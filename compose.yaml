@@ -1,0 +1,15 @@
+services:
+  observer:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    command: ["polybot", "run", "--interval", "300", "--max-events", "2"]
+    healthcheck:
+      test: ["CMD", "polybot", "status", "--json"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

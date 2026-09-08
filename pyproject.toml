@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "polybot"
+version = "0.1.0"
+description = "Read-only Polymarket weather scanner with GPT-6 Astra rule auditing and paper trading"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "httpx>=0.28,<1",
+  "openai>=2.28,<3",
+  "polymarket-client==0.9.0",
+  "pydantic>=2.12,<3",
+  "pydantic-settings>=2.10,<3",
+  "rich>=14,<15",
+]
+
+[project.scripts]
+polybot = "polybot.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4,<9",
+  "pytest-cov>=6,<8",
+  "pyright>=1.1,<2",
+  "ruff>=0.12,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/polybot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
+
