@@ -90,6 +90,20 @@ class PolymarketGateway:
             fee_taker_only=market.fee_taker_only,
         )
 
+    def get_yes_resolution(self, *, market_id: str) -> bool | None:
+        """Return a finalized YES result, or ``None`` while unresolved."""
+
+        market = self._client.get_market(id=market_id)
+        if not market.state.closed:
+            return None
+        yes = market.outcomes.yes.price
+        no = market.outcomes.no.price
+        if yes == Decimal(1) and no == Decimal(0):
+            return True
+        if yes == Decimal(0) and no == Decimal(1):
+            return False
+        return None
+
     @staticmethod
     def _normalize_event(event: Event) -> EventDefinition:
         raw_markets = event.markets

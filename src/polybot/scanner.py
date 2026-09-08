@@ -42,6 +42,7 @@ class Scanner:
         errors: list[str] = []
         decisions: list[MarketDecision] = []
         paper_orders_opened = 0
+        paper_orders_settled = 0
         events_scanned = 0
         markets_scanned = 0
 
@@ -55,6 +56,10 @@ class Scanner:
                 errors.append(f"geoblock check failed: {error}")
 
             with PolymarketGateway() as gateway:
+                paper_orders_settled, settlement_errors = self._settle_resolved_paper_orders(
+                    gateway
+                )
+                errors.extend(settlement_errors)
                 events = gateway.discover_weather_events(query=query, max_events=max_events)
                 for event in events:
                     events_scanned += 1
@@ -88,6 +93,7 @@ class Scanner:
                 events_scanned=events_scanned,
                 markets_scanned=markets_scanned,
                 paper_orders_opened=paper_orders_opened,
+                paper_orders_settled=paper_orders_settled,
                 decisions=decisions,
                 errors=errors,
             )
@@ -99,6 +105,20 @@ class Scanner:
                 error=str(error),
             )
             raise
+
+    def _settle_resolved_paper_orders(self, gateway: PolymarketGateway) -> tuple[int, list[str]]:
+        settled = 0
+        errors: list[str] = []
+        for market_id in self.storage.open_paper_market_ids():
+            try:
+                outcome = gateway.get_yes_resolution(market_id=market_id)
+                if outcome is None:
+                    continue
+                self.storage.settle_paper_order(market_id, won=outcome)
+                settled += 1
+            except Exception as error:
+                errors.append(f"paper settlement {market_id} failed: {error}")
+        return settled, errors
 
     def _scan_event(
         self,

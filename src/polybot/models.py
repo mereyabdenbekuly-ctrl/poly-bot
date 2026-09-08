@@ -170,5 +170,6 @@ class ScanReport(StrictModel):
     events_scanned: int
     markets_scanned: int
     paper_orders_opened: int
+    paper_orders_settled: int = 0
     decisions: list[MarketDecision]
     errors: list[str]

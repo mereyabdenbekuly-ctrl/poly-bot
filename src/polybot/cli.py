@@ -251,7 +251,8 @@ def _print_scan_report(report: dict[str, Any]) -> None:
     console.print(table)
     console.print(
         f"Events: {report['events_scanned']}; markets: {report['markets_scanned']}; "
-        f"paper orders opened: {report['paper_orders_opened']}"
+        f"paper orders opened: {report['paper_orders_opened']}; "
+        f"settled: {report.get('paper_orders_settled', 0)}"
     )
     for error in report["errors"]:
         console.print(f"[yellow]Warning:[/yellow] {error}")

@@ -68,6 +68,11 @@ def test_only_one_open_paper_order_per_event(tmp_path) -> None:
             max_total_risk=Decimal("6"),
         )
 
+    assert storage.open_paper_market_ids() == ["market-1"]
+    pnl = storage.settle_paper_order("market-1", won=False)
+    assert pnl == -Decimal("1.5725")
+    assert storage.open_paper_market_ids() == []
+
 
 def test_cached_astra_audit_has_zero_marginal_cost(tmp_path) -> None:
     storage = Storage(tmp_path / "test.sqlite3")

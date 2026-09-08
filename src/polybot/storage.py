@@ -474,6 +474,13 @@ class Storage:
             )
         return pnl
 
+    def open_paper_market_ids(self) -> list[str]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT market_id FROM paper_orders WHERE status = 'open' ORDER BY id"
+            ).fetchall()
+        return [str(row["market_id"]) for row in rows]
+
     def portfolio_summary(self) -> dict[str, Any]:
         with self.connect() as connection:
             open_row = connection.execute(
