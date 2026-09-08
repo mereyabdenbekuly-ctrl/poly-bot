@@ -12,7 +12,11 @@ _URL_RE = re.compile(r"https?://[^\s)]+")
 _STATION_RE = re.compile(
     r"highest temperature recorded by (?P<station>.+?) in degrees", re.I | re.S
 )
-_PRECISION_RE = re.compile(r"to (?P<word>one|two|three|\d+) decimal place", re.I)
+_PRECISION_RE = re.compile(
+    r"(?:to|measures temperatures to)\s+"
+    r"(?:(?P<word>one|two|three|\d+)\s+decimal places?|(?P<whole>whole degrees?))",
+    re.I,
+)
 _LABEL_RE = re.compile(
     r"^\s*(?P<value>-?\d+(?:\.\d+)?)\s*°?\s*(?P<unit>[CF])?"
     r"(?:\s+(?P<tail>or below|or lower|or higher|or above))?\s*$",
@@ -52,8 +56,12 @@ def deterministic_rule_audit(event: EventDefinition) -> RuleAudit:
     word_to_int = {"one": 1, "two": 2, "three": 3}
     precision: int | None = None
     if precision_match:
-        raw = precision_match.group("word").lower()
-        precision = word_to_int.get(raw, int(raw) if raw.isdigit() else 0)
+        raw = precision_match.group("word")
+        if precision_match.group("whole"):
+            precision = 0
+        elif raw:
+            raw = raw.lower()
+            precision = word_to_int.get(raw, int(raw) if raw.isdigit() else 0)
     station_match = _STATION_RE.search(event.description)
     station = station_match.group("station").strip() if station_match else None
     urls = _URL_RE.findall(event.description)

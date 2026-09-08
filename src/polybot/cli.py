@@ -244,7 +244,9 @@ def _print_scan_report(report: dict[str, Any]) -> None:
             _fmt(decision.get("executable_price")),
             _fmt(decision.get("probability_edge")),
             _fmt(decision.get("expected_profit_usd")),
-            ", ".join(decision["reason_codes"]) or "qualified",
+            ", ".join(decision["reason_codes"])
+            or ", ".join(f"WARN:{code}" for code in decision.get("warning_codes", []))
+            or "qualified",
         )
     console.print(table)
     console.print(

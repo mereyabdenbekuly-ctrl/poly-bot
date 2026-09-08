@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 from types import TracebackType
 from typing import Self
@@ -35,12 +36,15 @@ class PolymarketGateway:
         self._client.close()
 
     def discover_weather_events(self, *, query: str, max_events: int) -> list[EventDefinition]:
+        # Search relevance can put already-ended markets before tomorrow's markets.
+        # Fetch a wider candidate page and only count events that can still accept orders.
+        candidate_page_size = min(100, max(20, max_events * 10))
         page = self._client.search(
             q=query,
             events_status="active",
             search_tags=False,
             search_profiles=False,
-            page_size=max_events,
+            page_size=candidate_page_size,
         ).first_page()
         if not page.items:
             return []
@@ -55,7 +59,7 @@ class PolymarketGateway:
                 seen.add(event_id)
                 event = self._client.get_event(id=event_id)
                 normalized = self._normalize_event(event)
-                if normalized.markets:
+                if is_event_open_for_trading(normalized):
                     events.append(normalized)
                 if len(events) >= max_events:
                     return events
@@ -120,3 +124,11 @@ class PolymarketGateway:
             observation_date=event.schedule.event_date,
             markets=markets,
         )
+
+
+def is_event_open_for_trading(event: EventDefinition, *, now: datetime | None = None) -> bool:
+    now = now or datetime.now(UTC)
+    return any(
+        market.accepting_orders and (market.end_date is None or market.end_date > now)
+        for market in event.markets
+    )

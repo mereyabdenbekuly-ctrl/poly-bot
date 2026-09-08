@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Literal, cast
@@ -44,7 +45,7 @@ class OpenMeteoEnsemble:
                 f"{self.settings.max_forecast_horizon_days}d limit"
             )
 
-        place = self._geocode(rules.location)
+        place = self._geocode_rules(rules)
         response = httpx.get(
             self.settings.weather_ensemble_url,
             params={
@@ -130,6 +131,27 @@ class OpenMeteoEnsemble:
             longitude=float(best["longitude"]),
             timezone=timezone,
         )
+
+    def _geocode_rules(self, rules: RuleInterpretation) -> GeocodedPlace:
+        assert rules.location is not None
+        candidates: list[str] = []
+        station = rules.station_or_authority or ""
+        station = station.split(";", 1)[0]
+        station = re.sub(r"^NOAA\s+at\s+the\s+", "", station, flags=re.I)
+        station = re.sub(r"\s+Station$", "", station, flags=re.I).strip()
+        if station and station.casefold() != rules.location.casefold():
+            candidates.append(station)
+            if station.lower().endswith(" airport") and "international" not in station.lower():
+                candidates.append(station[: -len(" Airport")] + " International Airport")
+        candidates.append(rules.location)
+
+        failures: list[str] = []
+        for candidate in dict.fromkeys(candidates):
+            try:
+                return self._geocode(candidate)
+            except WeatherModelError as error:
+                failures.append(str(error))
+        raise WeatherModelError("; ".join(failures))
 
 
 def _normal_cdf(value: float) -> float:

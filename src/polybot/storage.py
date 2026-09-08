@@ -193,9 +193,11 @@ class Storage:
                 "rules_hash": row["rules_hash"],
                 "parser": row["parser"],
                 "interpretation": json.loads(row["interpretation_json"]),
-                "astra_cost_usd": row["cost_usd"],
-                "astra_input_tokens": row["input_tokens"],
-                "astra_output_tokens": row["output_tokens"],
+                # The historical cost remains in rule_cache/api_usage. Reusing a
+                # cached interpretation has zero marginal model cost this scan.
+                "astra_cost_usd": "0",
+                "astra_input_tokens": 0,
+                "astra_output_tokens": 0,
                 "cached": True,
             }
         )

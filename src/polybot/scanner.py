@@ -63,6 +63,7 @@ class Scanner:
                         gateway=gateway,
                         event=event,
                         use_astra=use_astra,
+                        paper=paper,
                     )
                     errors.extend(event_errors)
                     markets_scanned += len(event_decisions)
@@ -106,6 +107,7 @@ class Scanner:
         gateway: PolymarketGateway,
         event: EventDefinition,
         use_astra: bool,
+        paper: bool,
     ) -> tuple[list[MarketDecision], list[str]]:
         errors: list[str] = []
         deterministic = deterministic_rule_audit(event)
@@ -125,9 +127,13 @@ class Scanner:
             errors.append(f"event {event.id}: {error}")
 
         probabilities: dict[str, Decimal] = {}
-        if audit.interpretation.tradeable and brackets:
+        # This scanner has only observe/paper modes. A deterministic parse is
+        # enough to study the hypothesis; Astra ambiguities remain warnings.
+        # A future live executor must require the combined audit to be tradeable.
+        analysis_rules = deterministic.interpretation
+        if analysis_rules.tradeable and brackets:
             try:
-                forecast = self.weather.forecast(audit.interpretation)
+                forecast = self.weather.forecast(analysis_rules)
                 self.storage.record_weather(run_id, event.id, forecast)
                 probabilities = {
                     market_id: Decimal(
@@ -150,18 +156,24 @@ class Scanner:
                     api_cost_usd=audit.astra_cost_usd,
                 )
                 extra_reasons: list[str] = []
-                if not audit.interpretation.tradeable:
-                    extra_reasons.append("RULES_NOT_TRADEABLE")
+                warning_codes: list[str] = []
+                if not deterministic.interpretation.tradeable:
+                    extra_reasons.append("RULES_NOT_ANALYZABLE")
+                elif use_astra and not audit.interpretation.tradeable:
+                    warning_codes.append("ASTRA_RULE_AMBIGUITY_PAPER_ONLY")
                 if market.id not in brackets:
                     extra_reasons.append("BRACKET_NOT_PARSED")
-                if not probabilities and audit.interpretation.tradeable:
+                if not probabilities and analysis_rules.tradeable:
                     extra_reasons.append("WEATHER_PROBABILITY_UNAVAILABLE")
-                if extra_reasons:
+                if extra_reasons or warning_codes:
                     decision = decision.model_copy(
                         update={
-                            "action": DecisionAction.SKIP,
+                            "action": DecisionAction.SKIP if extra_reasons else decision.action,
                             "reason_codes": list(
                                 dict.fromkeys(decision.reason_codes + extra_reasons)
+                            ),
+                            "warning_codes": list(
+                                dict.fromkeys(decision.warning_codes + warning_codes)
                             ),
                         }
                     )

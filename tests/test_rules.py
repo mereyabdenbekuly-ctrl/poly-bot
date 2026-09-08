@@ -55,3 +55,16 @@ def test_temperature_labels_become_contiguous_brackets() -> None:
     assert brackets["2"].upper == 29.0
     assert brackets["3"].lower == 29.0
     assert brackets["3"].upper is None
+
+
+def test_whole_degree_precision_is_supported() -> None:
+    candidate = sample_event().model_copy(
+        update={
+            "description": sample_event().description.replace(
+                "to one decimal place", "to whole degrees Celsius"
+            )
+        }
+    )
+    audit = deterministic_rule_audit(candidate)
+    assert audit.interpretation.precision_decimal_places == 0
+    assert audit.interpretation.tradeable

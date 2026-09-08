@@ -3,7 +3,7 @@ from decimal import Decimal
 
 import pytest
 
-from polybot.models import DecisionAction, MarketDecision
+from polybot.models import DecisionAction, MarketDecision, RuleAudit, RuleInterpretation
 from polybot.storage import BudgetExceededError, PaperRiskRejectedError, Storage
 
 
@@ -67,3 +67,37 @@ def test_only_one_open_paper_order_per_event(tmp_path) -> None:
             max_event_risk=Decimal("2"),
             max_total_risk=Decimal("6"),
         )
+
+
+def test_cached_astra_audit_has_zero_marginal_cost(tmp_path) -> None:
+    storage = Storage(tmp_path / "test.sqlite3")
+    audit = RuleAudit(
+        rules_hash="rules",
+        parser="astra-v1",
+        interpretation=RuleInterpretation(
+            event_type="daily_max_temperature",
+            tradeable=True,
+            location="Test",
+            observation_date=None,
+            unit="C",
+            precision_decimal_places=0,
+            station_or_authority="Station",
+            resolution_source_url="https://example.test",
+            source_local_date=True,
+            bucket_semantics_clear=True,
+            ambiguity_reasons=[],
+            summary="Test",
+            confidence=1,
+        ),
+        astra_cost_usd=Decimal("0.07"),
+        astra_input_tokens=2000,
+        astra_output_tokens=1000,
+    )
+    storage.put_rule_cache(audit, model="gpt-6-astra")
+
+    cached = storage.get_rule_cache("rules")
+    assert cached is not None
+    assert cached.cached
+    assert cached.astra_cost_usd == Decimal(0)
+    assert cached.astra_input_tokens == 0
+    assert cached.astra_output_tokens == 0

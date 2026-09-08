@@ -146,6 +146,7 @@ class DecisionAction(StrEnum):
 class MarketDecision(StrictModel):
     action: DecisionAction
     reason_codes: list[str]
+    warning_codes: list[str] = Field(default_factory=list)
     event_id: str
     market_id: str
     asset_id: str
