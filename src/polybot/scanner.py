@@ -808,11 +808,13 @@ def _runtime_rule_ambiguities(
             continue
         if (
             history is not None
-            and history.observations
-            and not history.stale
             and "weather underground" in lowered
         ):
-            warnings.append("FALLBACK_SOURCE_AMBIGUOUS_PRIMARY_AVAILABLE")
+            warnings.append(
+                "FALLBACK_SOURCE_AMBIGUOUS_PRIMARY_AVAILABLE"
+                if history.observations and not history.stale
+                else "FALLBACK_SOURCE_AMBIGUOUS_PRIMARY_CONFIGURED"
+            )
             continue
         blockers.append("UNRESOLVED_RULE_AMBIGUITY")
     if not interpretation.ambiguity_reasons:

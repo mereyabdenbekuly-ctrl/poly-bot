@@ -71,6 +71,17 @@ def test_unresolved_rule_ambiguity_blocks_entry() -> None:
     assert warnings == []
 
 
+def test_future_day_fallback_ambiguity_is_warning_when_primary_station_is_configured() -> None:
+    value = history().model_copy(
+        update={"day_started": False, "observations": [], "warning_reasons": []}
+    )
+    blockers, warnings = _runtime_rule_ambiguities(
+        interpretation("Weather Underground fallback station is not specified."), value
+    )
+    assert blockers == []
+    assert warnings == ["FALLBACK_SOURCE_AMBIGUOUS_PRIMARY_CONFIGURED"]
+
+
 def _monitoring_event(now: datetime) -> EventDefinition:
     return EventDefinition(
         id="active-event",

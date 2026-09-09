@@ -91,6 +91,31 @@ class StationObservationCollector:
         day_started = now_local >= local_start
         day_finished = now_local >= local_end
 
+        # Synoptic rejects a START in the future.  Station metadata is already
+        # sufficient to establish identity/timezone for a lead-time forecast;
+        # return explicit empty evidence instead of turning a normal pre-event
+        # state into a source outage.
+        if not day_started:
+            return ObservationHistory(
+                station_id=station_id,
+                station_name=station_name,
+                station_timezone=timezone_name,
+                source_url=rules.resolution_source_url,
+                observation_date=rules.observation_date,
+                fetched_at_utc=fetched_at,
+                day_started=False,
+                day_finished=False,
+                expected_cadence_minutes=_KNOWN_CADENCE_MINUTES.get(
+                    station_id, self.settings.observation_default_cadence_minutes
+                ),
+                observations=[],
+                observed_max_c=None,
+                displayed_max_c=None,
+                latest_observed_at_utc=None,
+                stale=False,
+                warning_reasons=["OBSERVATION_DAY_NOT_STARTED"],
+            )
+
         payload = self._fetch_synoptic(
             station_id=station_id,
             start_utc=utc_start,
