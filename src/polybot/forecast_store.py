@@ -633,6 +633,9 @@ class ForecastStore:
                 "SELECT * FROM forecast_outcome_versions_v2 "
                 "ORDER BY recorded_at_utc DESC, id DESC LIMIT 50"
             ).fetchall()
+            latest_outcome_by_event: dict[str, sqlite3.Row] = {}
+            for row in outcome_rows:
+                latest_outcome_by_event.setdefault(str(row["event_id"]), row)
             catalog_rows = connection.execute(
                 """
                 SELECT DISTINCT m.source, m.model, p.algorithm_version, p.station_id
@@ -670,6 +673,20 @@ class ForecastStore:
                 station_metrics.append(_compact_metrics_report(report))
 
         events = list(grouped.values())
+        for event in events:
+            outcome = latest_outcome_by_event.get(str(event["event_id"]))
+            event["outcome"] = (
+                None
+                if outcome is None
+                else {
+                    "actual_max_c": outcome["actual_max_c"],
+                    "displayed_max": outcome["displayed_max"],
+                    "winning_market_id": outcome["winning_market_id"],
+                    "winning_label": outcome["winning_label"],
+                    "resolved_at_utc": outcome["resolved_at_utc"],
+                    "source_revision": outcome["source_revision"],
+                }
+            )
         events.sort(key=lambda item: str(item["latest_issued_at_utc"]), reverse=True)
         return {
             "counts": self.counts(),
