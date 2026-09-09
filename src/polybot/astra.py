@@ -26,7 +26,7 @@ class AstraRuleAuditor:
         self.settings = settings
         self.storage = storage
 
-    def audit(self, event: EventDefinition) -> RuleAudit:
+    def audit(self, event: EventDefinition, *, run_id: int | None = None) -> RuleAudit:
         digest = rules_hash(event)
         cached = self.storage.get_rule_cache(digest)
         if cached is not None and cached.parser == "astra-v1":
@@ -39,6 +39,9 @@ class AstraRuleAuditor:
             model=self.settings.astra_model,
             estimate=self.settings.astra_reserve_per_call_usd,
             budget=self.settings.astra_budget_usd,
+            run_id=run_id,
+            event_id=event.id,
+            rules_hash=digest,
         )
         payload = {
             "event_id": event.id,

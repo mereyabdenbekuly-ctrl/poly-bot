@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -11,6 +11,7 @@ from polybot.models import (
     RuleAudit,
     RuleInterpretation,
 )
+from polybot.observations import ObservationHistory, ObservationVersion
 from polybot.storage import BudgetExceededError, PaperRiskRejectedError, Storage
 
 
@@ -78,9 +79,77 @@ def test_only_one_open_paper_order_per_event(tmp_path) -> None:
         )
 
     assert storage.open_paper_market_ids() == ["market-1"]
+    assert storage.active_paper_orders()[0].strategy_version == "v1"
     pnl = storage.settle_paper_order("market-1", won=False)
-    assert pnl == -Decimal("1.5725")
+    assert pnl == -Decimal("1.5525")
     assert storage.open_paper_market_ids() == []
+
+
+def test_decimal_exposure_is_not_aggregated_through_float(tmp_path) -> None:
+    storage = Storage(tmp_path / "test.sqlite3")
+    storage.open_paper_order(
+        decision(event_id="event-1", market_id="market-1"),
+        idempotency_key="first",
+        max_event_risk=Decimal("2"),
+        max_total_risk=Decimal("6"),
+    )
+    storage.open_paper_order(
+        decision(event_id="event-2", market_id="market-2"),
+        idempotency_key="second",
+        max_event_risk=Decimal("2"),
+        max_total_risk=Decimal("6"),
+    )
+
+    assert storage.portfolio_summary()["open_exposure_usd"] == Decimal("3.1450")
+
+
+def test_observation_revisions_are_immutable_and_deduplicated(tmp_path) -> None:
+    storage = Storage(tmp_path / "test.sqlite3")
+    run_id = storage.start_scan(query="weather", mode="paper")
+    first_seen = datetime.now(UTC)
+    observation = ObservationVersion(
+        station_id="EDDM",
+        station_timezone="Europe/Berlin",
+        observed_at_utc=datetime(2026, 9, 8, 22, 20, tzinfo=UTC),
+        first_seen_at_utc=first_seen,
+        source="weather.gov-wrh-synoptic",
+        source_url="https://www.weather.gov/wrh/timeseries?site=eddm",
+        temperature_c=Decimal("22"),
+        displayed_temperature_c=Decimal("22"),
+        raw_payload={"metar_set_1": "EDDM 082220Z 22/15"},
+        revision_hash="revision-1",
+        corrected=False,
+    )
+    history = ObservationHistory(
+        station_id="EDDM",
+        station_name="Munich Airport",
+        station_timezone="Europe/Berlin",
+        source_url=observation.source_url,
+        observation_date=date(2026, 9, 9),
+        fetched_at_utc=first_seen,
+        day_started=True,
+        day_finished=False,
+        expected_cadence_minutes=30,
+        observations=[observation],
+        observed_max_c=Decimal("22"),
+        displayed_max_c=Decimal("22"),
+        latest_observed_at_utc=observation.observed_at_utc,
+        stale=False,
+    )
+    storage.record_observation_history(run_id, "event", history)
+    storage.record_observation_history(
+        run_id,
+        "event",
+        history.model_copy(update={"fetched_at_utc": first_seen + timedelta(minutes=5)}),
+    )
+
+    with storage.connect() as connection:
+        count = connection.execute("SELECT COUNT(*) FROM station_observation_versions").fetchone()[
+            0
+        ]
+        fetches = connection.execute("SELECT COUNT(*) FROM observation_fetches").fetchone()[0]
+    assert count == 1
+    assert fetches == 2
 
 
 def test_end_date_only_moves_order_to_awaiting_result(tmp_path) -> None:
@@ -144,7 +213,7 @@ def test_confirmed_identity_matched_result_uses_full_lifecycle(tmp_path) -> None
     storage.record_resolution_check(order_id, check)
     assert storage.resolve_paper_order(order_id, check)
     assert storage.active_paper_orders()[0].status.value == "RESOLVED"
-    assert storage.settle_resolved_paper_order(order_id) == Decimal("3.4275")
+    assert storage.settle_resolved_paper_order(order_id) == Decimal("3.4475")
     summary = storage.portfolio_summary()
     assert summary["orders_by_status"] == {"PAPER_SETTLED": 1}
 

@@ -39,6 +39,9 @@ def evaluate_market(
         if age < -30:
             reasons.append("BOOK_TIMESTAMP_IN_FUTURE")
 
+    # Paper execution models a crossing limit order. For limit orders the SDK
+    # ``size``/order-book ``min_order_size`` value is a share count. Do not pass
+    # this value as a BUY market-order ``amount`` (which is a currency spend).
     plan = plan_buy_fill(
         asks=snapshot.asks,
         shares=snapshot.min_order_size,

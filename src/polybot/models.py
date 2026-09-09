@@ -67,6 +67,8 @@ class WeatherForecast(StrictModel):
     unit: Literal["C", "F"]
     fetched_at: datetime
     member_values: list[float]
+    unadjusted_member_values: list[float] | None = None
+    observed_floor_c: Decimal | None = None
 
 
 class MarketDefinition(StrictModel):
@@ -165,6 +167,8 @@ class MarketDecision(StrictModel):
     action: DecisionAction
     reason_codes: list[str]
     warning_codes: list[str] = Field(default_factory=list)
+    strategy_version: str = "v1"
+    execution_model: str = "CROSSING_LIMIT_SHARES"
     event_id: str
     market_id: str
     asset_id: str
@@ -198,6 +202,8 @@ class PaperOrderTarget(StrictModel):
     token_id: str
     outcome: OutcomeSide
     status: PaperOrderStatus
+    strategy_version: str
+    execution_model: str
     shares: Decimal
     entry_cost_usd: Decimal
     fee_rate: Decimal

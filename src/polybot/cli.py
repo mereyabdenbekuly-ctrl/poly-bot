@@ -197,6 +197,7 @@ def _status(storage: Storage, *, as_json: bool) -> None:
         "realized_pnl_usd",
         "api_spend_usd",
         "api_reserved_usd",
+        "net_project_pnl_after_api_usd",
     ):
         table.add_row(key, str(summary[key]))
     console.print(table)

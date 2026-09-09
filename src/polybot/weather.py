@@ -97,8 +97,17 @@ class OpenMeteoEnsemble:
         sigma = self.settings.weather_error_sigma_c
         if forecast.unit == "F":
             sigma *= 9 / 5
+        floor_value = (
+            None if forecast.observed_floor_c is None else float(forecast.observed_floor_c)
+        )
         probabilities = [
-            _interval_probability(value, sigma, bracket.lower, bracket.upper)
+            _truncated_interval_probability(
+                value,
+                sigma,
+                bracket.lower,
+                bracket.upper,
+                floor_value,
+            )
             for value in forecast.member_values
         ]
         return sum(probabilities) / len(probabilities)
@@ -164,6 +173,25 @@ def _interval_probability(
     lower_cdf = 0.0 if lower is None else _normal_cdf((lower - mean) / sigma)
     upper_cdf = 1.0 if upper is None else _normal_cdf((upper - mean) / sigma)
     return max(0.0, min(1.0, upper_cdf - lower_cdf))
+
+
+def _truncated_interval_probability(
+    mean: float,
+    sigma: float,
+    lower: float | None,
+    upper: float | None,
+    floor_value: float | None,
+) -> float:
+    if floor_value is None:
+        return _interval_probability(mean, sigma, lower, upper)
+    if upper is not None and upper <= floor_value:
+        return 0.0
+    effective_lower = floor_value if lower is None else max(lower, floor_value)
+    numerator = _interval_probability(mean, sigma, effective_lower, upper)
+    denominator = 1.0 - _normal_cdf((floor_value - mean) / sigma)
+    if denominator <= 0:
+        return 0.0
+    return max(0.0, min(1.0, numerator / denominator))
 
 
 def is_forecast_date_eligible(observation_date: date, settings: Settings) -> bool:

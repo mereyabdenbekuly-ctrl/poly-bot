@@ -21,6 +21,7 @@ from polybot.models import (
     RuleAudit,
     WeatherForecast,
 )
+from polybot.observations import ObservationHistory
 
 
 def utc_now() -> datetime:
@@ -90,6 +91,9 @@ class Storage:
                 CREATE TABLE IF NOT EXISTS api_usage (
                     reservation_id TEXT PRIMARY KEY,
                     model TEXT NOT NULL,
+                    run_id INTEGER REFERENCES scan_runs(id),
+                    event_id TEXT,
+                    rules_hash TEXT,
                     status TEXT NOT NULL,
                     estimated_cost_usd TEXT NOT NULL,
                     actual_cost_usd TEXT,
@@ -106,6 +110,31 @@ class Storage:
                     event_id TEXT NOT NULL,
                     fetched_at TEXT NOT NULL,
                     payload_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS observation_fetches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL REFERENCES scan_runs(id),
+                    event_id TEXT NOT NULL,
+                    station_id TEXT NOT NULL,
+                    observation_date TEXT NOT NULL,
+                    fetched_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS station_observation_versions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    station_id TEXT NOT NULL,
+                    observed_at_utc TEXT NOT NULL,
+                    revision_hash TEXT NOT NULL,
+                    first_seen_at_utc TEXT NOT NULL,
+                    last_seen_at_utc TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    temperature_c TEXT NOT NULL,
+                    displayed_temperature_c TEXT NOT NULL,
+                    corrected INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    UNIQUE(station_id, observed_at_utc, revision_hash)
                 );
 
                 CREATE TABLE IF NOT EXISTS market_snapshots (
@@ -135,6 +164,9 @@ class Storage:
                     market_id TEXT NOT NULL,
                     asset_id TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    strategy_version TEXT NOT NULL DEFAULT 'v0',
+                    execution_model TEXT NOT NULL DEFAULT 'LEGACY_CROSSING_BOOK_SHARES',
+                    validation_notes TEXT,
                     condition_id TEXT,
                     token_id TEXT,
                     outcome TEXT NOT NULL DEFAULT 'YES',
@@ -191,6 +223,10 @@ class Storage:
 
                 CREATE INDEX IF NOT EXISTS decisions_run_idx ON decisions(run_id);
                 CREATE INDEX IF NOT EXISTS snapshots_run_idx ON market_snapshots(run_id);
+                CREATE INDEX IF NOT EXISTS observation_fetches_run_idx
+                    ON observation_fetches(run_id, event_id);
+                CREATE INDEX IF NOT EXISTS observation_versions_station_idx
+                    ON station_observation_versions(station_id, observed_at_utc, id);
                 CREATE INDEX IF NOT EXISTS paper_transitions_order_idx
                     ON paper_order_transitions(paper_order_id, id);
                 CREATE INDEX IF NOT EXISTS paper_resolution_order_idx
@@ -199,7 +235,16 @@ class Storage:
                     ON paper_marks(paper_order_id, id);
                 """
             )
+            self._migrate_api_usage(connection)
             self._migrate_paper_orders(connection)
+
+    @staticmethod
+    def _migrate_api_usage(connection: sqlite3.Connection) -> None:
+        columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(api_usage)")}
+        additions = {"run_id": "INTEGER", "event_id": "TEXT", "rules_hash": "TEXT"}
+        for name, declaration in additions.items():
+            if name not in columns:
+                connection.execute(f"ALTER TABLE api_usage ADD COLUMN {name} {declaration}")
 
     def _migrate_paper_orders(self, connection: sqlite3.Connection) -> None:
         """Migrate databases created by pre-lifecycle releases in place.
@@ -215,6 +260,9 @@ class Storage:
         }
         additions: dict[str, str] = {
             "condition_id": "TEXT",
+            "strategy_version": "TEXT NOT NULL DEFAULT 'v0'",
+            "execution_model": "TEXT NOT NULL DEFAULT 'LEGACY_CROSSING_BOOK_SHARES'",
+            "validation_notes": "TEXT",
             "token_id": "TEXT",
             "outcome": "TEXT NOT NULL DEFAULT 'YES'",
             "fee_rate": "TEXT NOT NULL DEFAULT '0'",
@@ -373,7 +421,16 @@ class Storage:
                 ),
             )
 
-    def reserve_api_budget(self, *, model: str, estimate: Decimal, budget: Decimal) -> str:
+    def reserve_api_budget(
+        self,
+        *,
+        model: str,
+        estimate: Decimal,
+        budget: Decimal,
+        run_id: int | None = None,
+        event_id: str | None = None,
+        rules_hash: str | None = None,
+    ) -> str:
         reservation_id = uuid.uuid4().hex
         with self.transaction(immediate=True) as connection:
             rows = connection.execute(
@@ -399,10 +456,19 @@ class Storage:
             connection.execute(
                 """
                 INSERT INTO api_usage(
-                    reservation_id, model, status, estimated_cost_usd, created_at
-                ) VALUES (?, ?, 'reserved', ?, ?)
+                    reservation_id, model, run_id, event_id, rules_hash,
+                    status, estimated_cost_usd, created_at
+                ) VALUES (?, ?, ?, ?, ?, 'reserved', ?, ?)
                 """,
-                (reservation_id, model, str(estimate), utc_now().isoformat()),
+                (
+                    reservation_id,
+                    model,
+                    run_id,
+                    event_id,
+                    rules_hash,
+                    str(estimate),
+                    utc_now().isoformat(),
+                ),
             )
         return reservation_id
 
@@ -466,6 +532,65 @@ class Storage:
                 """,
                 (run_id, event_id, forecast.fetched_at.isoformat(), forecast.model_dump_json()),
             )
+
+    def record_observation_history(
+        self, run_id: int, event_id: str, history: ObservationHistory
+    ) -> None:
+        with self.transaction(immediate=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO observation_fetches(
+                    run_id, event_id, station_id, observation_date, fetched_at, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    event_id,
+                    history.station_id,
+                    history.observation_date.isoformat(),
+                    history.fetched_at_utc.isoformat(),
+                    history.model_dump_json(),
+                ),
+            )
+            for observation in history.observations:
+                existing = connection.execute(
+                    """
+                    SELECT id FROM station_observation_versions
+                    WHERE station_id = ? AND observed_at_utc = ? AND revision_hash = ?
+                    """,
+                    (
+                        observation.station_id,
+                        observation.observed_at_utc.isoformat(),
+                        observation.revision_hash,
+                    ),
+                ).fetchone()
+                if existing is None:
+                    connection.execute(
+                        """
+                        INSERT INTO station_observation_versions(
+                            station_id, observed_at_utc, revision_hash, first_seen_at_utc,
+                            last_seen_at_utc, source, temperature_c,
+                            displayed_temperature_c, corrected, payload_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            observation.station_id,
+                            observation.observed_at_utc.isoformat(),
+                            observation.revision_hash,
+                            observation.first_seen_at_utc.isoformat(),
+                            history.fetched_at_utc.isoformat(),
+                            observation.source,
+                            str(observation.temperature_c),
+                            str(observation.displayed_temperature_c),
+                            int(observation.corrected),
+                            observation.model_dump_json(),
+                        ),
+                    )
+                else:
+                    connection.execute(
+                        "UPDATE station_observation_versions SET last_seen_at_utc = ? WHERE id = ?",
+                        (history.fetched_at_utc.isoformat(), existing["id"]),
+                    )
 
     def record_market_snapshot(self, run_id: int, snapshot: MarketSnapshot) -> None:
         with self.connect() as connection:
@@ -534,22 +659,19 @@ class Storage:
             if existing is not None:
                 return int(existing["id"])
 
-            event_row = connection.execute(
-                """
-                SELECT COALESCE(SUM(CAST(max_loss_usd AS REAL)), 0) AS exposure
-                FROM paper_orders
-                WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED') AND event_id = ?
-                """,
-                (decision.event_id,),
-            ).fetchone()
-            total_row = connection.execute(
-                """
-                SELECT COALESCE(SUM(CAST(max_loss_usd AS REAL)), 0) AS exposure
-                FROM paper_orders WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED')
-                """
-            ).fetchone()
-            event_exposure = Decimal(str(event_row["exposure"]))
-            total_exposure = Decimal(str(total_row["exposure"]))
+            active_rows = connection.execute(
+                "SELECT event_id, max_loss_usd FROM paper_orders "
+                "WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED')"
+            ).fetchall()
+            total_exposure = sum((Decimal(row["max_loss_usd"]) for row in active_rows), Decimal(0))
+            event_exposure = sum(
+                (
+                    Decimal(row["max_loss_usd"])
+                    for row in active_rows
+                    if row["event_id"] == decision.event_id
+                ),
+                Decimal(0),
+            )
             if event_exposure + decision.max_loss_usd > max_event_risk:
                 raise PaperRiskRejectedError(
                     f"event exposure ${event_exposure} + ${decision.max_loss_usd} "
@@ -566,11 +688,13 @@ class Storage:
                     """
                     INSERT INTO paper_orders(
                         idempotency_key, event_id, market_id, asset_id, condition_id,
-                        token_id, outcome, status, shares,
+                        token_id, outcome, status, strategy_version, execution_model, shares,
                         entry_price, notional_usd, fee_usd, api_cost_usd,
                         execution_buffer_usd, max_loss_usd, expected_profit_usd,
                         fee_rate, fee_exponent, end_date, identity_verified, opened_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?
+                    )
                     """,
                     (
                         idempotency_key,
@@ -580,6 +704,8 @@ class Storage:
                         decision.condition_id,
                         decision.token_id or decision.asset_id,
                         decision.outcome.value,
+                        decision.strategy_version,
+                        decision.execution_model,
                         str(decision.shares),
                         str(decision.executable_price),
                         str(decision.notional_usd),
@@ -617,6 +743,8 @@ class Storage:
                 token_id=str(row["token_id"] or row["asset_id"]),
                 outcome=OutcomeSide(str(row["outcome"] or "YES").upper()),
                 status=PaperOrderStatus(str(row["status"]).upper()),
+                strategy_version=str(row["strategy_version"] or "v0"),
+                execution_model=str(row["execution_model"] or "LEGACY_CROSSING_BOOK_SHARES"),
                 shares=Decimal(row["shares"]),
                 entry_cost_usd=sum(
                     (
@@ -625,7 +753,6 @@ class Storage:
                             "notional_usd",
                             "fee_usd",
                             "api_cost_usd",
-                            "execution_buffer_usd",
                         )
                     ),
                     Decimal(0),
@@ -748,7 +875,6 @@ class Storage:
                         "notional_usd",
                         "fee_usd",
                         "api_cost_usd",
-                        "execution_buffer_usd",
                     )
                 ),
                 Decimal(0),
@@ -860,20 +986,13 @@ class Storage:
 
     def portfolio_summary(self) -> dict[str, Any]:
         with self.connect() as connection:
-            open_row = connection.execute(
-                """
-                SELECT COUNT(*) AS count,
-                       COALESCE(SUM(CAST(max_loss_usd AS REAL)), 0) AS exposure
-                FROM paper_orders WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED')
-                """
-            ).fetchone()
-            closed_row = connection.execute(
-                """
-                SELECT COUNT(*) AS count,
-                       COALESCE(SUM(CAST(realized_pnl_usd AS REAL)), 0) AS pnl
-                FROM paper_orders WHERE status = 'PAPER_SETTLED'
-                """
-            ).fetchone()
+            open_rows = connection.execute(
+                "SELECT max_loss_usd FROM paper_orders "
+                "WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED')"
+            ).fetchall()
+            closed_rows = connection.execute(
+                "SELECT realized_pnl_usd FROM paper_orders WHERE status = 'PAPER_SETTLED'"
+            ).fetchall()
             last_scan = connection.execute(
                 "SELECT * FROM scan_runs ORDER BY id DESC LIMIT 1"
             ).fetchone()
@@ -890,13 +1009,23 @@ class Storage:
                 "ON latest.id = p.id ORDER BY p.paper_order_id"
             ).fetchall()
         settled, reserved = self.api_spend()
+        open_exposure = sum((Decimal(row["max_loss_usd"]) for row in open_rows), Decimal(0))
+        realized_pnl = sum(
+            (
+                Decimal(row["realized_pnl_usd"])
+                for row in closed_rows
+                if row["realized_pnl_usd"] is not None
+            ),
+            Decimal(0),
+        )
         return {
-            "open_orders": int(open_row["count"]),
-            "open_exposure_usd": Decimal(str(open_row["exposure"])),
-            "closed_orders": int(closed_row["count"]),
-            "realized_pnl_usd": Decimal(str(closed_row["pnl"])),
+            "open_orders": len(open_rows),
+            "open_exposure_usd": open_exposure,
+            "closed_orders": len(closed_rows),
+            "realized_pnl_usd": realized_pnl,
             "api_spend_usd": settled,
             "api_reserved_usd": reserved,
+            "net_project_pnl_after_api_usd": realized_pnl - settled,
             "last_scan": None if last_scan is None else dict(last_scan),
             "recent_orders": [dict(row) for row in recent_orders],
             "orders_by_status": {str(row["status"]): int(row["count"]) for row in status_rows},
@@ -906,15 +1035,19 @@ class Storage:
     def realized_pnl_for_day(self, day: date) -> Decimal:
         prefix = day.isoformat()
         with self.connect() as connection:
-            row = connection.execute(
-                """
-                SELECT COALESCE(SUM(CAST(realized_pnl_usd AS REAL)), 0) AS pnl
-                FROM paper_orders
-                WHERE status = 'PAPER_SETTLED' AND substr(settled_at, 1, 10) = ?
-                """,
+            rows = connection.execute(
+                "SELECT realized_pnl_usd FROM paper_orders "
+                "WHERE status = 'PAPER_SETTLED' AND substr(settled_at, 1, 10) = ?",
                 (prefix,),
-            ).fetchone()
-        return Decimal(str(row["pnl"]))
+            ).fetchall()
+        return sum(
+            (
+                Decimal(row["realized_pnl_usd"])
+                for row in rows
+                if row["realized_pnl_usd"] is not None
+            ),
+            Decimal(0),
+        )
 
     @staticmethod
     def _verified_order_row(

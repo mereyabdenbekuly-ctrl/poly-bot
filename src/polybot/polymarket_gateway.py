@@ -69,6 +69,12 @@ class PolymarketGateway:
 
     def get_snapshot(self, *, event: EventDefinition, market: MarketDefinition) -> MarketSnapshot:
         book = self._client.get_order_book(asset_id=market.asset_id)
+        _verify_book_identity(
+            requested_token_id=market.asset_id,
+            requested_condition_id=market.condition_id,
+            book_token_id=str(book.asset_id),
+            book_condition_id=str(book.condition_id),
+        )
         return MarketSnapshot(
             event_id=event.id,
             event_slug=event.slug,
@@ -184,6 +190,12 @@ class PolymarketGateway:
                 f"stored={token_id}, api={actual_token_id}"
             )
         book = self._client.get_order_book(asset_id=token_id)
+        _verify_book_identity(
+            requested_token_id=token_id,
+            requested_condition_id=condition_id,
+            book_token_id=str(book.asset_id),
+            book_condition_id=str(book.condition_id),
+        )
         schedule = market.trading.fee_schedule
         event = market.events[0] if market.events else None
         return MarketSnapshot(
@@ -253,3 +265,21 @@ def is_event_open_for_trading(event: EventDefinition, *, now: datetime | None = 
         market.accepting_orders and (market.end_date is None or market.end_date > now)
         for market in event.markets
     )
+
+
+def _verify_book_identity(
+    *,
+    requested_token_id: str,
+    requested_condition_id: str | None,
+    book_token_id: str,
+    book_condition_id: str,
+) -> None:
+    if book_token_id != requested_token_id:
+        raise ValueError(
+            f"order-book token mismatch: requested={requested_token_id}, api={book_token_id}"
+        )
+    if requested_condition_id is not None and book_condition_id != requested_condition_id:
+        raise ValueError(
+            "order-book condition mismatch: "
+            f"requested={requested_condition_id}, api={book_condition_id}"
+        )

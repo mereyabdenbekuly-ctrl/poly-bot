@@ -1,4 +1,5 @@
 from datetime import UTC, date, datetime
+from decimal import Decimal
 
 import pytest
 
@@ -29,3 +30,25 @@ def test_bracket_probabilities_cover_the_distribution() -> None:
 
     total = sum(model.probability(forecast=forecast, bracket=item) for item in brackets)
     assert total == pytest.approx(1.0)
+
+
+def test_observed_floor_makes_lower_bracket_impossible() -> None:
+    model = OpenMeteoEnsemble(Settings(weather_error_sigma_c=1.0))
+    forecast = WeatherForecast(
+        provider="test",
+        requested_location="Test",
+        matched_location="Test",
+        latitude=0,
+        longitude=0,
+        timezone="UTC",
+        observation_date=date(2026, 9, 9),
+        unit="C",
+        fetched_at=datetime.now(UTC),
+        member_values=[27.0, 28.0],
+        observed_floor_c=Decimal("27"),
+    )
+    impossible = Bracket(market_id="1", label="24", lower=24, upper=25)
+    possible = Bracket(market_id="2", label="27+", lower=27, upper=None)
+
+    assert model.probability(forecast=forecast, bracket=impossible) == 0
+    assert model.probability(forecast=forecast, bracket=possible) == pytest.approx(1)

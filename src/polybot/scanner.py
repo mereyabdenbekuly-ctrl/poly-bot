@@ -15,6 +15,12 @@ from polybot.models import (
     RuleInterpretation,
     ScanReport,
 )
+from polybot.observations import (
+    ObservationHistory,
+    StationObservationCollector,
+    apply_observed_max,
+    bracket_is_impossible,
+)
 from polybot.polymarket_gateway import PolymarketGateway
 from polybot.risk import evaluate_market
 from polybot.rules import build_brackets, deterministic_rule_audit
@@ -27,6 +33,7 @@ class Scanner:
         self.settings = settings
         self.storage = storage
         self.weather = OpenMeteoEnsemble(settings)
+        self.observations = StationObservationCollector(settings)
 
     def scan(
         self,
@@ -164,7 +171,9 @@ class Scanner:
         audit = deterministic
         if use_astra:
             try:
-                astra = AstraRuleAuditor(settings=self.settings, storage=self.storage).audit(event)
+                astra = AstraRuleAuditor(settings=self.settings, storage=self.storage).audit(
+                    event, run_id=run_id
+                )
                 audit = _combine_rule_audits(deterministic, astra)
             except Exception as error:
                 errors.append(f"event {event.id}: Astra audit failed: {error}")
@@ -176,14 +185,42 @@ class Scanner:
             brackets = {}
             errors.append(f"event {event.id}: {error}")
 
+        observation_history: ObservationHistory | None = None
+        observation_blockers: list[str] = []
+        observation_warnings: list[str] = []
+        if deterministic.interpretation.tradeable:
+            try:
+                observation_history = self.observations.fetch(deterministic.interpretation)
+                self.storage.record_observation_history(run_id, event.id, observation_history)
+                observation_blockers.extend(observation_history.blocking_reasons)
+                observation_warnings.extend(observation_history.warning_reasons)
+            except Exception as error:
+                observation_blockers.append("OBSERVATION_SOURCE_UNAVAILABLE")
+                errors.append(f"event {event.id}: observation source failed: {error}")
+
+        rule_blockers, rule_warnings = _runtime_rule_ambiguities(
+            audit.interpretation, observation_history
+        )
         probabilities: dict[str, Decimal] = {}
-        # This scanner has only observe/paper modes. A deterministic parse is
-        # enough to study the hypothesis; Astra ambiguities remain warnings.
-        # A future live executor must require the combined audit to be tradeable.
         analysis_rules = deterministic.interpretation
-        if analysis_rules.tradeable and brackets:
+        if analysis_rules.tradeable and brackets and not observation_blockers and not rule_blockers:
             try:
                 forecast = self.weather.forecast(analysis_rules)
+                adjusted_members = apply_observed_max(
+                    forecast.member_values,
+                    None if observation_history is None else observation_history.observed_max_c,
+                )
+                forecast = forecast.model_copy(
+                    update={
+                        "unadjusted_member_values": forecast.member_values,
+                        "member_values": adjusted_members,
+                        "observed_floor_c": (
+                            None
+                            if observation_history is None
+                            else observation_history.observed_max_c
+                        ),
+                    }
+                )
                 self.storage.record_weather(run_id, event.id, forecast)
                 probabilities = {
                     market_id: Decimal(
@@ -209,11 +246,28 @@ class Scanner:
                 warning_codes: list[str] = []
                 if not deterministic.interpretation.tradeable:
                     extra_reasons.append("RULES_NOT_ANALYZABLE")
-                elif use_astra and not audit.interpretation.tradeable:
-                    warning_codes.append("ASTRA_RULE_AMBIGUITY_PAPER_ONLY")
+                extra_reasons.extend(rule_blockers)
+                extra_reasons.extend(observation_blockers)
+                warning_codes.extend(rule_warnings)
+                warning_codes.extend(observation_warnings)
                 if market.id not in brackets:
                     extra_reasons.append("BRACKET_NOT_PARSED")
-                if not probabilities and analysis_rules.tradeable:
+                bracket = brackets.get(market.id)
+                if (
+                    bracket is not None
+                    and observation_history is not None
+                    and bracket_is_impossible(
+                        upper=bracket.upper,
+                        observed_display_max_c=observation_history.displayed_max_c,
+                    )
+                ):
+                    extra_reasons.append("OBSERVED_MAX_EXCEEDS_BRACKET")
+                if (
+                    not probabilities
+                    and analysis_rules.tradeable
+                    and not observation_blockers
+                    and not rule_blockers
+                ):
                     extra_reasons.append("WEATHER_PROBABILITY_UNAVAILABLE")
                 if extra_reasons or warning_codes:
                     decision = decision.model_copy(
@@ -374,6 +428,37 @@ def _paper_idempotency_key(decision: MarketDecision) -> str:
             decision.asset_id,
             decision.book_hash,
             str(decision.probability),
+            decision.strategy_version,
+            decision.execution_model,
         )
     )
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _runtime_rule_ambiguities(
+    interpretation: RuleInterpretation,
+    history: ObservationHistory | None,
+) -> tuple[list[str], list[str]]:
+    """Resolve only ambiguities proven by current primary-source evidence."""
+
+    if interpretation.tradeable:
+        return [], []
+    blockers: list[str] = []
+    warnings: list[str] = []
+    for reason in interpretation.ambiguity_reasons:
+        lowered = reason.casefold()
+        if history is not None and ("timezone" in lowered or "source-local date" in lowered):
+            warnings.append("RULE_TIMEZONE_VERIFIED_FROM_STATION_SOURCE")
+            continue
+        if (
+            history is not None
+            and history.observations
+            and not history.stale
+            and "weather underground" in lowered
+        ):
+            warnings.append("FALLBACK_SOURCE_AMBIGUOUS_PRIMARY_AVAILABLE")
+            continue
+        blockers.append("UNRESOLVED_RULE_AMBIGUITY")
+    if not interpretation.ambiguity_reasons:
+        blockers.append("ASTRA_RULES_NOT_TRADEABLE")
+    return list(dict.fromkeys(blockers)), list(dict.fromkeys(warnings))

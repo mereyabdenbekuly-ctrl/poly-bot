@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     max_forecast_horizon_days: int = Field(default=10, ge=0, le=30)
     weather_geocoding_url: str = "https://geocoding-api.open-meteo.com/v1/search"
     weather_ensemble_url: str = "https://ensemble-api.open-meteo.com/v1/ensemble"
+    weather_wrh_token_url: str = "https://www.weather.gov/source/wrh/apiKey.js"
+    weather_synoptic_url: str = "https://api.synopticdata.com/v2/stations/timeseries"
+    weather_awc_metar_url: str = "https://aviationweather.gov/api/data/metar"
+    observation_default_cadence_minutes: int = Field(default=60, ge=10, le=180)
+    observation_stale_multiplier: float = Field(default=2.5, ge=1.5, le=6)
 
     http_timeout_seconds: float = Field(default=20.0, ge=1, le=120)
 
