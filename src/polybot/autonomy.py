@@ -40,6 +40,9 @@ class AutonomousRunner:
         interval: int,
     ) -> None:
         interval = max(30, int(interval))
+        # No scan can belong to this brand-new runner yet. Any persisted
+        # ``running`` row was abandoned by a previous process.
+        self.storage.recover_stale_scans(older_than_seconds=0)
         window = self.storage.start_runtime_window(
             query=query,
             interval_seconds=interval,

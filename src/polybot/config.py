@@ -56,6 +56,20 @@ class Settings(BaseSettings):
     max_forecast_horizon_days: int = Field(default=10, ge=0, le=30)
     weather_geocoding_url: str = "https://geocoding-api.open-meteo.com/v1/search"
     weather_ensemble_url: str = "https://ensemble-api.open-meteo.com/v1/ensemble"
+    # ECMWF IFS ENS is collected as a shadow source.  It never changes v1
+    # paper decisions; the explicit model selector prevents Open-Meteo from
+    # silently blending it with other ensembles.
+    ecmwf_enabled: bool = False
+    ecmwf_shadow_model: str = "ecmwf_ifs025"
+    ecmwf_json_archive_root: Path = Path("data/forecasts/ecmwf-ifs025-json")
+    ecmwf_min_members: int = Field(default=50, ge=20, le=50)
+    forecast_v2_enabled: bool = False
+    forecast_v2_station_min_samples: int = Field(default=5, ge=2, le=1000)
+    forecast_v2_pooled_min_samples: int = Field(default=20, ge=5, le=10000)
+    forecast_v2_default_residual_sigma_c: float = Field(default=1.5, gt=0.1, le=10)
+    forecast_snapshot_min_interval_seconds: int = Field(default=3600, ge=300, le=21600)
+    forecast_snapshot_probability_delta: Decimal = Decimal("0.02")
+    forecast_outcome_monitor_hours: int = Field(default=336, ge=24, le=2160)
     weather_wrh_token_url: str = "https://www.weather.gov/source/wrh/apiKey.js"
     weather_synoptic_url: str = "https://api.synopticdata.com/v2/stations/timeseries"
     weather_awc_metar_url: str = "https://aviationweather.gov/api/data/metar"
@@ -79,6 +93,7 @@ class Settings(BaseSettings):
         "min_probability_edge",
         "min_expected_profit_usd",
         "execution_buffer_usd",
+        "forecast_snapshot_probability_delta",
     )
     @classmethod
     def _nonnegative_decimal(cls, value: Decimal) -> Decimal:

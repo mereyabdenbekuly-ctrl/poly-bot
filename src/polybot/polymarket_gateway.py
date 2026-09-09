@@ -15,6 +15,7 @@ from polybot.models import (
     MarketSnapshot,
     OutcomeSide,
     ResolutionCheck,
+    ResolvedWeatherWinner,
 )
 
 
@@ -83,9 +84,7 @@ class PolymarketGateway:
         requested = str(event_id)
         event = self._normalize_event(self._client.get_event(id=requested))
         if event.id != requested:
-            raise ValueError(
-                f"event identity mismatch: requested={requested}, api={event.id}"
-            )
+            raise ValueError(f"event identity mismatch: requested={requested}, api={event.id}")
         return event
 
     def get_weather_events_by_ids(self, event_ids: Iterable[str]) -> list[EventDefinition]:
@@ -201,6 +200,45 @@ class PolymarketGateway:
             won=won,
             yes_price=yes,
             no_price=no,
+        )
+
+    def get_resolved_weather_winner(self, event_id: str) -> ResolvedWeatherWinner:
+        """Return the one YES=1 bracket after every identity/finality check."""
+
+        event = self._client.get_event(id=str(event_id))
+        winners = []
+        for market in event.markets:
+            status = market.resolution.uma_resolution_status
+            status_value = None if status is None else str(status.value)
+            yes = market.outcomes.yes.price
+            no = market.outcomes.no.price
+            if (
+                market.state.closed
+                and status_value in {"resolved", "settled"}
+                and market.resolution.resolved_by is not None
+                and yes == Decimal(1)
+                and no == Decimal(0)
+                and market.condition_id is not None
+                and market.resolution.source
+            ):
+                winners.append(market)
+        if len(winners) != 1:
+            raise ValueError(
+                f"event {event_id} has {len(winners)} confirmed winning weather brackets"
+            )
+        winner = winners[0]
+        # The SDK's normalized Market model exposes ``closed_time`` but not an
+        # ``updated_at`` field. Do not dereference an unmodeled API attribute;
+        # receipt time is the only honest fallback when closed_time is absent.
+        resolved_at = winner.state.closed_time or datetime.now(UTC)
+        return ResolvedWeatherWinner(
+            event_id=str(event.id),
+            market_id=str(winner.id),
+            condition_id=str(winner.condition_id),
+            outcome_label=winner.group_item_title or winner.question,
+            resolution_source=str(winner.resolution.source),
+            resolved_by=str(winner.resolution.resolved_by),
+            resolved_at_utc=resolved_at,
         )
 
     def get_snapshot_for_token(

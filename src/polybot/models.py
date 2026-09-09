@@ -234,6 +234,18 @@ class ResolutionCheck(StrictModel):
     no_price: Decimal | None
 
 
+class ResolvedWeatherWinner(StrictModel):
+    """Official winning bracket for one fully resolved weather event."""
+
+    event_id: str
+    market_id: str
+    condition_id: str
+    outcome_label: str
+    resolution_source: str
+    resolved_by: str
+    resolved_at_utc: datetime
+
+
 class PaperMark(StrictModel):
     """Executable, same-token bid-side mark for a paper position."""
 

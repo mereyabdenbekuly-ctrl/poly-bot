@@ -144,6 +144,7 @@ class ForecastSubmission(StrictModel):
     observed_floor_c: Decimal | None = None
     probabilities: list[ForecastProbability] = Field(min_length=1)
     observations: list[ForecastObservationEvidence] = Field(default_factory=list)
+    metadata: dict[str, object] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _validate_submission(self) -> ForecastSubmission:
@@ -228,6 +229,13 @@ class RealizedForecastOutcome(StrictModel):
             value = getattr(self, name)
             if value is not None and value.tzinfo is None:
                 raise ValueError(f"{name} must be timezone-aware")
+        if self.recorded_at_utc < self.resolved_at_utc:
+            raise ValueError("recorded_at_utc must not precede resolved_at_utc")
+        if (
+            self.source_published_at_utc is not None
+            and self.recorded_at_utc < self.source_published_at_utc
+        ):
+            raise ValueError("recorded_at_utc must not precede source publication")
         return self
 
 
@@ -235,6 +243,7 @@ class ForecastMetricsQuery(StrictModel):
     source: str | None = None
     model: str | None = None
     algorithm_version: str | None = None
+    station_id: str | None = None
     phases: tuple[ForecastPhase, ...] = (
         ForecastPhase.LEAD_TIME,
         ForecastPhase.INTRADAY,

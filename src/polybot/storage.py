@@ -639,6 +639,46 @@ class Storage:
                         "strategy_version": decision.get("strategy_version", "v1"),
                     }
                 )
+        forecast_comparison: dict[str, object]
+        try:
+            from polybot.forecast_store import ForecastStore
+
+            forecast_comparison = ForecastStore(self.path).dashboard_summary()
+        except Exception as error:
+            forecast_comparison = {
+                "counts": {"model_runs": 0, "predictions": 0, "outcome_versions": 0},
+                "events": [],
+                "metrics": [],
+                "station_metrics": [],
+                "outcomes": [],
+                "error": str(error),
+            }
+        dashboard_reports: list[dict[str, object]] = []
+        if active is not None:
+            for report in self.runtime_reports(active.id):
+                payload = report.model_dump(mode="json")
+                if report.kind == "CYCLE" and isinstance(report.payload.get("scan"), dict):
+                    scan = cast(dict[str, object], report.payload["scan"])
+                    payload["payload"] = {
+                        "scan": {
+                            key: scan.get(key)
+                            for key in (
+                                "run_id",
+                                "geoblock",
+                                "events_scanned",
+                                "markets_scanned",
+                                "paper_orders_opened",
+                                "paper_orders_settled",
+                                "errors",
+                                "weather_next_status",
+                            )
+                        }
+                    }
+                dashboard_reports.append(payload)
+        compact_windows = [
+            {key: value for key, value in window.items() if key != "reports"}
+            for window in self.recent_runtime_windows(limit=2)
+        ]
         return {
             "generated_at": utc_now().isoformat(),
             "portfolio": portfolio,
@@ -646,10 +686,9 @@ class Storage:
             "latest_scan": latest_scan,
             "decisions": compact_decisions,
             "active_window": None if active is None else active.model_dump(mode="json"),
-            "reports": []
-            if active is None
-            else [report.model_dump(mode="json") for report in self.runtime_reports(active.id)],
-            "recent_windows": self.recent_runtime_windows(),
+            "reports": dashboard_reports,
+            "recent_windows": compact_windows,
+            "forecast_comparison": forecast_comparison,
         }
 
     def start_scan(self, *, query: str, mode: str, window_id: int | None = None) -> int:
@@ -662,6 +701,37 @@ class Storage:
                 (utc_now().isoformat(), query, mode, window_id),
             )
             return _lastrowid(cursor)
+
+    def recover_stale_scans(self, *, older_than_seconds: int = 900) -> int:
+        """Mark abandoned scans after a process/host restart.
+
+        A scan is single-threaded, so an old ``running`` row cannot represent
+        work still owned by the current observer. This keeps the dashboard and
+        runtime reports honest after a crash or machine reboot.
+        """
+
+        cutoff = utc_now().timestamp() - max(0, older_than_seconds)
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT id, started_at FROM scan_runs WHERE status = 'running'"
+            ).fetchall()
+            stale_ids: list[int] = []
+            for row in rows:
+                try:
+                    started = datetime.fromisoformat(str(row["started_at"])).timestamp()
+                except ValueError:
+                    started = 0
+                if started < cutoff:
+                    stale_ids.append(int(row["id"]))
+            if stale_ids:
+                placeholders = ",".join("?" for _ in stale_ids)
+                connection.execute(
+                    f"UPDATE scan_runs SET status='failed', completed_at=?, "
+                    f"error='stale scan recovered after observer restart' "
+                    f"WHERE id IN ({placeholders})",
+                    (utc_now().isoformat(), *stale_ids),
+                )
+        return len(stale_ids)
 
     def finish_scan(
         self,
@@ -841,6 +911,17 @@ class Storage:
                 (run_id, event_id, forecast.fetched_at.isoformat(), forecast.model_dump_json()),
             )
 
+    def latest_weather_forecast(self, event_id: str) -> WeatherForecast | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM weather_snapshots WHERE event_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (event_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return WeatherForecast.model_validate_json(row["payload_json"])
+
     def record_observation_history(
         self, run_id: int, event_id: str, history: ObservationHistory
     ) -> None:
@@ -899,6 +980,17 @@ class Storage:
                         "UPDATE station_observation_versions SET last_seen_at_utc = ? WHERE id = ?",
                         (history.fetched_at_utc.isoformat(), existing["id"]),
                     )
+
+    def latest_observation_history(self, event_id: str) -> ObservationHistory | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM observation_fetches WHERE event_id = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (event_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return ObservationHistory.model_validate_json(row["payload_json"])
 
     def record_weathernext_snapshot(self, run_id: int, event_id: str, snapshot: object) -> None:
         payload = snapshot.model_dump_json()  # type: ignore[union-attr]

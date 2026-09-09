@@ -295,6 +295,60 @@ def test_archived_model_run_is_reused_with_new_issuance_and_observations(
     assert rows[0]["observation_cutoff_at_utc"] != rows[1]["observation_cutoff_at_utc"]
 
 
+def test_prediction_archive_throttles_unchanged_polling_but_keeps_material_change(
+    tmp_path: Path,
+) -> None:
+    path, run_id = _prepare_database(tmp_path)
+    store = ForecastStore(path)
+    first = _submission(
+        run_id=run_id,
+        issued_at=datetime(2026, 9, 8, 12, tzinfo=UTC),
+    )
+    unchanged = _submission(
+        run_id=run_id,
+        issued_at=datetime(2026, 9, 8, 12, 5, tzinfo=UTC),
+        model_fetched_at=first.model_run.fetched_at_utc,
+        observation_cutoff=datetime(2026, 9, 8, 11, 59, tzinfo=UTC),
+        init_time=first.model_run.init_time_utc,
+        published_at=first.model_run.published_at_utc,
+    )
+    changed = unchanged.model_copy(
+        update={
+            "issued_at_utc": datetime(2026, 9, 8, 12, 10, tzinfo=UTC),
+            "probabilities": [
+                unchanged.probabilities[0].model_copy(
+                    update={"probability": Decimal("0.67")}
+                ),
+                unchanged.probabilities[1].model_copy(
+                    update={"probability": Decimal("0.33")}
+                ),
+            ],
+        }
+    )
+
+    first_id = store.record(
+        first, min_interval_seconds=3600, probability_delta=Decimal("0.02")
+    )
+    assert (
+        store.record(
+            unchanged,
+            min_interval_seconds=3600,
+            probability_delta=Decimal("0.02"),
+        )
+        == first_id
+    )
+    assert store.counts()["predictions"] == 1
+    assert (
+        store.record(
+            changed,
+            min_interval_seconds=3600,
+            probability_delta=Decimal("0.02"),
+        )
+        != first_id
+    )
+    assert store.counts()["predictions"] == 2
+
+
 def test_phase_uses_prediction_issuance_not_archived_model_fetch(tmp_path: Path) -> None:
     path, run_id = _prepare_database(tmp_path)
     store = ForecastStore(path)
@@ -363,6 +417,10 @@ def test_metrics_use_unique_events_and_latest_forecast_per_segment(tmp_path: Pat
     assert report.by_lead_time["LEAD_006_012H"].forecast_count == 1
     assert report.by_lead_time["LEAD_012_024H"].forecast_count == 1
 
+    station_report = store.metrics(ForecastMetricsQuery(station_id="TEST"))
+    assert station_report.overall.outcome_event_count == 1
+    assert station_report.overall.coverage == Decimal(1)
+
 
 def test_multiclass_brier_uses_full_distribution_once_per_event() -> None:
     case = ForecastEvaluationCase(
@@ -427,6 +485,49 @@ def test_outcome_revisions_are_append_only_and_as_of_is_reproducible(tmp_path: P
     assert historical.overall.exact_bracket_accuracy == Decimal(1)
     assert current.overall.exact_bracket_accuracy == Decimal(0)
     assert store.counts()["outcome_versions"] == 2
+
+
+def test_outcome_identity_is_checked_when_forecasts_exist(tmp_path: Path) -> None:
+    path, run_id = _prepare_database(tmp_path)
+    store = ForecastStore(path)
+    store.record(
+        _submission(run_id=run_id, issued_at=datetime(2026, 9, 8, 12, tzinfo=UTC))
+    )
+
+    with pytest.raises(ValueError, match="rule-day identity mismatch"):
+        store.record_outcome(
+            _outcome(source_revision="wrong-station").model_copy(
+                update={"station_id": "OTHER"}
+            )
+        )
+
+
+def test_forecasted_ended_events_are_polled_and_refreshed_for_corrections(
+    tmp_path: Path,
+) -> None:
+    path, run_id = _prepare_database(tmp_path)
+    store = ForecastStore(path)
+    store.record(
+        _submission(run_id=run_id, issued_at=datetime(2026, 9, 8, 12, tzinfo=UTC))
+    )
+    as_of = datetime(2026, 9, 10, 1, tzinfo=UTC)
+
+    assert store.pending_outcome_event_ids(as_of_utc=as_of) == ["event-1"]
+    store.record_outcome(_outcome(source_revision="first"))
+    assert store.pending_outcome_event_ids(as_of_utc=as_of) == []
+    assert store.outcome_refresh_event_ids(as_of_utc=as_of) == ["event-1"]
+
+
+def test_outcome_timestamps_must_be_causal() -> None:
+    payload = _outcome(source_revision="bad-time").model_dump()
+    payload.update(
+        {
+            "resolved_at_utc": datetime(2026, 9, 10, 1, tzinfo=UTC),
+            "recorded_at_utc": datetime(2026, 9, 10, tzinfo=UTC),
+        }
+    )
+    with pytest.raises(ValueError, match="must not precede resolved"):
+        RealizedForecastOutcome.model_validate(payload)
 
 
 def test_future_observation_revision_cannot_leak_into_prediction(tmp_path: Path) -> None:

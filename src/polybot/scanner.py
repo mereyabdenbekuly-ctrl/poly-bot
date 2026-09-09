@@ -1,11 +1,20 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from polybot.astra import AstraRuleAuditor
 from polybot.config import Settings
+from polybot.forecast_engine import ForecastEngineV2
+from polybot.forecast_models import RealizedForecastOutcome
+from polybot.forecast_v2 import (
+    ECMWF_RAW_ALGORITHM_VERSION,
+    FORECAST_V2_ALGORITHM_VERSION,
+    ForecastV2Calibrator,
+    OpenMeteoEcmwfIfsEns,
+    build_v2_forecast,
+)
 from polybot.geoblock import fetch_geoblock_status
 from polybot.models import (
     DecisionAction,
@@ -36,6 +45,8 @@ class Scanner:
         self.weather = OpenMeteoEnsemble(settings)
         self.observations = StationObservationCollector(settings)
         self.weathernext = WeatherNextProvider(settings)
+        self.forecasts = ForecastEngineV2(storage.path, settings=settings)
+        self.ecmwf = OpenMeteoEcmwfIfsEns(settings)
 
     def scan(
         self,
@@ -117,6 +128,20 @@ class Scanner:
                     paper_orders_opened += opened
                     decisions.extend(event_decisions)
 
+                forecast_store = getattr(self, "forecasts", None)
+                if forecast_store is not None:
+                    for event_id in forecast_store.store.outcome_refresh_event_ids(
+                        correction_window_hours=self.settings.forecast_outcome_monitor_hours
+                    ):
+                        try:
+                            self._record_forecast_outcome(
+                                gateway, event_id, datetime.now(UTC), run_id=run_id
+                            )
+                        except Exception as error:
+                            errors.append(
+                                f"event {event_id}: forecast outcome pending: {error}"
+                            )
+
             self.storage.finish_scan(
                 run_id,
                 geoblocked=None if geoblock is None else geoblock.blocked,
@@ -159,9 +184,7 @@ class Scanner:
             paper=paper,
         )
         if allow_paper_open:
-            final_decisions, opened = self._finalize_event_decisions(
-                event_decisions, paper=paper
-            )
+            final_decisions, opened = self._finalize_event_decisions(event_decisions, paper=paper)
         else:
             final_decisions = [
                 (_monitor_only_decision(decision), None) for decision in event_decisions
@@ -218,6 +241,67 @@ class Scanner:
                 errors.append(f"paper settlement {order.market_id} failed: {error}")
         return settled, errors
 
+    def _record_forecast_outcome(
+        self,
+        gateway: PolymarketGateway,
+        event_id: str,
+        recorded_at: datetime,
+        *,
+        run_id: int | None = None,
+    ) -> None:
+        """Pair official resolution with the final saved station observations."""
+
+        history = self.storage.latest_observation_history(event_id)
+        if (
+            history is None
+            or history.observed_max_c is None
+            or history.displayed_max_c is None
+            or not history.day_finished
+        ):
+            event = gateway.get_weather_event(event_id)
+            audit = deterministic_rule_audit(event)
+            if not audit.interpretation.tradeable:
+                raise ValueError(f"event {event_id} rules are not analyzable")
+            refreshed = self.observations.fetch(audit.interpretation)
+            if run_id is not None:
+                self.storage.record_observation_history(run_id, event_id, refreshed)
+            history = refreshed
+            if (
+                history.observed_max_c is None
+                or history.displayed_max_c is None
+                or not history.day_finished
+            ):
+                raise ValueError(
+                    f"event {event_id} has no final station observation history for evaluation"
+                )
+        winner = gateway.get_resolved_weather_winner(event_id)
+        recorded_at = max(recorded_at, winner.resolved_at_utc, datetime.now(UTC))
+        revisions = sorted(item.revision_hash for item in history.observations)
+        source_revision = hashlib.sha256(
+            (winner.market_id + ":" + ":".join(revisions)).encode()
+        ).hexdigest()
+        self.forecasts.record_outcome(
+            RealizedForecastOutcome(
+                event_id=event_id,
+                station_id=history.station_id,
+                observation_date=history.observation_date,
+                actual_max_c=history.observed_max_c,
+                displayed_max=history.displayed_max_c,
+                winning_market_id=winner.market_id,
+                winning_condition_id=winner.condition_id,
+                winning_label=winner.outcome_label,
+                resolution_source=winner.resolution_source,
+                source_revision=source_revision,
+                resolved_at_utc=winner.resolved_at_utc,
+                recorded_at_utc=recorded_at,
+                evidence={
+                    "resolved_by": winner.resolved_by,
+                    "observation_revision_hashes": revisions,
+                    "observation_fetch_time": history.fetched_at_utc.isoformat(),
+                },
+            )
+        )
+
     def _scan_event(
         self,
         *,
@@ -264,6 +348,11 @@ class Scanner:
         )
         probabilities: dict[str, Decimal] = {}
         weathernext_probabilities: dict[str, Decimal] = {}
+        forecast = None
+        comparison = None
+        ecmwf_snapshot = None
+        v2_result = None
+        post_event_reused_snapshot = False
         analysis_rules = deterministic.interpretation
         if analysis_rules.tradeable and brackets and not observation_blockers and not rule_blockers:
             try:
@@ -302,8 +391,79 @@ class Scanner:
                         }
                 except Exception as error:
                     errors.append(f"event {event.id}: WeatherNext comparison failed: {error}")
+
+                ecmwf_adapter = getattr(self, "ecmwf", None)
+                if (
+                    self.settings.ecmwf_enabled
+                    and self.settings.forecast_v2_enabled
+                    and ecmwf_adapter is not None
+                    and observation_history is not None
+                ):
+                    try:
+                        ecmwf_snapshot = ecmwf_adapter.forecast_from_baseline(forecast)
+                        issued_at = datetime.now(UTC)
+                        profile = ForecastV2Calibrator(
+                            self.settings, self.forecasts.store
+                        ).profile(
+                            station_id=observation_history.station_id,
+                            as_of_utc=issued_at,
+                        )
+                        v2_result = build_v2_forecast(
+                            snapshot=ecmwf_snapshot,
+                            observations=observation_history,
+                            brackets=brackets,
+                            profile=profile,
+                            issued_at_utc=issued_at,
+                        )
+                    except Exception as error:
+                        errors.append(f"event {event.id}: ECMWF/v2 shadow failed: {error}")
             except Exception as error:
-                errors.append(f"event {event.id}: weather model failed: {error}")
+                # Once a station-local day has passed, an ensemble endpoint
+                # may no longer serve that date. Reuse the last immutable model
+                # snapshot with fresh observations for monitoring/revaluation;
+                # this is explicitly marked as post-event reanalysis and never
+                # enables a new paper entry.
+                previous = self.storage.latest_weather_forecast(event.id)
+                if previous is None:
+                    errors.append(f"event {event.id}: weather model failed: {error}")
+                else:
+                    errors.append(
+                        f"event {event.id}: weather model unavailable; "
+                        "reused last forecast snapshot for monitoring"
+                    )
+                    post_event_reused_snapshot = True
+                    forecast = previous
+                    raw_members = forecast.unadjusted_member_values or forecast.member_values
+                    adjusted_members = apply_observed_max(
+                        raw_members,
+                        None
+                        if observation_history is None
+                        else observation_history.observed_max_c,
+                    )
+                    forecast = forecast.model_copy(
+                        update={
+                            "unadjusted_member_values": raw_members,
+                            "member_values": adjusted_members,
+                            "observed_floor_c": (
+                                None
+                                if observation_history is None
+                                else observation_history.observed_max_c
+                            ),
+                        }
+                    )
+                    probabilities = {
+                        market_id: Decimal(
+                            str(
+                                round(
+                                    self.weather.probability(
+                                        forecast=forecast, bracket=bracket
+                                    ),
+                                    10,
+                                )
+                            )
+                        )
+                        for market_id, bracket in brackets.items()
+                    }
 
         event_decisions: list[MarketDecision] = []
         for market in event.markets:
@@ -370,6 +530,99 @@ class Scanner:
                 event_decisions.append(decision)
             except Exception as error:
                 errors.append(f"event {event.id}, market {market.id}: snapshot failed: {error}")
+
+        # Shadow forecasts are persisted only after every same-run market
+        # snapshot exists. Failures are diagnostic and never alter v1 actions.
+        forecast_engine = getattr(self, "forecasts", None)
+        if (
+            forecast_engine is not None
+            and forecast is not None
+            and observation_history is not None
+            and probabilities
+        ):
+            try:
+                forecast_engine.record_open_meteo(
+                    scan_run_id=run_id,
+                    event_id=event.id,
+                    audit=audit,
+                    forecast=forecast,
+                    brackets=brackets,
+                    probabilities=probabilities,
+                    observations=observation_history,
+                    source_uri=self.settings.weather_ensemble_url,
+                    weather_error_sigma_c=Decimal(str(self.settings.weather_error_sigma_c)),
+                    metadata=(
+                        {"post_event_reused_snapshot": True}
+                        if post_event_reused_snapshot
+                        else None
+                    ),
+                )
+            except Exception as error:
+                errors.append(f"event {event.id}: v1 forecast archive failed: {error}")
+        if (
+            forecast_engine is not None
+            and comparison is not None
+            and observation_history is not None
+            and weathernext_probabilities
+        ):
+            try:
+                forecast_engine.record_weathernext(
+                    scan_run_id=run_id,
+                    event_id=event.id,
+                    audit=audit,
+                    snapshot=comparison,
+                    brackets=brackets,
+                    probabilities=weathernext_probabilities,
+                    observations=observation_history,
+                    model_version="weathernext-3",
+                )
+            except Exception as error:
+                errors.append(f"event {event.id}: WeatherNext forecast archive failed: {error}")
+        if (
+            forecast_engine is not None
+            and ecmwf_snapshot is not None
+            and v2_result is not None
+            and observation_history is not None
+        ):
+            try:
+                forecast_engine.record_ecmwf_shadow(
+                    scan_run_id=run_id,
+                    event_id=event.id,
+                    audit=audit,
+                    snapshot=ecmwf_snapshot,
+                    brackets=brackets,
+                    probabilities=v2_result.raw_probabilities,
+                    observations=observation_history,
+                    algorithm_version=ECMWF_RAW_ALGORITHM_VERSION,
+                    point_forecast_c=v2_result.raw_point_c,
+                    metadata={
+                        "uses_station_correction": False,
+                        "uses_observations": False,
+                        "distribution": "empirical_50_member",
+                    },
+                )
+                forecast_engine.record_ecmwf_shadow(
+                    scan_run_id=run_id,
+                    event_id=event.id,
+                    audit=audit,
+                    snapshot=ecmwf_snapshot,
+                    brackets=brackets,
+                    probabilities=v2_result.v2_probabilities,
+                    observations=observation_history,
+                    algorithm_version=FORECAST_V2_ALGORITHM_VERSION,
+                    adjusted_member_max_c=v2_result.corrected_member_max_c,
+                    observed_floor_c=observation_history.observed_max_c,
+                    point_forecast_c=v2_result.v2_point_c,
+                    metadata={
+                        "uses_station_correction": v2_result.profile.state == "fitted",
+                        "uses_observations": True,
+                        "station_correction": v2_result.profile.as_metadata(),
+                        "intraday_features": v2_result.intraday_features,
+                        "distribution": "bias_spread_corrected_truncated_normal_mixture",
+                    },
+                )
+            except Exception as error:
+                errors.append(f"event {event.id}: ECMWF forecast archive failed: {error}")
         return event_decisions, errors
 
     def _finalize_event_decisions(

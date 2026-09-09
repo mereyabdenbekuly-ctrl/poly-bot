@@ -5,9 +5,9 @@ readonly project="/Users/admin/Documents/ChatGPT/poly-bot"
 readonly destination="$HOME/Library/LaunchAgents"
 readonly domain="gui/$(id -u)"
 
-mkdir -p "$destination" "$project/data"
+mkdir -p "$destination" "$project/data" "$HOME/Library/Application Support/Polybot/backups"
 
-for label in com.polybot.observer com.polybot.dashboard; do
+for label in com.polybot.observer com.polybot.dashboard com.polybot.backup com.polybot.ecmwf-archive; do
   source_plist="$project/deploy/macos/$label.plist"
   destination_plist="$destination/$label.plist"
   plutil -lint "$source_plist"

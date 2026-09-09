@@ -103,6 +103,7 @@ class ForecastStore:
                     observation_revision_count INTEGER NOT NULL,
                     observation_cutoff_at_utc TEXT NOT NULL,
                     distribution_mass TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
                     submission_hash TEXT NOT NULL UNIQUE,
                     created_at_utc TEXT NOT NULL
                 );
@@ -169,6 +170,14 @@ class ForecastStore:
                     UNIQUE(event_id, source_revision)
                 );
 
+                CREATE TABLE IF NOT EXISTS forecast_source_status_v2 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    checked_at_utc TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS forecast_predictions_event_idx
                     ON forecast_predictions_v2(event_id, phase, issued_at_utc);
                 CREATE INDEX IF NOT EXISTS forecast_predictions_model_idx
@@ -177,6 +186,8 @@ class ForecastStore:
                     ON forecast_probabilities_v2(market_id, market_snapshot_id);
                 CREATE INDEX IF NOT EXISTS forecast_outcomes_event_idx
                     ON forecast_outcome_versions_v2(event_id, recorded_at_utc, id);
+                CREATE INDEX IF NOT EXISTS forecast_source_status_idx
+                    ON forecast_source_status_v2(source, checked_at_utc, id);
                 """
             )
             connection.execute(
@@ -184,8 +195,32 @@ class ForecastStore:
                 "VALUES (?, ?)",
                 (FORECAST_SCHEMA_VERSION, datetime.now(UTC).isoformat()),
             )
+            columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(forecast_predictions_v2)"
+                ).fetchall()
+            }
+            if "metadata_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE forecast_predictions_v2 "
+                    "ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
+                )
+            connection.execute(
+                "UPDATE forecast_model_runs_v2 SET "
+                "source='open-meteo-ecmwf', "
+                "model='ECMWF IFS ENS 0.25° daily max via Open-Meteo' "
+                "WHERE source='ecmwf' "
+                "AND json_extract(metadata_json, '$.transport_provider')='open-meteo'"
+            )
 
-    def record(self, submission: ForecastSubmission) -> int:
+    def record(
+        self,
+        submission: ForecastSubmission,
+        *,
+        min_interval_seconds: int = 0,
+        probability_delta: Decimal = Decimal(0),
+    ) -> int:
         """Persist a fully linked forecast; identical submissions are idempotent."""
 
         submission_hash = _digest(submission.model_dump(mode="json"))
@@ -197,6 +232,19 @@ class ForecastStore:
             if existing is not None:
                 return int(existing["id"])
             self._require_scan_run(connection, submission.scan_run_id)
+            previous = self._latest_prediction(
+                connection,
+                event_id=submission.event_id,
+                algorithm_version=submission.algorithm_version,
+            )
+            if previous is not None and not self._materially_changed(
+                connection,
+                previous=previous,
+                submission=submission,
+                min_interval_seconds=max(0, min_interval_seconds),
+                probability_delta=max(Decimal(0), probability_delta),
+            ):
+                return int(previous["id"])
             snapshots = self._market_snapshots(
                 connection,
                 run_id=submission.scan_run_id,
@@ -215,11 +263,90 @@ class ForecastStore:
             self._insert_observation_evidence(connection, prediction_id, submission)
             return prediction_id
 
+    @staticmethod
+    def _latest_prediction(
+        connection: sqlite3.Connection,
+        *,
+        event_id: str,
+        algorithm_version: str,
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            "SELECT * FROM forecast_predictions_v2 WHERE event_id = ? "
+            "AND algorithm_version = ? ORDER BY issued_at_utc DESC, id DESC LIMIT 1",
+            (event_id, algorithm_version),
+        ).fetchone()
+
+    @staticmethod
+    def _materially_changed(
+        connection: sqlite3.Connection,
+        *,
+        previous: sqlite3.Row,
+        submission: ForecastSubmission,
+        min_interval_seconds: int,
+        probability_delta: Decimal,
+    ) -> bool:
+        previous_issued = datetime.fromisoformat(str(previous["issued_at_utc"]))
+        elapsed = (submission.issued_at_utc - previous_issued).total_seconds()
+        if elapsed >= min_interval_seconds:
+            return True
+        if str(previous["phase"]) != submission.phase.value:
+            return True
+        prior_floor = (
+            None
+            if previous["observed_floor_c"] is None
+            else Decimal(str(previous["observed_floor_c"]))
+        )
+        if prior_floor != submission.observed_floor_c:
+            return True
+        rows = connection.execute(
+            "SELECT market_id, probability FROM forecast_probabilities_v2 "
+            "WHERE prediction_id = ?",
+            (previous["id"],),
+        ).fetchall()
+        prior = {str(row["market_id"]): Decimal(str(row["probability"])) for row in rows}
+        current = {item.market_id: item.probability for item in submission.probabilities}
+        if prior.keys() != current.keys():
+            return True
+        prior_top = max(prior, key=prior.__getitem__)
+        current_top = max(current, key=current.__getitem__)
+        if prior_top != current_top:
+            return True
+        return any(abs(current[key] - prior[key]) >= probability_delta for key in current)
+
     def record_outcome(self, outcome: RealizedForecastOutcome) -> int:
         """Append one outcome revision; never rewrite an earlier revision."""
 
         outcome_hash = _digest(outcome.model_dump(mode="json"))
         with self.transaction() as connection:
+            prediction_rows = connection.execute(
+                "SELECT DISTINCT station_id, observation_date "
+                "FROM forecast_predictions_v2 WHERE event_id = ?",
+                (outcome.event_id,),
+            ).fetchall()
+            if prediction_rows:
+                identities = {
+                    (str(row["station_id"]), str(row["observation_date"]))
+                    for row in prediction_rows
+                }
+                expected_identity = (
+                    outcome.station_id,
+                    outcome.observation_date.isoformat(),
+                )
+                if identities != {expected_identity}:
+                    raise ValueError(
+                        f"outcome rule-day identity mismatch: forecasts={sorted(identities)}, "
+                        f"outcome={expected_identity}"
+                    )
+                winner_known = connection.execute(
+                    """
+                    SELECT 1 FROM forecast_probabilities_v2 fp
+                    JOIN forecast_predictions_v2 p ON p.id = fp.prediction_id
+                    WHERE p.event_id = ? AND fp.market_id = ? LIMIT 1
+                    """,
+                    (outcome.event_id, outcome.winning_market_id),
+                ).fetchone()
+                if winner_known is None:
+                    raise ValueError("outcome winner is absent from archived forecast brackets")
             existing = connection.execute(
                 "SELECT id, outcome_hash FROM forecast_outcome_versions_v2 "
                 "WHERE event_id = ? AND source_revision = ?",
@@ -265,7 +392,10 @@ class ForecastStore:
     def metrics(self, query: ForecastMetricsQuery | None = None) -> ForecastMetricsReport:
         query = query or ForecastMetricsQuery()
         predictions = self._load_predictions(query)
-        outcomes = self._load_latest_outcomes(as_of=query.as_of_utc)
+        outcomes = self._load_latest_outcomes(
+            as_of=query.as_of_utc,
+            station_id=query.station_id,
+        )
         outcome_count = len(outcomes)
 
         def make_slice(segment: str, rows: list[sqlite3.Row]) -> ForecastMetricsSlice:
@@ -305,6 +435,273 @@ class ForecastStore:
                 "outcome_versions": _count(connection, "forecast_outcome_versions_v2"),
             }
 
+    def record_source_status(
+        self,
+        *,
+        source: str,
+        state: str,
+        checked_at_utc: datetime,
+        payload: dict[str, object],
+    ) -> int:
+        if checked_at_utc.tzinfo is None:
+            raise ValueError("source status timestamp must be timezone-aware")
+        with self.connect() as connection:
+            cursor = connection.execute(
+                "INSERT INTO forecast_source_status_v2("
+                "source, state, checked_at_utc, payload_json) VALUES (?, ?, ?, ?)",
+                (
+                    source,
+                    state,
+                    checked_at_utc.astimezone(UTC).isoformat(),
+                    _canonical_json(payload),
+                ),
+            )
+            return _lastrowid(cursor)
+
+    def latest_source_statuses(self) -> list[dict[str, object]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT s.* FROM forecast_source_status_v2 s
+                JOIN (
+                    SELECT source, MAX(id) AS id FROM forecast_source_status_v2
+                    GROUP BY source
+                ) latest ON latest.id = s.id
+                ORDER BY s.source
+                """
+            ).fetchall()
+        return [
+            {
+                "source": str(row["source"]),
+                "state": str(row["state"]),
+                "checked_at_utc": str(row["checked_at_utc"]),
+                "payload": _json_object(row["payload_json"]),
+            }
+            for row in rows
+        ]
+
+    def pending_outcome_event_ids(self, *, as_of_utc: datetime | None = None) -> list[str]:
+        """Forecasted ended events that still need an immutable weather outcome."""
+
+        as_of = (as_of_utc or datetime.now(UTC)).isoformat()
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT DISTINCT p.event_id
+                FROM forecast_predictions_v2 p
+                LEFT JOIN forecast_outcome_versions_v2 o ON o.event_id = p.event_id
+                WHERE p.rule_day_end_utc <= ? AND o.event_id IS NULL
+                ORDER BY p.event_id
+                """,
+                (as_of,),
+            ).fetchall()
+        return [str(row["event_id"]) for row in rows]
+
+    def outcome_refresh_event_ids(
+        self, *, as_of_utc: datetime | None = None, correction_window_hours: int = 336
+    ) -> list[str]:
+        """Events whose final source can still publish a correction revision."""
+
+        as_of = as_of_utc or datetime.now(UTC)
+        lower = as_of.timestamp() - max(1, correction_window_hours) * 3600
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT event_id, MAX(rule_day_end_utc) AS rule_day_end_utc "
+                "FROM forecast_predictions_v2 WHERE rule_day_end_utc <= ? "
+                "GROUP BY event_id ORDER BY event_id",
+                (as_of.isoformat(),),
+            ).fetchall()
+        return [
+            str(row["event_id"])
+            for row in rows
+            if datetime.fromisoformat(str(row["rule_day_end_utc"])).timestamp() >= lower
+        ]
+
+    def dashboard_summary(self, *, event_limit: int = 20) -> dict[str, object]:
+        """Return a compact, read-only comparison view for the local dashboard."""
+
+        with self.connect() as connection:
+            available_event_count = int(
+                connection.execute(
+                    "SELECT COUNT(DISTINCT event_id) FROM forecast_predictions_v2"
+                ).fetchone()[0]
+            )
+            prediction_rows = connection.execute(
+                """
+                SELECT p.*, m.source, m.model, m.model_version, m.source_run_id,
+                       m.init_time_utc, m.published_at_utc, m.first_fetched_at_utc,
+                       m.source_uri, m.source_payload_hash, m.metadata_json AS model_metadata_json
+                FROM forecast_predictions_v2 p
+                JOIN forecast_model_runs_v2 m ON m.id = p.model_run_id
+                ORDER BY p.issued_at_utc DESC, p.id DESC
+                LIMIT 1000
+                """
+            ).fetchall()
+            latest: dict[tuple[str, str], sqlite3.Row] = {}
+            previous: dict[tuple[str, str], sqlite3.Row] = {}
+            event_order: list[str] = []
+            for row in prediction_rows:
+                event_id = str(row["event_id"])
+                key = (event_id, str(row["algorithm_version"]))
+                if event_id not in event_order:
+                    event_order.append(event_id)
+                if key not in latest:
+                    latest[key] = row
+                elif key not in previous:
+                    previous[key] = row
+
+            selected_events = set(event_order[: max(1, event_limit)])
+            grouped: dict[str, dict[str, object]] = {}
+            for (event_id, algorithm), row in latest.items():
+                if event_id not in selected_events:
+                    continue
+                probability_rows = connection.execute(
+                    """
+                    SELECT fp.*, ms.payload_json
+                    FROM forecast_probabilities_v2 fp
+                    JOIN market_snapshots ms ON ms.id = fp.market_snapshot_id
+                    WHERE fp.prediction_id = ? ORDER BY fp.ordinal
+                    """,
+                    (row["id"],),
+                ).fetchall()
+                distribution: list[dict[str, object]] = []
+                event_title = None
+                for probability in probability_rows:
+                    payload = json.loads(probability["payload_json"])
+                    event_title = event_title or payload.get("event_title")
+                    distribution.append(
+                        {
+                            "market_id": str(probability["market_id"]),
+                            "market_question": payload.get("market_question"),
+                            "label": probability["outcome_label"],
+                            "probability": probability["probability"],
+                            "executable_price": _best_ask_from_snapshot(payload),
+                        }
+                    )
+                distribution.sort(
+                    key=lambda item: Decimal(str(item["probability"])), reverse=True
+                )
+                top = distribution[0] if distribution else None
+                previous_top = self._top_probability(
+                    connection, previous.get((event_id, algorithm))
+                )
+                metadata = _json_object(row["metadata_json"])
+                model_metadata = _json_object(row["model_metadata_json"])
+                event = grouped.setdefault(
+                    event_id,
+                    {
+                        "event_id": event_id,
+                        "event_title": event_title,
+                        "station_id": row["station_id"],
+                        "observation_date": row["observation_date"],
+                        "latest_issued_at_utc": row["issued_at_utc"],
+                        "observed_max_c": row["observed_floor_c"],
+                        "versions": [],
+                    },
+                )
+                event["event_title"] = event.get("event_title") or event_title
+                if str(row["issued_at_utc"]) > str(event["latest_issued_at_utc"]):
+                    event["latest_issued_at_utc"] = row["issued_at_utc"]
+                if row["observed_floor_c"] is not None:
+                    event["observed_max_c"] = row["observed_floor_c"]
+                versions = event["versions"]
+                assert isinstance(versions, list)
+                versions.append(
+                    {
+                        "prediction_id": int(row["id"]),
+                        "algorithm_version": algorithm,
+                        "source": row["source"],
+                        "model": row["model"],
+                        "model_version": row["model_version"],
+                        "phase": row["phase"],
+                        "issued_at_utc": row["issued_at_utc"],
+                        "model_init_time_utc": row["init_time_utc"],
+                        "model_published_at_utc": row["published_at_utc"],
+                        "model_fetched_at_utc": row["model_fetched_at_utc"],
+                        "scenario_count": int(row["scenario_count"]),
+                        "point_forecast_c": row["point_forecast_c"],
+                        "observed_floor_c": row["observed_floor_c"],
+                        "top": top,
+                        "previous_top": previous_top,
+                        "distribution": distribution,
+                        "metadata": metadata,
+                        "model_metadata": model_metadata,
+                    }
+                )
+
+            outcome_rows = connection.execute(
+                "SELECT * FROM forecast_outcome_versions_v2 "
+                "ORDER BY recorded_at_utc DESC, id DESC LIMIT 50"
+            ).fetchall()
+            catalog_rows = connection.execute(
+                """
+                SELECT DISTINCT m.source, m.model, p.algorithm_version, p.station_id
+                FROM forecast_predictions_v2 p
+                JOIN forecast_model_runs_v2 m ON m.id = p.model_run_id
+                ORDER BY m.source, m.model, p.algorithm_version, p.station_id
+                """
+            ).fetchall()
+
+        metrics: list[dict[str, object]] = []
+        seen_catalog: set[tuple[str, str, str]] = set()
+        for row in catalog_rows:
+            key = (str(row["source"]), str(row["model"]), str(row["algorithm_version"]))
+            if key in seen_catalog:
+                continue
+            seen_catalog.add(key)
+            report = self.metrics(
+                ForecastMetricsQuery(
+                    source=key[0], model=key[1], algorithm_version=key[2]
+                )
+            )
+            metrics.append(_compact_metrics_report(report))
+
+        station_metrics: list[dict[str, object]] = []
+        if outcome_rows:
+            for row in catalog_rows:
+                report = self.metrics(
+                    ForecastMetricsQuery(
+                        source=str(row["source"]),
+                        model=str(row["model"]),
+                        algorithm_version=str(row["algorithm_version"]),
+                        station_id=str(row["station_id"]),
+                    )
+                )
+                station_metrics.append(_compact_metrics_report(report))
+
+        events = list(grouped.values())
+        events.sort(key=lambda item: str(item["latest_issued_at_utc"]), reverse=True)
+        return {
+            "counts": self.counts(),
+            "available_event_count": available_event_count,
+            "shown_event_count": len(events),
+            "events": events,
+            "metrics": metrics,
+            "station_metrics": station_metrics,
+            "outcomes": [dict(row) for row in outcome_rows],
+            "source_statuses": self.latest_source_statuses(),
+        }
+
+    @staticmethod
+    def _top_probability(
+        connection: sqlite3.Connection, row: sqlite3.Row | None
+    ) -> dict[str, object] | None:
+        if row is None:
+            return None
+        probability = connection.execute(
+            "SELECT market_id, outcome_label, probability FROM forecast_probabilities_v2 "
+            "WHERE prediction_id = ? ORDER BY CAST(probability AS REAL) DESC, ordinal LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        if probability is None:
+            return None
+        return {
+            "market_id": str(probability["market_id"]),
+            "label": probability["outcome_label"],
+            "probability": probability["probability"],
+            "issued_at_utc": row["issued_at_utc"],
+        }
+
     @staticmethod
     def _require_scan_run(connection: sqlite3.Connection, run_id: int) -> None:
         if connection.execute("SELECT 1 FROM scan_runs WHERE id = ?", (run_id,)).fetchone() is None:
@@ -329,10 +726,10 @@ class ForecastStore:
                 display_unit, precision_decimal_places, rounding_rule, rules_hash,
                 point_forecast_c, observed_floor_c, scenario_count,
                 observation_revision_count, observation_cutoff_at_utc,
-                distribution_mass, submission_hash, created_at_utc
+                distribution_mass, metadata_json, submission_hash, created_at_utc
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
             )
             """,
             (
@@ -361,6 +758,7 @@ class ForecastStore:
                 len(submission.observations),
                 submission.observation_cutoff_at_utc.isoformat(),
                 str(submission.distribution_mass),
+                _canonical_json(submission.metadata),
                 submission_hash,
                 datetime.now(UTC).isoformat(),
             ),
@@ -566,6 +964,9 @@ class ForecastStore:
         if query.algorithm_version is not None:
             clauses.append("p.algorithm_version = ?")
             params.append(query.algorithm_version)
+        if query.station_id is not None:
+            clauses.append("p.station_id = ?")
+            params.append(query.station_id)
         if query.as_of_utc is not None:
             clauses.append("p.issued_at_utc <= ?")
             params.append(query.as_of_utc.isoformat())
@@ -578,13 +979,23 @@ class ForecastStore:
                 params,
             ).fetchall()
 
-    def _load_latest_outcomes(self, *, as_of: datetime | None) -> dict[str, sqlite3.Row]:
+    def _load_latest_outcomes(
+        self, *, as_of: datetime | None, station_id: str | None = None
+    ) -> dict[str, sqlite3.Row]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if as_of is not None:
+            clauses.append("recorded_at_utc <= ?")
+            params.append(as_of.isoformat())
+        if station_id is not None:
+            clauses.append("station_id = ?")
+            params.append(station_id)
         with self.connect() as connection:
             rows = connection.execute(
                 "SELECT * FROM forecast_outcome_versions_v2 "
-                + ("WHERE recorded_at_utc <= ? " if as_of is not None else "")
+                + ("WHERE " + " AND ".join(clauses) + " " if clauses else "")
                 + "ORDER BY recorded_at_utc, id",
-                () if as_of is None else (as_of.isoformat(),),
+                params,
             ).fetchall()
         latest: dict[str, sqlite3.Row] = {}
         for row in rows:
@@ -678,6 +1089,43 @@ def _json_default(value: object) -> str:
 
 def _digest(value: object) -> str:
     return hashlib.sha256(_canonical_json(value).encode()).hexdigest()
+
+
+def _json_object(value: object) -> dict[str, object]:
+    try:
+        parsed = json.loads(str(value or "{}"))
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _best_ask_from_snapshot(payload: dict[str, Any]) -> str | None:
+    asks = payload.get("asks")
+    if not isinstance(asks, list):
+        return None
+    prices: list[Decimal] = []
+    for row in asks:
+        if isinstance(row, dict) and row.get("price") is not None:
+            try:
+                prices.append(Decimal(str(row["price"])))
+            except ValueError:
+                continue
+    return None if not prices else str(min(prices))
+
+
+def _compact_metrics_report(report: ForecastMetricsReport) -> dict[str, object]:
+    payload = report.model_dump(mode="json")
+    for key in ("overall",):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            value.pop("top_label_calibration", None)
+    for section in ("by_phase", "by_lead_time"):
+        rows = payload.get(section)
+        if isinstance(rows, dict):
+            for value in rows.values():
+                if isinstance(value, dict):
+                    value.pop("top_label_calibration", None)
+    return payload
 
 
 def _count(connection: sqlite3.Connection, table: str) -> int:

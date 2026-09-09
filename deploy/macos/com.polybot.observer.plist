@@ -12,6 +12,8 @@
     <string>HOME=/Users/admin</string>
     <string>PATH=/Users/admin/Documents/ChatGPT/poly-bot/.venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <string>PYTHONUNBUFFERED=1</string>
+    <string>POLYBOT_DATABASE_PATH=/Users/admin/Library/Application Support/Polybot/polybot.sqlite3</string>
+    <string>POLYBOT_ECMWF_JSON_ARCHIVE_ROOT=/Users/admin/Library/Application Support/Polybot/forecasts/ecmwf-ifs025-json</string>
     <string>POLYBOT_PAPER_MAX_EVENTS=8</string>
     <string>/Users/admin/Documents/ChatGPT/poly-bot/.venv/bin/polybot</string>
     <string>run</string>

@@ -123,3 +123,33 @@ def test_exact_monitoring_load_deduplicates_and_keeps_ended_events(monkeypatch) 
     assert found == [ended]
     assert client.requested_ids == ["occupied"]
     assert not is_event_open_for_trading(found[0])
+
+
+def test_resolved_winner_without_closed_time_uses_receipt_time() -> None:
+    """The SDK Market model has no ``updated_at`` fallback attribute."""
+
+    winner = SimpleNamespace(
+        id="market-winner",
+        condition_id="condition-winner",
+        group_item_title="22°C",
+        question="Will the maximum be 22°C?",
+        state=SimpleNamespace(closed=True, closed_time=None),
+        resolution=SimpleNamespace(
+            uma_resolution_status=SimpleNamespace(value="resolved"),
+            resolved_by="0xresolver",
+            source="https://example.test/weather",
+        ),
+        outcomes=SimpleNamespace(
+            yes=SimpleNamespace(price=Decimal(1)),
+            no=SimpleNamespace(price=Decimal(0)),
+        ),
+    )
+    gateway = PolymarketGateway.__new__(PolymarketGateway)
+    cast(Any, gateway)._client = SimpleNamespace(
+        get_event=lambda **kwargs: SimpleNamespace(id="event", markets=[winner])
+    )
+
+    resolved = gateway.get_resolved_weather_winner("event")
+
+    assert resolved.market_id == "market-winner"
+    assert resolved.resolved_at_utc.tzinfo is not None

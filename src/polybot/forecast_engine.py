@@ -21,6 +21,7 @@ from polybot.forecast_models import (
     RealizedForecastOutcome,
 )
 from polybot.forecast_store import ForecastStore
+from polybot.forecast_v2 import EcmwfShadowSnapshot
 from polybot.models import Bracket, RuleAudit, WeatherForecast
 from polybot.observations import ObservationHistory
 from polybot.weathernext import WeatherNextSnapshot
@@ -29,8 +30,21 @@ from polybot.weathernext import WeatherNextSnapshot
 class ForecastEngineV2:
     """Shadow recorder/evaluator; it never participates in v1 trade decisions."""
 
-    def __init__(self, database_path: Path) -> None:
+    def __init__(self, database_path: Path, *, settings: object | None = None) -> None:
         self.store = ForecastStore(database_path)
+        self._min_interval_seconds = int(
+            getattr(settings, "forecast_snapshot_min_interval_seconds", 0)
+        )
+        self._probability_delta = Decimal(
+            str(getattr(settings, "forecast_snapshot_probability_delta", 0))
+        )
+
+    def _record(self, submission: ForecastSubmission) -> int:
+        return self.store.record(
+            submission,
+            min_interval_seconds=self._min_interval_seconds,
+            probability_delta=self._probability_delta,
+        )
 
     def record_open_meteo(
         self,
@@ -45,6 +59,7 @@ class ForecastEngineV2:
         source_uri: str,
         weather_error_sigma_c: Decimal,
         issued_at_utc: datetime | None = None,
+        metadata: dict[str, object] | None = None,
         algorithm_version: str = OPEN_METEO_ALGORITHM_VERSION,
     ) -> int:
         raw_values = forecast.unadjusted_member_values or forecast.member_values
@@ -80,6 +95,7 @@ class ForecastEngineV2:
                     "longitude": forecast.longitude,
                     "forecast_timezone": forecast.timezone,
                     "weather_error_sigma_c": str(weather_error_sigma_c),
+                    **(metadata or {}),
                 },
             ),
             issued_at_utc=issued,
@@ -90,7 +106,7 @@ class ForecastEngineV2:
             probabilities=_probabilities(brackets, probabilities),
             observations=_observation_evidence(observations),
         )
-        return self.store.record(submission)
+        return self._record(submission)
 
     def record_weathernext(
         self,
@@ -140,7 +156,85 @@ class ForecastEngineV2:
             probabilities=_probabilities(brackets, probabilities),
             observations=_observation_evidence(observations),
         )
-        return self.store.record(submission)
+        return self._record(submission)
+
+    def record_ecmwf_shadow(
+        self,
+        *,
+        scan_run_id: int,
+        event_id: str,
+        audit: RuleAudit,
+        snapshot: EcmwfShadowSnapshot,
+        brackets: dict[str, Bracket],
+        probabilities: dict[str, Decimal],
+        observations: ObservationHistory,
+        algorithm_version: str,
+        adjusted_member_max_c: tuple[Decimal, ...] | None = None,
+        observed_floor_c: Decimal | None = None,
+        point_forecast_c: Decimal | None = None,
+        issued_at_utc: datetime | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> int:
+        """Record raw or corrected IFS ENS scenarios without affecting v1."""
+
+        raw = tuple(snapshot.member_max_c)
+        adjusted = adjusted_member_max_c or raw
+        if len(raw) != len(adjusted):
+            raise ValueError("raw and adjusted ECMWF member counts differ")
+        observation_cutoff = observations.fetched_at_utc.astimezone(UTC)
+        issued = (issued_at_utc or max(snapshot.fetched_at_utc, observation_cutoff)).astimezone(
+            UTC
+        )
+        submission = ForecastSubmission(
+            scan_run_id=scan_run_id,
+            event_id=event_id,
+            algorithm_version=algorithm_version,
+            model_run=ForecastModelRun(
+                source="open-meteo-ecmwf",
+                model="ECMWF IFS ENS 0.25° daily max via Open-Meteo",
+                model_version=snapshot.upstream_model,
+                source_run_id=snapshot.source_run_id,
+                init_time_utc=snapshot.init_time_utc,
+                published_at_utc=snapshot.published_at_utc,
+                fetched_at_utc=snapshot.fetched_at_utc.astimezone(UTC),
+                source_uri=snapshot.source_uri,
+                source_payload_hash=snapshot.payload_sha256,
+                metadata={
+                    "transport_provider": snapshot.transport_provider,
+                    "archive_path": snapshot.archive_path,
+                    "requested_location": snapshot.requested_location,
+                    "matched_location": snapshot.matched_location,
+                    "latitude": snapshot.latitude,
+                    "longitude": snapshot.longitude,
+                    "forecast_timezone": snapshot.timezone,
+                    "provenance_complete": bool(
+                        snapshot.source_run_id
+                        and snapshot.init_time_utc
+                        and snapshot.published_at_utc
+                    ),
+                },
+            ),
+            issued_at_utc=issued,
+            observation_cutoff_at_utc=observation_cutoff,
+            rule_day=_rule_day(audit=audit, observations=observations),
+            scenarios=[
+                ForecastScenario(
+                    member_id=f"member-{index + 1:03d}",
+                    raw_max_c=raw_value,
+                    adjusted_max_c=adjusted_value,
+                    weight=Decimal(1),
+                )
+                for index, (raw_value, adjusted_value) in enumerate(
+                    zip(raw, adjusted, strict=True)
+                )
+            ],
+            point_forecast_c=point_forecast_c,
+            observed_floor_c=observed_floor_c,
+            probabilities=_probabilities(brackets, probabilities),
+            observations=_observation_evidence(observations),
+            metadata=metadata or {},
+        )
+        return self._record(submission)
 
     def record_outcome(self, outcome: RealizedForecastOutcome) -> int:
         return self.store.record_outcome(outcome)
@@ -151,8 +245,12 @@ class ForecastEngineV2:
 
 def _rule_day(*, audit: RuleAudit, observations: ObservationHistory) -> ForecastRuleDay:
     rules = audit.interpretation
-    if rules.observation_date is None or rules.unit not in {"C", "F"}:
-        raise ValueError("forecast v2 requires an exact observation date and display unit")
+    if rules.observation_date is None or rules.unit != "C":
+        raise ValueError("forecast v2 currently requires Celsius and an exact observation date")
+    if rules.precision_decimal_places != 0:
+        raise ValueError(
+            "forecast v2 currently supports only whole-degree resolution rules"
+        )
     timezone = ZoneInfo(observations.station_timezone)
     local_start = datetime.combine(rules.observation_date, datetime.min.time(), tzinfo=timezone)
     return ForecastRuleDay(

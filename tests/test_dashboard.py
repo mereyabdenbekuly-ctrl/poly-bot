@@ -22,3 +22,6 @@ def test_dashboard_is_read_only_snapshot(tmp_path) -> None:
         assert dashboard_portfolio[key] == before[key]
     assert before == after
     assert payload["active_window"] is None
+    comparison = cast(dict[str, object], payload["forecast_comparison"])
+    assert comparison["events"] == []
+    assert comparison["metrics"] == []

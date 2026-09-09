@@ -307,3 +307,40 @@ uv run pytest --cov=polybot
 5. ручной kill switch и отдельное явное подтверждение владельца.
 
 До этого момента правильный результат программы часто будет: **не торговать**.
+
+## Forecast engine v2 (shadow mode)
+
+The current `v1` paper strategy remains immutable. In parallel, the autonomous
+loop can archive the `v1` distribution, an explicitly selected 50-member ECMWF
+IFS ENS distribution, a simple station/intraday corrected `v2`, and later the
+64-member WeatherNext 3 export. None of these shadow versions changes a paper
+or live decision.
+
+Enable local collection with:
+
+```bash
+POLYBOT_ECMWF_ENABLED=true
+POLYBOT_FORECAST_V2_ENABLED=true
+```
+
+The dashboard shows forecasts even when no position is opened and calculates
+MAE, exact-bracket accuracy, Brier score, calibration and coverage only after
+an official result exists. See `docs/forecast-v1.md`, `docs/forecast-v2.md` and
+`docs/ecmwf.md` for formulas and provenance limits.
+
+### Durable local state and source archive
+
+The deployed macOS LaunchAgents keep the live SQLite database and forecast
+archives outside the Git checkout:
+
+```text
+~/Library/Application Support/Polybot/polybot.sqlite3
+~/Library/Application Support/Polybot/forecasts/
+```
+
+`com.polybot.backup` creates an integrity-checked SQLite backup every 15 minutes
+and retains the latest 96 snapshots. `com.polybot.ecmwf-archive` runs every six
+hours and archives the official ECMWF Open Data IFS ENS `enfo/pf/mx2t3` byte
+ranges for all 50 perturbed members. This raw official archive is shown
+separately from the lightweight `IFS ENS via Open-Meteo` comparison feed; the
+latter intentionally reports missing upstream run/publication metadata.
