@@ -553,9 +553,98 @@ class Storage:
 
     def dashboard_payload(self) -> dict[str, object]:
         active = self.get_active_runtime_window()
+        portfolio = self.portfolio_summary()
+        raw_orders = portfolio.pop("recent_orders", [])
+        raw_marks = portfolio.pop("latest_marks", [])
+        marks_by_order = {int(mark["order_id"]): mark for mark in raw_marks}
+        market_ids = [str(order["market_id"]) for order in raw_orders]
+        snapshot_by_market: dict[str, dict[str, object]] = {}
+        if market_ids:
+            placeholders = ",".join("?" for _ in market_ids)
+            with self.connect() as connection:
+                snapshot_rows = connection.execute(
+                    f"""
+                    SELECT market_id, payload_json FROM market_snapshots
+                    WHERE market_id IN ({placeholders})
+                      AND id IN (
+                        SELECT MAX(id) FROM market_snapshots
+                        WHERE market_id IN ({placeholders}) GROUP BY market_id
+                      )
+                    """,
+                    (*market_ids, *market_ids),
+                ).fetchall()
+            for row in snapshot_rows:
+                try:
+                    value = json.loads(row["payload_json"])
+                except (TypeError, ValueError):
+                    value = {}
+                snapshot_by_market[str(row["market_id"])] = value if isinstance(value, dict) else {}
+        positions: list[dict[str, object]] = []
+        for order in raw_orders:
+            if order.get("status") not in {"OPEN", "AWAITING_RESULT", "RESOLVED"}:
+                continue
+            mark = marks_by_order.get(int(str(order["id"])), {})
+            snapshot_payload = snapshot_by_market.get(str(order["market_id"]), {})
+            positions.append(
+                {
+                    "id": int(order["id"]),
+                    "event_id": order["event_id"],
+                    "event_title": snapshot_payload.get("event_title"),
+                    "market_id": order["market_id"],
+                    "market_question": snapshot_payload.get("market_question"),
+                    "outcome_label": snapshot_payload.get("outcome_label"),
+                    "status": order["status"],
+                    "strategy_version": order.get("strategy_version", "v0"),
+                    "outcome": order.get("outcome", "YES"),
+                    "shares": order["shares"],
+                    "entry_price": order["entry_price"],
+                    "notional_usd": order["notional_usd"],
+                    "fee_usd": order["fee_usd"],
+                    "max_loss_usd": order["max_loss_usd"],
+                    "opened_at": order["opened_at"],
+                    "current_bid_price": mark.get("current_bid_price"),
+                    "immediately_sellable_shares": mark.get("immediately_sellable_shares", "0"),
+                    "estimated_full_exit_pnl_usd": mark.get("estimated_full_exit_pnl_usd"),
+                    "full_exit_value_usd": mark.get("full_exit_value_usd"),
+                }
+            )
+        positions.sort(
+            key=lambda item: (str(item.get("opened_at", "")), int(str(item["id"]))),
+            reverse=True,
+        )
+        latest_scan = portfolio.get("last_scan")
+        latest_cycle = None
+        if active is not None:
+            reports = self.runtime_reports(active.id)
+            for report in reversed(reports):
+                if report.kind == "CYCLE" and isinstance(report.payload.get("scan"), dict):
+                    latest_cycle = report.payload["scan"]
+                    break
+        compact_decisions: list[dict[str, object]] = []
+        if isinstance(latest_cycle, dict):
+            for decision in latest_cycle.get("decisions", [])[:40]:
+                if not isinstance(decision, dict):
+                    continue
+                compact_decisions.append(
+                    {
+                        "action": decision.get("action"),
+                        "event_id": decision.get("event_id"),
+                        "market_id": decision.get("market_id"),
+                        "probability": decision.get("probability"),
+                        "executable_price": decision.get("executable_price"),
+                        "probability_edge": decision.get("probability_edge"),
+                        "expected_profit_usd": decision.get("expected_profit_usd"),
+                        "reason_codes": decision.get("reason_codes", []),
+                        "warning_codes": decision.get("warning_codes", []),
+                        "strategy_version": decision.get("strategy_version", "v1"),
+                    }
+                )
         return {
             "generated_at": utc_now().isoformat(),
-            "portfolio": self.portfolio_summary(),
+            "portfolio": portfolio,
+            "positions": positions,
+            "latest_scan": latest_scan,
+            "decisions": compact_decisions,
             "active_window": None if active is None else active.model_dump(mode="json"),
             "reports": []
             if active is None

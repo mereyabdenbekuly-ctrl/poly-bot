@@ -44,10 +44,12 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
+[tool.ruff.lint.per-file-ignores]
+"src/polybot/dashboard.py" = ["E501"]
+
 [tool.pyright]
 include = ["src", "tests"]
 pythonVersion = "3.11"
 typeCheckingMode = "standard"
 venvPath = "."
 venv = ".venv"
-

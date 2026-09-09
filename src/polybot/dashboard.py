@@ -14,32 +14,100 @@ _HTML = """<!doctype html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Polybot — autonomous observer</title>
 <style>
-body { font: 15px system-ui, sans-serif; max-width: 1100px; margin: 32px auto;
-       padding: 0 18px; background: #f6f7f9; color: #17202a }
-pre { white-space: pre-wrap; overflow: auto; background: #fff;
-      border: 1px solid #ddd; border-radius: 8px; padding: 14px }
-small { color: #68737d }
+:root{--bg:#f4f7fb;--panel:#fff;--ink:#172033;--muted:#6d7890;--line:#e6ebf2;
+--blue:#3867f2;--blue-soft:#eef2ff;--green:#0f9d69;--green-soft:#e9fbf3;
+--amber:#a66b00;--amber-soft:#fff7df;--red:#c53f52;--red-soft:#fff0f2;
+--shadow:0 10px 30px rgba(25,39,73,.06)}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.shell{max-width:1400px;margin:0 auto;padding:28px 28px 48px}.topbar{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;margin-bottom:28px}
+.brand{display:flex;align-items:center;gap:13px}.logo{width:42px;height:42px;border-radius:13px;background:linear-gradient(135deg,#5279ff,#7256dc);color:#fff;display:grid;place-items:center;font-weight:800;font-size:20px;box-shadow:0 8px 20px rgba(56,103,242,.24)}
+h1{font-size:25px;letter-spacing:-.03em;margin:0}.subtitle{color:var(--muted);margin:3px 0 0}.live{display:flex;align-items:center;gap:9px;color:var(--muted);font-size:13px;white-space:nowrap}.dot{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 0 4px var(--green-soft)}
+.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:18px}.card{background:var(--panel);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow)}.metric{padding:18px 19px;min-height:112px}.eyebrow{color:var(--muted);font-size:12px;font-weight:700;letter-spacing:.05em;text-transform:uppercase}.value{font-size:27px;font-weight:750;letter-spacing:-.04em;margin-top:11px}.value.good{color:var(--green)}.value.warn{color:var(--amber)}.value.neutral{color:var(--ink)}.hint{color:var(--muted);font-size:12px;margin-top:3px}
+.layout{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(340px,.75fr);gap:18px}.panel{padding:20px;margin-bottom:18px}.panel-head{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:16px}.panel h2{font-size:16px;margin:0;letter-spacing:-.015em}.panel-note{font-size:12px;color:var(--muted)}
+.window{position:relative;overflow:hidden}.window:after{content:"";position:absolute;left:0;right:0;bottom:0;height:4px;background:linear-gradient(90deg,var(--blue) 0 18%,#e7ecf7 18%)}.window-meta{display:flex;gap:10px;flex-wrap:wrap;color:var(--muted);font-size:13px}.pill{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:5px 9px;font-size:12px;font-weight:700}.pill.blue{background:var(--blue-soft);color:var(--blue)}.pill.green{background:var(--green-soft);color:var(--green)}.pill.amber{background:var(--amber-soft);color:var(--amber)}.pill.gray{background:#f0f3f7;color:#657087}
+.bar{height:8px;background:#edf1f7;border-radius:99px;overflow:hidden;margin-top:18px}.bar>span{display:block;height:100%;width:20%;border-radius:99px;background:linear-gradient(90deg,var(--blue),#7d6bf2)}
+.positions{width:100%;min-width:620px;border-collapse:collapse}.positions th{text-align:left;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em;font-weight:700;padding:0 10px 10px}.positions td{padding:13px 10px;border-top:1px solid var(--line);vertical-align:top}.positions th:first-child,.positions td:first-child{padding-left:0}.positions th:last-child,.positions td:last-child{padding-right:0}.market{font-weight:700}.sub{color:var(--muted);font-size:12px;margin-top:2px}.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}.positive{color:var(--green);font-weight:700}.negative{color:var(--red);font-weight:700}.empty{padding:24px 0;color:var(--muted);text-align:center}#positions{overflow-x:auto}
+.source{display:flex;align-items:flex-start;justify-content:space-between;gap:15px;padding:14px 0;border-top:1px solid var(--line)}.source:first-of-type{border-top:0;padding-top:0}.source-name{font-weight:700}.source-detail{color:var(--muted);font-size:12px;margin-top:3px}.source-state{white-space:nowrap}
+.timeline{display:grid;gap:0}.event{display:grid;grid-template-columns:110px 1fr;gap:14px;padding:13px 0;border-top:1px solid var(--line)}.event:first-child{border-top:0}.event-time{color:var(--muted);font-size:12px}.event-title{font-weight:700}.event-detail{color:var(--muted);font-size:12px;margin-top:3px}.status-icon{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:7px;background:var(--blue)}
+.decisions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.decision{border:1px solid var(--line);border-radius:11px;padding:12px}.decision-top{display:flex;justify-content:space-between;gap:10px}.decision-id{font-weight:700}.decision-reason{color:var(--muted);font-size:12px;margin-top:5px}.decision-metrics{display:flex;gap:12px;margin-top:9px;font-size:12px;color:var(--muted)}
+.footer{color:var(--muted);font-size:12px;text-align:center;margin-top:7px}.error{background:var(--red-soft);color:var(--red);padding:12px;border-radius:10px;font-size:13px;margin-top:10px}
+@media(max-width:1050px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.layout{grid-template-columns:1fr}.decisions{grid-template-columns:1fr}}
+@media(max-width:620px){.shell{padding:20px 14px}.topbar{display:block}.live{margin-top:14px}.grid{grid-template-columns:1fr}.panel{padding:15px}.positions{font-size:12px}.positions th:nth-child(3),.positions td:nth-child(3){display:none}.event{grid-template-columns:82px 1fr}}
 </style>
 </head>
 <body>
-<h1>Polybot</h1>
-<p><span id="state">loading…</span> · view-only dashboard</p>
-<p><small>Refreshes automatically. This page never starts a scan and never places
-orders.</small></p>
-<pre id="data">loading…</pre>
+<main class="shell">
+  <header class="topbar" aria-label="Polybot header">
+    <div class="brand"><div class="logo">P</div><div><h1>Polybot</h1><p class="subtitle">Autonomous weather-market observer</p></div></div>
+    <div class="live" aria-live="polite"><span class="dot"></span><span id="updated">Connecting…</span><span id="mode" class="pill blue">PAPER ONLY</span></div>
+  </header>
+  <section class="grid" id="metrics"></section>
+  <section class="card panel window" id="window"></section>
+  <div class="layout">
+    <div>
+      <section class="card panel"><div class="panel-head"><h2>Open paper positions</h2><span class="panel-note">same-token marks · no live orders</span></div><div id="positions"></div></section>
+      <section class="card panel"><div class="panel-head"><h2>Latest decisions</h2><span class="panel-note">most recent autonomous cycle</span></div><div id="decisions" class="decisions"></div></section>
+    </div>
+    <aside>
+      <section class="card panel"><div class="panel-head"><h2>Data sources</h2><span class="panel-note">live status</span></div><div id="sources"></div></section>
+      <section class="card panel"><div class="panel-head"><h2>Runtime timeline</h2><span class="panel-note">persistent reports</span></div><div id="timeline" class="timeline"></div></section>
+    </aside>
+  </div>
+  <p class="footer">View-only dashboard · refreshes every 30 seconds · this page never starts scans or places orders</p>
+</main>
 <script>
-async function refresh() {
-  try {
-    const response = await fetch('/api/dashboard', {cache: 'no-store'});
-    const data = await response.json();
-    document.getElementById('state').textContent = 'updated ' + data.generated_at;
-    document.getElementById('data').textContent = JSON.stringify(data, null, 2);
-  } catch (error) {
-    document.getElementById('data').textContent = String(error);
-  }
+const $ = id => document.getElementById(id);
+const money = v => v == null ? '—' : '$' + Number(v).toFixed(4);
+const compactMoney = v => v == null ? '—' : '$' + Number(v).toFixed(2);
+const dateTime = v => v ? new Date(v).toLocaleString('en-US', {timeZone:'Asia/Almaty',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
+const elapsed = s => { s=Number(s||0); return s<60 ? `${s}s` : `${Math.floor(s/60)}m`; };
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function latestCycle(d){ return [...(d.reports||[])].reverse().find(r=>r.kind==='CYCLE' && r.payload && r.payload.scan); }
+function renderMetrics(d){
+  const p=d.portfolio||{}, scan=d.latest_scan||{};
+  const allowed=scan.geoblocked===0;
+  const status=allowed?'good':'warn';
+  $('mode').textContent=d.active_window?.paper===false?'OBSERVE ONLY':'PAPER ONLY';
+  $('mode').className='pill '+(d.active_window?.paper===false?'gray':'blue');
+  $('metrics').innerHTML = [
+    ['Open exposure',compactMoney(p.open_exposure_usd),'risk reserved','neutral'],
+    ['Realized P&L',compactMoney(p.realized_pnl_usd),'settled paper only',Number(p.realized_pnl_usd||0)>=0?'good':'warn'],
+    ['API spend',compactMoney(p.api_spend_usd),'persistent project budget','neutral'],
+    ['Network',allowed?'KZ / allowed':'blocked',allowed?'public API reachable':'new entries disabled',status]
+  ].map(x=>`<div class="card metric"><div class="eyebrow">${x[0]}</div><div class="value ${x[3]}">${x[1]}</div><div class="hint">${x[2]}</div></div>`).join('');
 }
-refresh();
-setInterval(refresh, 30000);
+function renderWindow(d){
+  const w=d.active_window, reports=d.reports||[];
+  if(!w){$('window').innerHTML='<div class="empty">No active runtime window yet.</div>';return}
+  const start=new Date(w.started_at), secs=Math.max(0,(Date.now()-start.getTime())/1000), pct=Math.min(100,secs/7200*100), last=d.latest_scan||{}, next=last.completed_at?new Date(new Date(last.completed_at).getTime()+Number(w.interval_seconds||300)*1000):null;
+  $('window').innerHTML=`<div class="panel-head"><h2>Autonomous window #${w.id}</h2><span class="pill green"><span class="dot"></span> RUNNING</span></div>
+  <div class="window-meta"><span>Started ${dateTime(w.started_at)}</span><span>Every ${w.interval_seconds/60} min</span><span>${w.paper?'Paper trading':'Observe only'}</span><span>Astra ${w.astra?'on':'off'}</span><span>Next scan ${next?dateTime(next):'pending'}</span></div>
+  <div class="bar"><span style="width:${pct}%"></span></div><div class="hint" style="margin-top:8px">${elapsed(secs)} of 120m · ${reports.length} saved reports · times shown in Almaty</div>`;
+}
+function renderPositions(d){
+  const rows=d.positions||[];
+  if(!rows.length){$('positions').innerHTML='<div class="empty">No open paper positions.</div>';return}
+  $('positions').innerHTML=`<table class="positions"><thead><tr><th>Market</th><th>State</th><th>Entry</th><th>Exit mark</th><th>P&L</th></tr></thead><tbody>${rows.map(o=>{const pnl=o.estimated_full_exit_pnl_usd; const title=o.market_question||o.market_id; return `<tr><td><div class="market">${esc(title)} <span class="pill gray">${esc(o.outcome_label||o.outcome||'YES')}</span></div><div class="sub">market ${esc(o.market_id)} · ${o.shares} shares</div></td><td><span class="pill ${o.status==='PAPER_SETTLED'?'green':'blue'}">${esc(o.status)}</span><div class="sub">v${esc(o.strategy_version||'0')}</div></td><td class="num">${money(o.entry_price)}<div class="sub">cost ${money(o.notional_usd)}</div></td><td class="num">${o.current_bid_price==null?'—':money(o.current_bid_price)}<div class="sub">${o.immediately_sellable_shares||0}/${o.shares} sellable</div></td><td class="num ${pnl!=null?(Number(pnl)>=0?'positive':'negative'):''}">${pnl==null?'—':money(pnl)}<div class="sub">${o.full_exit_value_usd==null?'no full exit':'hypothetical'}</div></td></tr>`}).join('')}</tbody></table>`;
+}
+function renderSources(d){
+ const reports=d.reports||[], latest=[...reports].reverse().find(r=>r.payload?.weathernext), wn=(latest?.payload?.weathernext)||{state:'unknown',message:'No status'}; const scan=d.latest_scan||{};
+ $('sources').innerHTML=`<div class="source"><div><div class="source-name">Polymarket API</div><div class="source-detail">${scan.geoblocked===0?'KZ endpoint accepted':'status from latest scan'}</div></div><div class="source-state pill ${scan.geoblocked===0?'green':'amber'}">${scan.geoblocked===0?'AVAILABLE':'CHECK'}</div></div>
+ <div class="source"><div><div class="source-name">Station observations</div><div class="source-detail">NOAA WRH / Synoptic + AWC cross-check</div></div><div class="source-state pill green">ACTIVE</div></div>
+ <div class="source"><div><div class="source-name">GPT-6 Astra</div><div class="source-detail">Rules only · cached · no wallet access</div></div><div class="source-state pill ${d.active_window?.astra?'green':'gray'}">${d.active_window?.astra?'ON':'OFF'}</div></div>
+ <div class="source"><div><div class="source-name">WeatherNext 3</div><div class="source-detail">${esc(wn.message||'')}</div></div><div class="source-state pill ${wn.state==='snapshot_available'?'green':'amber'}">${esc(wn.state||'UNKNOWN')}</div></div>`;
+}
+function renderTimeline(d){
+ const reports=[...(d.reports||[])].reverse();
+ $('timeline').innerHTML=reports.length?reports.map(r=>`<div class="event"><div class="event-time">${dateTime(r.created_at)}<br><small>${elapsed(r.elapsed_seconds)}</small></div><div><div class="event-title"><span class="status-icon"></span>${esc(r.kind.replaceAll('_',' '))}</div><div class="event-detail">${r.payload?.error?esc(r.payload.error):r.payload?.scan?`${r.payload.scan.events_scanned||0} events · ${r.payload.scan.markets_scanned||0} markets · ${r.payload.scan.paper_orders_opened||0} opened`:esc(r.payload?.message||'Autonomous service is running.')}</div></div></div>`).join(''):'<div class="empty">Reports will appear automatically.</div>';
+}
+function renderDecisions(d){
+ const decisions=d.decisions||[];
+ if(!decisions.length){$('decisions').innerHTML='<div class="empty">No decisions in the latest cycle.</div>';return}
+ const interesting=decisions.filter(x=>x.action!=='SKIP'||(x.expected_profit_usd!=null&&Number(x.expected_profit_usd)>0)).slice(0,12);
+ $('decisions').innerHTML=(interesting.length?interesting:decisions.slice(0,12)).map(x=>`<div class="decision"><div class="decision-top"><span class="decision-id">${esc(x.market_id)}</span><span class="pill ${x.action==='PAPER_BUY'?'green':x.action==='OBSERVE'?'blue':'gray'}">${esc(x.action)}</span></div><div class="decision-metrics"><span>p ${x.probability==null?'—':(Number(x.probability)*100).toFixed(1)+'%'}</span><span>EV ${money(x.expected_profit_usd)}</span><span>entry ${money(x.executable_price)}</span></div><div class="decision-reason">${esc((x.reason_codes||[]).concat(x.warning_codes||[]).join(' · ')||'qualified')}</div></div>`).join('');
+}
+async function refresh(){try{const response=await fetch('/api/dashboard',{cache:'no-store'});const data=await response.json();$('updated').textContent='Updated '+dateTime(data.generated_at);renderMetrics(data);renderWindow(data);renderPositions(data);renderSources(data);renderTimeline(data);renderDecisions(data)}catch(error){$('updated').textContent='Connection error';console.error(error)}}
+refresh();setInterval(refresh,30000);
 </script>
 </body>
 </html>"""
@@ -58,6 +126,12 @@ def serve_dashboard(storage: Storage, *, host: str, port: int) -> None:
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
+                self.send_header(
+                    "Content-Security-Policy",
+                    "default-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'",
+                )
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -69,6 +143,11 @@ def serve_dashboard(storage: Storage, *, host: str, port: int) -> None:
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
+            self.send_header(
+                "Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'"
+            )
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
