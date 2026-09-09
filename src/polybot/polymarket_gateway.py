@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from decimal import Decimal
 from types import TracebackType
@@ -74,6 +75,35 @@ class PolymarketGateway:
                     events.append(normalized)
                 if len(events) >= max_events:
                     return events
+        return events
+
+    def get_weather_event(self, event_id: str) -> EventDefinition:
+        """Load one exact event for monitoring without an open-market filter."""
+
+        requested = str(event_id)
+        event = self._normalize_event(self._client.get_event(id=requested))
+        if event.id != requested:
+            raise ValueError(
+                f"event identity mismatch: requested={requested}, api={event.id}"
+            )
+        return event
+
+    def get_weather_events_by_ids(self, event_ids: Iterable[str]) -> list[EventDefinition]:
+        """Load exact monitoring events regardless of their trading state.
+
+        Active paper positions keep collecting rule, observation, and forecast
+        evidence after trading stops and until the official result is confirmed.
+        This path therefore intentionally skips :func:`is_event_open_for_trading`.
+        """
+
+        events: list[EventDefinition] = []
+        seen: set[str] = set()
+        for value in event_ids:
+            event_id = str(value)
+            if event_id in seen:
+                continue
+            seen.add(event_id)
+            events.append(self.get_weather_event(event_id))
         return events
 
     def get_snapshot(self, *, event: EventDefinition, market: MarketDefinition) -> MarketSnapshot:

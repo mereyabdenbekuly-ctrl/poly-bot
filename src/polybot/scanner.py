@@ -71,33 +71,51 @@ class Scanner:
                     gateway
                 )
                 errors.extend(settlement_errors)
-                excluded_event_ids = self.storage.active_paper_event_ids() if paper else set()
-                events = gateway.discover_weather_events(
-                    query=query,
-                    max_events=max_events,
-                    excluded_event_ids=excluded_event_ids,
-                )
-                for event in events:
+
+                # Active paper events use a dedicated monitoring lane. They run
+                # through the same rule/observation/forecast/snapshot pipeline,
+                # never through the opening path, and do not consume the quota
+                # reserved for new candidate events.
+                active_event_ids = self.storage.active_paper_event_ids()
+                for event_id in sorted(active_event_ids):
+                    try:
+                        event = gateway.get_weather_event(event_id)
+                    except Exception as error:
+                        errors.append(f"active paper event {event_id}: load failed: {error}")
+                        continue
                     events_scanned += 1
-                    event_decisions, event_errors = self._scan_event(
+                    event_decisions, opened, event_errors = self._process_event(
                         run_id=run_id,
                         gateway=gateway,
                         event=event,
                         use_astra=use_astra,
                         paper=paper,
+                        allow_paper_open=False,
                     )
                     errors.extend(event_errors)
                     markets_scanned += len(event_decisions)
-
-                    final_decisions, opened = self._finalize_event_decisions(
-                        event_decisions, paper=paper
-                    )
                     paper_orders_opened += opened
-                    for decision, paper_order_id in final_decisions:
-                        self.storage.record_decision(
-                            run_id, decision, paper_order_id=paper_order_id
-                        )
-                        decisions.append(decision)
+                    decisions.extend(event_decisions)
+
+                candidate_events = gateway.discover_weather_events(
+                    query=query,
+                    max_events=max_events,
+                    excluded_event_ids=active_event_ids,
+                )
+                for event in candidate_events:
+                    events_scanned += 1
+                    event_decisions, opened, event_errors = self._process_event(
+                        run_id=run_id,
+                        gateway=gateway,
+                        event=event,
+                        use_astra=use_astra,
+                        paper=paper,
+                        allow_paper_open=True,
+                    )
+                    errors.extend(event_errors)
+                    markets_scanned += len(event_decisions)
+                    paper_orders_opened += opened
+                    decisions.extend(event_decisions)
 
             self.storage.finish_scan(
                 run_id,
@@ -122,6 +140,39 @@ class Scanner:
                 error=str(error),
             )
             raise
+
+    def _process_event(
+        self,
+        *,
+        run_id: int,
+        gateway: PolymarketGateway,
+        event: EventDefinition,
+        use_astra: bool,
+        paper: bool,
+        allow_paper_open: bool,
+    ) -> tuple[list[MarketDecision], int, list[str]]:
+        event_decisions, errors = self._scan_event(
+            run_id=run_id,
+            gateway=gateway,
+            event=event,
+            use_astra=use_astra,
+            paper=paper,
+        )
+        if allow_paper_open:
+            final_decisions, opened = self._finalize_event_decisions(
+                event_decisions, paper=paper
+            )
+        else:
+            final_decisions = [
+                (_monitor_only_decision(decision), None) for decision in event_decisions
+            ]
+            opened = 0
+
+        recorded: list[MarketDecision] = []
+        for decision, paper_order_id in final_decisions:
+            self.storage.record_decision(run_id, decision, paper_order_id=paper_order_id)
+            recorded.append(decision)
+        return recorded, opened, errors
 
     def _settle_resolved_paper_orders(self, gateway: PolymarketGateway) -> tuple[int, list[str]]:
         settled = 0
@@ -468,6 +519,23 @@ def _paper_idempotency_key(decision: MarketDecision) -> str:
         )
     )
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _monitor_only_decision(decision: MarketDecision) -> MarketDecision:
+    """Prevent an active paper event from producing another opening action."""
+
+    return decision.model_copy(
+        update={
+            "action": (
+                DecisionAction.OBSERVE
+                if decision.action == DecisionAction.PAPER_BUY
+                else decision.action
+            ),
+            "reason_codes": list(
+                dict.fromkeys(decision.reason_codes + ["ACTIVE_PAPER_EVENT_MONITOR_ONLY"])
+            ),
+        }
+    )
 
 
 def _runtime_rule_ambiguities(

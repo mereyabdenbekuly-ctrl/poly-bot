@@ -94,3 +94,32 @@ def test_discovery_excludes_active_paper_events_without_consuming_limit(monkeypa
     assert [item.id for item in found] == ["new-1", "new-2"]
     assert client.requested_ids == ["new-1", "new-2"]
     assert client.requested_page_size == 30
+
+
+def test_exact_monitoring_load_deduplicates_and_keeps_ended_events(monkeypatch) -> None:
+    ended = event(
+        accepting_orders=False,
+        end_date=datetime.now(UTC) - timedelta(hours=1),
+    ).model_copy(update={"id": "occupied"})
+
+    class FakeClient:
+        requested_ids: list[str] = []
+
+        def get_event(self, *, id: str):
+            self.requested_ids.append(id)
+            return ended
+
+    client = FakeClient()
+    gateway = PolymarketGateway.__new__(PolymarketGateway)
+    cast(Any, gateway)._client = client
+    monkeypatch.setattr(
+        PolymarketGateway,
+        "_normalize_event",
+        staticmethod(lambda item: item),
+    )
+
+    found = gateway.get_weather_events_by_ids(["occupied", "occupied"])
+
+    assert found == [ended]
+    assert client.requested_ids == ["occupied"]
+    assert not is_event_open_for_trading(found[0])
