@@ -3,18 +3,20 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
-import time
 from decimal import Decimal
 from typing import Any
 
 from rich.console import Console
 from rich.table import Table
 
+from polybot.autonomy import AutonomousRunner
 from polybot.config import Settings
+from polybot.dashboard import serve_dashboard
 from polybot.geoblock import fetch_geoblock_status
 from polybot.polymarket_gateway import PolymarketGateway
 from polybot.scanner import Scanner
 from polybot.storage import Storage
+from polybot.weathernext import WeatherNextProvider
 
 console = Console()
 error_console = Console(stderr=True)
@@ -36,6 +38,10 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="Run the scanner on an interval")
     _add_scan_options(run)
     run.add_argument("--interval", type=int, default=300, help="Seconds between scans")
+
+    dashboard = subparsers.add_parser("dashboard", help="Run the read-only local dashboard")
+    dashboard.add_argument("--host", default="127.0.0.1")
+    dashboard.add_argument("--port", type=int, default=8787)
 
     status = subparsers.add_parser("status", help="Show paper portfolio and API spend")
     status.add_argument("--json", action="store_true", dest="as_json")
@@ -73,6 +79,8 @@ def main(argv: list[str] | None = None) -> None:
             _scan_once(settings, storage, args)
         elif args.command == "run":
             _run(settings, storage, args)
+        elif args.command == "dashboard":
+            serve_dashboard(storage, host=args.host, port=args.port)
         elif args.command == "status":
             _status(storage, as_json=args.as_json)
         elif args.command == "settle":
@@ -103,6 +111,7 @@ def _doctor(settings: Settings, storage: Storage, *, as_json: bool) -> None:
         ),
         "openai_key_present": settings.openai_api_key is not None,
         "live_executor_present": False,
+        "weathernext": WeatherNextProvider(settings).status().model_dump(mode="json"),
     }
     try:
         geoblock = fetch_geoblock_status(
@@ -170,16 +179,13 @@ def _run(settings: Settings, storage: Storage, args: argparse.Namespace) -> None
         f"Starting {'paper' if args.paper else 'observe'} loop every {interval}s. "
         "Press Ctrl-C to stop."
     )
-    while True:
-        started = time.monotonic()
-        try:
-            _scan_once(settings, storage, args)
-        except SystemExit:
-            raise
-        except Exception as error:
-            console.print(f"[red]Scan failed:[/red] {error}")
-        elapsed = time.monotonic() - started
-        time.sleep(max(1, interval - elapsed))
+    AutonomousRunner(settings=settings, storage=storage).run(
+        query=args.query or settings.market_search_query,
+        max_events=args.max_events or settings.max_events,
+        use_astra=bool(args.astra or settings.astra_enabled),
+        paper=bool(args.paper),
+        interval=interval,
+    )
 
 
 def _status(storage: Storage, *, as_json: bool) -> None:

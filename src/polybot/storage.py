@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from polybot.models import (
     MarketDecision,
@@ -19,6 +19,8 @@ from polybot.models import (
     PaperOrderTarget,
     ResolutionCheck,
     RuleAudit,
+    RuntimeReport,
+    RuntimeWindow,
     WeatherForecast,
 )
 from polybot.observations import ObservationHistory
@@ -66,6 +68,17 @@ class Storage:
         with self.connect() as connection:
             connection.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS runtime_windows (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    status TEXT NOT NULL,
+                    query TEXT NOT NULL,
+                    interval_seconds INTEGER NOT NULL,
+                    paper INTEGER NOT NULL,
+                    astra INTEGER NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS scan_runs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     started_at TEXT NOT NULL,
@@ -74,7 +87,18 @@ class Storage:
                     mode TEXT NOT NULL,
                     geoblocked INTEGER,
                     status TEXT NOT NULL,
-                    error TEXT
+                    error TEXT,
+                    window_id INTEGER REFERENCES runtime_windows(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS runtime_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    window_id INTEGER NOT NULL REFERENCES runtime_windows(id),
+                    kind TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    elapsed_seconds INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    UNIQUE(window_id, kind)
                 );
 
                 CREATE TABLE IF NOT EXISTS rule_cache (
@@ -109,6 +133,14 @@ class Storage:
                     run_id INTEGER NOT NULL REFERENCES scan_runs(id),
                     event_id TEXT NOT NULL,
                     fetched_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS weathernext_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL REFERENCES scan_runs(id),
+                    event_id TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
                     payload_json TEXT NOT NULL
                 );
 
@@ -222,7 +254,11 @@ class Storage:
                 );
 
                 CREATE INDEX IF NOT EXISTS decisions_run_idx ON decisions(run_id);
+                CREATE INDEX IF NOT EXISTS runtime_reports_window_idx
+                    ON runtime_reports(window_id, id);
                 CREATE INDEX IF NOT EXISTS snapshots_run_idx ON market_snapshots(run_id);
+                CREATE INDEX IF NOT EXISTS weathernext_snapshots_run_idx
+                    ON weathernext_snapshots(run_id, event_id);
                 CREATE INDEX IF NOT EXISTS observation_fetches_run_idx
                     ON observation_fetches(run_id, event_id);
                 CREATE INDEX IF NOT EXISTS observation_versions_station_idx
@@ -236,7 +272,23 @@ class Storage:
                 """
             )
             self._migrate_api_usage(connection)
+            self._migrate_runtime_tables(connection)
             self._migrate_paper_orders(connection)
+
+    @staticmethod
+    def _migrate_runtime_tables(connection: sqlite3.Connection) -> None:
+        scan_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(scan_runs)")}
+        if "window_id" not in scan_columns:
+            connection.execute(
+                "ALTER TABLE scan_runs ADD COLUMN window_id INTEGER REFERENCES runtime_windows(id)"
+            )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS scan_runs_window_idx ON scan_runs(window_id, id)"
+        )
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS runtime_active_window_idx "
+            "ON runtime_windows(status) WHERE status = 'ACTIVE'"
+        )
 
     @staticmethod
     def _migrate_api_usage(connection: sqlite3.Connection) -> None:
@@ -344,14 +396,181 @@ class Storage:
             "ON paper_orders(event_id) WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED')"
         )
 
-    def start_scan(self, *, query: str, mode: str) -> int:
+    def start_runtime_window(
+        self,
+        *,
+        query: str,
+        interval_seconds: int,
+        paper: bool,
+        astra: bool,
+    ) -> RuntimeWindow:
+        with self.transaction(immediate=True) as connection:
+            active = connection.execute(
+                "SELECT * FROM runtime_windows WHERE status = 'ACTIVE' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if active is not None:
+                return _runtime_window_from_row(active)
+            now = utc_now()
+            cursor = connection.execute(
+                """
+                INSERT INTO runtime_windows(
+                    started_at, status, query, interval_seconds, paper, astra
+                ) VALUES (?, 'ACTIVE', ?, ?, ?, ?)
+                """,
+                (now.isoformat(), query, interval_seconds, int(paper), int(astra)),
+            )
+            row = connection.execute(
+                "SELECT * FROM runtime_windows WHERE id = ?", (_lastrowid(cursor),)
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("failed to read newly created runtime window")
+            return _runtime_window_from_row(row)
+
+    def get_active_runtime_window(self) -> RuntimeWindow | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM runtime_windows WHERE status = 'ACTIVE' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        return None if row is None else _runtime_window_from_row(row)
+
+    def finish_runtime_window(self, window_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE runtime_windows SET status = 'COMPLETED', ended_at = ? "
+                "WHERE id = ? AND status = 'ACTIVE'",
+                (utc_now().isoformat(), window_id),
+            )
+
+    def runtime_report_exists(self, window_id: int, kind: str) -> bool:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM runtime_reports WHERE window_id = ? AND kind = ?",
+                (window_id, kind),
+            ).fetchone()
+        return row is not None
+
+    def record_runtime_report(
+        self,
+        window_id: int,
+        *,
+        kind: str,
+        elapsed_seconds: int,
+        payload: dict[str, object],
+    ) -> None:
+        values = (
+            window_id,
+            kind,
+            utc_now().isoformat(),
+            max(0, int(elapsed_seconds)),
+            json.dumps(payload, ensure_ascii=False, default=str),
+        )
+        with self.connect() as connection:
+            if kind == "CYCLE":
+                connection.execute(
+                    """
+                    INSERT INTO runtime_reports(
+                        window_id, kind, created_at, elapsed_seconds, payload_json
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(window_id, kind) DO UPDATE SET
+                        created_at=excluded.created_at,
+                        elapsed_seconds=excluded.elapsed_seconds,
+                        payload_json=excluded.payload_json
+                    """,
+                    values,
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO runtime_reports(
+                        window_id, kind, created_at, elapsed_seconds, payload_json
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    values,
+                )
+
+    def runtime_reports(self, window_id: int) -> list[RuntimeReport]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM runtime_reports WHERE window_id = ? ORDER BY id",
+                (window_id,),
+            ).fetchall()
+        return [
+            RuntimeReport(
+                window_id=int(row["window_id"]),
+                kind=row["kind"],
+                created_at=datetime.fromisoformat(row["created_at"]),
+                elapsed_seconds=int(row["elapsed_seconds"]),
+                payload=json.loads(row["payload_json"]),
+            )
+            for row in rows
+        ]
+
+    def runtime_window_summary(self, window_id: int) -> dict[str, object]:
+        with self.connect() as connection:
+            scan_rows = connection.execute(
+                "SELECT id, status, geoblocked, error FROM scan_runs "
+                "WHERE window_id = ? ORDER BY id",
+                (window_id,),
+            ).fetchall()
+            decision_rows = connection.execute(
+                "SELECT d.action, COUNT(*) AS count FROM decisions d "
+                "JOIN scan_runs s ON s.id = d.run_id WHERE s.window_id = ? "
+                "GROUP BY d.action",
+                (window_id,),
+            ).fetchall()
+        return {
+            "scan_count": len(scan_rows),
+            "completed_scans": sum(row["status"] == "completed" for row in scan_rows),
+            "failed_scans": sum(row["status"] == "failed" for row in scan_rows),
+            "geoblocked_scans": sum(row["geoblocked"] == 1 for row in scan_rows),
+            "latest_scan_id": None if not scan_rows else int(scan_rows[-1]["id"]),
+            "latest_error": next(
+                (str(row["error"]) for row in reversed(scan_rows) if row["error"]), None
+            ),
+            "decisions_by_action": {str(row["action"]): int(row["count"]) for row in decision_rows},
+        }
+
+    def recent_runtime_windows(self, *, limit: int = 8) -> list[dict[str, object]]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM runtime_windows ORDER BY id DESC LIMIT ?", (max(1, limit),)
+            ).fetchall()
+        result: list[dict[str, object]] = []
+        for row in rows:
+            window = _runtime_window_from_row(row)
+            result.append(
+                {
+                    **window.model_dump(mode="json"),
+                    "summary": self.runtime_window_summary(window.id),
+                    "reports": [
+                        report.model_dump(mode="json")
+                        for report in self.runtime_reports(window.id)
+                        if report.kind != "CYCLE"
+                    ],
+                }
+            )
+        return result
+
+    def dashboard_payload(self) -> dict[str, object]:
+        active = self.get_active_runtime_window()
+        return {
+            "generated_at": utc_now().isoformat(),
+            "portfolio": self.portfolio_summary(),
+            "active_window": None if active is None else active.model_dump(mode="json"),
+            "reports": []
+            if active is None
+            else [report.model_dump(mode="json") for report in self.runtime_reports(active.id)],
+            "recent_windows": self.recent_runtime_windows(),
+        }
+
+    def start_scan(self, *, query: str, mode: str, window_id: int | None = None) -> int:
         with self.connect() as connection:
             cursor = connection.execute(
                 """
-                INSERT INTO scan_runs(started_at, query, mode, status)
-                VALUES (?, ?, ?, 'running')
+                INSERT INTO scan_runs(started_at, query, mode, status, window_id)
+                VALUES (?, ?, ?, 'running', ?)
                 """,
-                (utc_now().isoformat(), query, mode),
+                (utc_now().isoformat(), query, mode, window_id),
             )
             return _lastrowid(cursor)
 
@@ -591,6 +810,17 @@ class Storage:
                         "UPDATE station_observation_versions SET last_seen_at_utc = ? WHERE id = ?",
                         (history.fetched_at_utc.isoformat(), existing["id"]),
                     )
+
+    def record_weathernext_snapshot(self, run_id: int, event_id: str, snapshot: object) -> None:
+        payload = snapshot.model_dump_json()  # type: ignore[union-attr]
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO weathernext_snapshots(run_id, event_id, captured_at, payload_json)
+                VALUES (?, ?, ?, ?)
+                """,
+                (run_id, event_id, utc_now().isoformat(), payload),
+            )
 
     def record_market_snapshot(self, run_id: int, snapshot: MarketSnapshot) -> None:
         with self.connect() as connection:
@@ -1104,3 +1334,16 @@ def _lastrowid(cursor: sqlite3.Cursor) -> int:
     if cursor.lastrowid is None:
         raise RuntimeError("SQLite did not return a row id")
     return int(cursor.lastrowid)
+
+
+def _runtime_window_from_row(row: sqlite3.Row) -> RuntimeWindow:
+    return RuntimeWindow(
+        id=int(row["id"]),
+        started_at=datetime.fromisoformat(row["started_at"]),
+        ended_at=None if row["ended_at"] is None else datetime.fromisoformat(row["ended_at"]),
+        status=cast(Literal["ACTIVE", "COMPLETED"], str(row["status"])),
+        query=str(row["query"]),
+        interval_seconds=int(row["interval_seconds"]),
+        paper=bool(row["paper"]),
+        astra=bool(row["astra"]),
+    )

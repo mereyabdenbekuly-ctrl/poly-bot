@@ -1,4 +1,4 @@
-.PHONY: sync check test doctor scan run
+.PHONY: sync check test doctor scan run dashboard
 
 sync:
 	uv sync --all-groups
@@ -21,3 +21,5 @@ scan:
 run:
 	uv run polybot run --interval 300 --max-events 2
 
+dashboard:
+	uv run polybot dashboard --host 127.0.0.1 --port 8787

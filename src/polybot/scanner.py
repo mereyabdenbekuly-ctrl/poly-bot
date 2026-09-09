@@ -26,6 +26,7 @@ from polybot.risk import evaluate_market
 from polybot.rules import build_brackets, deterministic_rule_audit
 from polybot.storage import PaperRiskRejectedError, Storage
 from polybot.weather import OpenMeteoEnsemble
+from polybot.weathernext import WeatherNextProvider
 
 
 class Scanner:
@@ -34,6 +35,7 @@ class Scanner:
         self.storage = storage
         self.weather = OpenMeteoEnsemble(settings)
         self.observations = StationObservationCollector(settings)
+        self.weathernext = WeatherNextProvider(settings)
 
     def scan(
         self,
@@ -42,9 +44,10 @@ class Scanner:
         max_events: int,
         use_astra: bool,
         paper: bool,
+        window_id: int | None = None,
     ) -> ScanReport:
         mode = "paper" if paper else "observe"
-        run_id = self.storage.start_scan(query=query, mode=mode)
+        run_id = self.storage.start_scan(query=query, mode=mode, window_id=window_id)
         geoblock = None
         errors: list[str] = []
         decisions: list[MarketDecision] = []
@@ -52,6 +55,7 @@ class Scanner:
         paper_orders_settled = 0
         events_scanned = 0
         markets_scanned = 0
+        weather_next_status = self.weathernext.status().model_dump(mode="json")
 
         try:
             try:
@@ -103,6 +107,7 @@ class Scanner:
                 paper_orders_settled=paper_orders_settled,
                 decisions=decisions,
                 errors=errors,
+                weather_next_status=weather_next_status,
             )
         except Exception as error:
             self.storage.finish_scan(
@@ -202,6 +207,7 @@ class Scanner:
             audit.interpretation, observation_history
         )
         probabilities: dict[str, Decimal] = {}
+        weathernext_probabilities: dict[str, Decimal] = {}
         analysis_rules = deterministic.interpretation
         if analysis_rules.tradeable and brackets and not observation_blockers and not rule_blockers:
             try:
@@ -228,6 +234,18 @@ class Scanner:
                     )
                     for market_id, bracket in brackets.items()
                 }
+                try:
+                    comparison = self.weathernext.snapshot_for(analysis_rules)
+                    if comparison is not None:
+                        self.storage.record_weathernext_snapshot(run_id, event.id, comparison)
+                        weathernext_probabilities = {
+                            market_id: Decimal(str(round(value, 10)))
+                            for market_id, value in self.weathernext.probabilities(
+                                comparison, brackets
+                            ).items()
+                        }
+                except Exception as error:
+                    errors.append(f"event {event.id}: WeatherNext comparison failed: {error}")
             except Exception as error:
                 errors.append(f"event {event.id}: weather model failed: {error}")
 
@@ -242,6 +260,18 @@ class Scanner:
                     settings=self.settings,
                     api_cost_usd=audit.astra_cost_usd,
                 )
+                wn_probability = weathernext_probabilities.get(market.id)
+                if wn_probability is not None:
+                    decision = decision.model_copy(
+                        update={
+                            "weathernext_probability": wn_probability,
+                            "probability_delta_vs_weathernext": (
+                                None
+                                if decision.probability is None
+                                else decision.probability - wn_probability
+                            ),
+                        }
+                    )
                 extra_reasons: list[str] = []
                 warning_codes: list[str] = []
                 if not deterministic.interpretation.tradeable:

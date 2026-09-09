@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     weather_awc_metar_url: str = "https://aviationweather.gov/api/data/metar"
     observation_default_cadence_minutes: int = Field(default=60, ge=10, le=180)
     observation_stale_multiplier: float = Field(default=2.5, ge=1.5, le=6)
+    weathernext_enabled: bool = False
+    weathernext_surface: str = "gcs_full_ensemble"
+    weathernext_snapshot_path: str | None = None
 
     http_timeout_seconds: float = Field(default=20.0, ge=1, le=120)
 

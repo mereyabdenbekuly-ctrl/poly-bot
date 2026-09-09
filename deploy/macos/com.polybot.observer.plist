@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.polybot.observer</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/env</string>
+    <string>-i</string>
+    <string>HOME=/Users/admin</string>
+    <string>PATH=/Users/admin/Documents/ChatGPT/poly-bot/.venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <string>PYTHONUNBUFFERED=1</string>
+    <string>/Users/admin/Documents/ChatGPT/poly-bot/.venv/bin/polybot</string>
+    <string>run</string>
+    <string>--interval</string>
+    <string>300</string>
+    <string>--paper</string>
+    <string>--max-events</string>
+    <string>2</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/admin/Documents/ChatGPT/poly-bot</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/admin/Documents/ChatGPT/poly-bot/data/launchd.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/admin/Documents/ChatGPT/poly-bot/data/launchd.stderr.log</string>
+</dict>
+</plist>

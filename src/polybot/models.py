@@ -185,6 +185,8 @@ class MarketDecision(StrictModel):
     execution_buffer_usd: Decimal = Decimal(0)
     max_loss_usd: Decimal | None = None
     expected_profit_usd: Decimal | None = None
+    weathernext_probability: Decimal | None = None
+    probability_delta_vs_weathernext: Decimal | None = None
     fee_rate: Decimal = Decimal(0)
     fee_exponent: Decimal = Decimal(0)
     end_date: datetime | None = None
@@ -260,5 +262,25 @@ class ScanReport(StrictModel):
     markets_scanned: int
     paper_orders_opened: int
     paper_orders_settled: int = 0
+    weather_next_status: dict[str, object] = Field(default_factory=dict)
     decisions: list[MarketDecision]
     errors: list[str]
+
+
+class RuntimeWindow(StrictModel):
+    id: int
+    started_at: datetime
+    ended_at: datetime | None
+    status: Literal["ACTIVE", "COMPLETED"]
+    query: str
+    interval_seconds: int
+    paper: bool
+    astra: bool
+
+
+class RuntimeReport(StrictModel):
+    window_id: int
+    kind: Literal["STARTUP", "INTERIM_60M", "COMPLETE_120M", "CYCLE"]
+    created_at: datetime
+    elapsed_seconds: int
+    payload: dict[str, object]
