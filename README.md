@@ -323,10 +323,12 @@ POLYBOT_ECMWF_ENABLED=true
 POLYBOT_FORECAST_V2_ENABLED=true
 ```
 
-The dashboard shows forecasts even when no position is opened and calculates
-MAE, exact-bracket accuracy, Brier score, calibration and coverage only after
-an official result exists. See `docs/forecast-v1.md`, `docs/forecast-v2.md` and
-`docs/ecmwf.md` for formulas and provenance limits.
+The dashboard shows forecasts even when no position is opened. Forecast
+coverage is measured against the explicit eligible-event registry immediately;
+MAE, exact-bracket accuracy, Brier score and calibration appear only after an
+official result exists. Rates include 95% uncertainty intervals, and fewer than
+30 resolved unique events remain descriptive-only. See `docs/forecast-v1.md`,
+`docs/forecast-v2.md` and `docs/ecmwf.md` for formulas and provenance limits.
 
 ### Durable local state and source archive
 

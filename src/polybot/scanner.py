@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 from polybot.astra import AstraRuleAuditor
 from polybot.config import Settings
 from polybot.forecast_engine import ForecastEngineV2
-from polybot.forecast_models import RealizedForecastOutcome
+from polybot.forecast_models import (
+    OPEN_METEO_ALGORITHM_VERSION,
+    WEATHERNEXT_ALGORITHM_VERSION,
+    ForecastAlgorithmAttemptStatus,
+    ForecastAlgorithmEligibility,
+    ForecastEligibilityStage,
+    ForecastEventEligibility,
+    RealizedForecastOutcome,
+)
 from polybot.forecast_v2 import (
     ECMWF_RAW_ALGORITHM_VERSION,
     FORECAST_V2_ALGORITHM_VERSION,
@@ -17,6 +26,7 @@ from polybot.forecast_v2 import (
 )
 from polybot.geoblock import fetch_geoblock_status
 from polybot.models import (
+    Bracket,
     DecisionAction,
     EventDefinition,
     MarketDecision,
@@ -29,6 +39,7 @@ from polybot.observations import (
     StationObservationCollector,
     apply_observed_max,
     bracket_is_impossible,
+    station_id_from_source_url,
 )
 from polybot.polymarket_gateway import PolymarketGateway
 from polybot.risk import evaluate_market
@@ -138,9 +149,7 @@ class Scanner:
                                 gateway, event_id, datetime.now(UTC), run_id=run_id
                             )
                         except Exception as error:
-                            errors.append(
-                                f"event {event_id}: forecast outcome pending: {error}"
-                            )
+                            errors.append(f"event {event_id}: forecast outcome pending: {error}")
 
             self.storage.finish_scan(
                 run_id,
@@ -251,30 +260,29 @@ class Scanner:
     ) -> None:
         """Pair official resolution with the final saved station observations."""
 
-        history = self.storage.latest_observation_history(event_id)
+        # Check the official winning bracket first. Unresolved events can stay
+        # in the persistent retry set without hammering the station source every
+        # five minutes before a result exists.
+        winner = gateway.get_resolved_weather_winner(event_id)
+        # Re-fetch even when a prior history is complete. NOAA/Synoptic can
+        # revise a station record after the rule day, and the 14-day refresh
+        # window is meaningful only if new revisions are actually requested.
+        event = gateway.get_weather_event(event_id)
+        audit = deterministic_rule_audit(event)
+        if not audit.interpretation.tradeable:
+            raise ValueError(f"event {event_id} rules are not analyzable")
+        history = self.observations.fetch(audit.interpretation)
+        if run_id is not None:
+            self.storage.record_observation_history(run_id, event_id, history)
         if (
             history is None
             or history.observed_max_c is None
             or history.displayed_max_c is None
             or not history.day_finished
         ):
-            event = gateway.get_weather_event(event_id)
-            audit = deterministic_rule_audit(event)
-            if not audit.interpretation.tradeable:
-                raise ValueError(f"event {event_id} rules are not analyzable")
-            refreshed = self.observations.fetch(audit.interpretation)
-            if run_id is not None:
-                self.storage.record_observation_history(run_id, event_id, refreshed)
-            history = refreshed
-            if (
-                history.observed_max_c is None
-                or history.displayed_max_c is None
-                or not history.day_finished
-            ):
-                raise ValueError(
-                    f"event {event_id} has no final station observation history for evaluation"
-                )
-        winner = gateway.get_resolved_weather_winner(event_id)
+            raise ValueError(
+                f"event {event_id} has no final station observation history for evaluation"
+            )
         recorded_at = max(recorded_at, winner.resolved_at_utc, datetime.now(UTC))
         revisions = sorted(item.revision_hash for item in history.observations)
         source_revision = hashlib.sha256(
@@ -342,6 +350,32 @@ class Scanner:
             except Exception as error:
                 observation_blockers.append("OBSERVATION_SOURCE_UNAVAILABLE")
                 errors.append(f"event {event.id}: observation source failed: {error}")
+                previous_history = getattr(
+                    self.storage, "latest_observation_history", lambda _event_id: None
+                )(event.id)
+                expected_station_id = None
+                if deterministic.interpretation.resolution_source_url:
+                    try:
+                        expected_station_id = station_id_from_source_url(
+                            deterministic.interpretation.resolution_source_url
+                        )
+                    except Exception:
+                        expected_station_id = None
+                if (
+                    previous_history is not None
+                    and previous_history.observation_date
+                    == deterministic.interpretation.observation_date
+                    and (
+                        expected_station_id is None
+                        or previous_history.station_id == expected_station_id
+                    )
+                    and previous_history.source_url
+                    == deterministic.interpretation.resolution_source_url
+                ):
+                    # Identity/timezone evidence is safe to reuse for cohort
+                    # registration only. The source outage remains blocking, so
+                    # no new forecast or paper entry is produced from stale data.
+                    observation_history = previous_history
 
         rule_blockers, rule_warnings = _runtime_rule_ambiguities(
             audit.interpretation, observation_history
@@ -353,6 +387,8 @@ class Scanner:
         ecmwf_snapshot = None
         v2_result = None
         post_event_reused_snapshot = False
+        prediction_ids: dict[str, int] = {}
+        persist_failures: set[str] = set()
         analysis_rules = deterministic.interpretation
         if analysis_rules.tradeable and brackets and not observation_blockers and not rule_blockers:
             try:
@@ -402,9 +438,7 @@ class Scanner:
                     try:
                         ecmwf_snapshot = ecmwf_adapter.forecast_from_baseline(forecast)
                         issued_at = datetime.now(UTC)
-                        profile = ForecastV2Calibrator(
-                            self.settings, self.forecasts.store
-                        ).profile(
+                        profile = ForecastV2Calibrator(self.settings, self.forecasts.store).profile(
                             station_id=observation_history.station_id,
                             as_of_utc=issued_at,
                         )
@@ -436,9 +470,7 @@ class Scanner:
                     raw_members = forecast.unadjusted_member_values or forecast.member_values
                     adjusted_members = apply_observed_max(
                         raw_members,
-                        None
-                        if observation_history is None
-                        else observation_history.observed_max_c,
+                        None if observation_history is None else observation_history.observed_max_c,
                     )
                     forecast = forecast.model_copy(
                         update={
@@ -455,9 +487,7 @@ class Scanner:
                         market_id: Decimal(
                             str(
                                 round(
-                                    self.weather.probability(
-                                        forecast=forecast, bracket=bracket
-                                    ),
+                                    self.weather.probability(forecast=forecast, bracket=bracket),
                                     10,
                                 )
                             )
@@ -541,7 +571,7 @@ class Scanner:
             and probabilities
         ):
             try:
-                forecast_engine.record_open_meteo(
+                prediction_ids[OPEN_METEO_ALGORITHM_VERSION] = forecast_engine.record_open_meteo(
                     scan_run_id=run_id,
                     event_id=event.id,
                     audit=audit,
@@ -552,12 +582,11 @@ class Scanner:
                     source_uri=self.settings.weather_ensemble_url,
                     weather_error_sigma_c=Decimal(str(self.settings.weather_error_sigma_c)),
                     metadata=(
-                        {"post_event_reused_snapshot": True}
-                        if post_event_reused_snapshot
-                        else None
+                        {"post_event_reused_snapshot": True} if post_event_reused_snapshot else None
                     ),
                 )
             except Exception as error:
+                persist_failures.add(OPEN_METEO_ALGORITHM_VERSION)
                 errors.append(f"event {event.id}: v1 forecast archive failed: {error}")
         if (
             forecast_engine is not None
@@ -566,7 +595,7 @@ class Scanner:
             and weathernext_probabilities
         ):
             try:
-                forecast_engine.record_weathernext(
+                prediction_ids[WEATHERNEXT_ALGORITHM_VERSION] = forecast_engine.record_weathernext(
                     scan_run_id=run_id,
                     event_id=event.id,
                     audit=audit,
@@ -577,6 +606,7 @@ class Scanner:
                     model_version="weathernext-3",
                 )
             except Exception as error:
+                persist_failures.add(WEATHERNEXT_ALGORITHM_VERSION)
                 errors.append(f"event {event.id}: WeatherNext forecast archive failed: {error}")
         if (
             forecast_engine is not None
@@ -585,7 +615,7 @@ class Scanner:
             and observation_history is not None
         ):
             try:
-                forecast_engine.record_ecmwf_shadow(
+                prediction_ids[ECMWF_RAW_ALGORITHM_VERSION] = forecast_engine.record_ecmwf_shadow(
                     scan_run_id=run_id,
                     event_id=event.id,
                     audit=audit,
@@ -601,7 +631,11 @@ class Scanner:
                         "distribution": "empirical_50_member",
                     },
                 )
-                forecast_engine.record_ecmwf_shadow(
+            except Exception as error:
+                persist_failures.add(ECMWF_RAW_ALGORITHM_VERSION)
+                errors.append(f"event {event.id}: raw ECMWF forecast archive failed: {error}")
+            try:
+                prediction_ids[FORECAST_V2_ALGORITHM_VERSION] = forecast_engine.record_ecmwf_shadow(
                     scan_run_id=run_id,
                     event_id=event.id,
                     audit=audit,
@@ -622,8 +656,181 @@ class Scanner:
                     },
                 )
             except Exception as error:
-                errors.append(f"event {event.id}: ECMWF forecast archive failed: {error}")
+                persist_failures.add(FORECAST_V2_ALGORITHM_VERSION)
+                errors.append(f"event {event.id}: v2 ECMWF forecast archive failed: {error}")
+        self._register_evaluation_event(
+            run_id=run_id,
+            event=event,
+            audit=audit,
+            deterministic=deterministic,
+            brackets=brackets,
+            observation_history=observation_history,
+            observation_blockers=observation_blockers,
+            rule_blockers=rule_blockers,
+            rule_warnings=rule_warnings,
+            observation_warnings=observation_warnings,
+            baseline_model=("open-meteo-ensemble" if forecast is None else forecast.provider),
+            prediction_ids=prediction_ids,
+            persist_failures=persist_failures,
+            errors=errors,
+        )
         return event_decisions, errors
+
+    def _register_evaluation_event(
+        self,
+        *,
+        run_id: int,
+        event: EventDefinition,
+        audit: RuleAudit,
+        deterministic: RuleAudit,
+        brackets: dict[str, Bracket],
+        observation_history: ObservationHistory | None,
+        observation_blockers: list[str],
+        rule_blockers: list[str],
+        rule_warnings: list[str],
+        observation_warnings: list[str],
+        baseline_model: str,
+        prediction_ids: dict[str, int],
+        persist_failures: set[str],
+        errors: list[str],
+    ) -> None:
+        forecast_engine = getattr(self, "forecasts", None)
+        if forecast_engine is None:
+            return
+        rules = deterministic.interpretation
+        readiness_blockers = list(dict.fromkeys(rule_blockers + observation_blockers))
+        cohort_blockers: list[str] = []
+        if not rules.tradeable:
+            cohort_blockers.append("RULES_NOT_ANALYZABLE")
+        if not brackets:
+            cohort_blockers.append("BRACKET_NOT_PARSED")
+        if observation_history is None:
+            cohort_blockers.append("OBSERVATION_IDENTITY_UNAVAILABLE")
+        if rules.unit != "C" or rules.precision_decimal_places != 0:
+            cohort_blockers.append("FORECAST_RULE_FORMAT_UNSUPPORTED")
+        blockers = list(dict.fromkeys(cohort_blockers + readiness_blockers))
+        warnings = list(dict.fromkeys(rule_warnings + observation_warnings))
+        eligible = not cohort_blockers
+        if not eligible:
+            stage = ForecastEligibilityStage.INELIGIBLE
+        elif prediction_ids:
+            stage = ForecastEligibilityStage.FORECAST_READY
+        else:
+            stage = ForecastEligibilityStage.FORECAST_FAILED
+
+        # Cohort membership is a property of the opportunity and its rule/day
+        # identity, not of whether a weather provider happened to answer or a
+        # trade was selected.  Provider/observation failures stay visible in
+        # block_reasons and algorithm attempt rows instead of disappearing from
+        # the coverage denominator.
+        def attempt_status(version: str) -> ForecastAlgorithmAttemptStatus:
+            if not eligible:
+                return ForecastAlgorithmAttemptStatus.VALIDATION_FAILED
+            if version in prediction_ids:
+                return ForecastAlgorithmAttemptStatus.PREDICTED
+            if version in persist_failures:
+                return ForecastAlgorithmAttemptStatus.PERSIST_FAILED
+            if readiness_blockers:
+                return ForecastAlgorithmAttemptStatus.VALIDATION_FAILED
+            return ForecastAlgorithmAttemptStatus.SOURCE_UNAVAILABLE
+
+        def attempt_reasons(version: str) -> list[str]:
+            if not eligible:
+                return blockers
+            if version in persist_failures:
+                return ["FORECAST_ARCHIVE_FAILED"]
+            if readiness_blockers:
+                return readiness_blockers
+            if version not in prediction_ids:
+                return ["FORECAST_SOURCE_UNAVAILABLE"]
+            return []
+
+        expected: list[ForecastAlgorithmEligibility] = [
+            ForecastAlgorithmEligibility(
+                source="open-meteo",
+                model=baseline_model,
+                algorithm_version=OPEN_METEO_ALGORITHM_VERSION,
+                expected=True,
+                status=attempt_status(OPEN_METEO_ALGORITHM_VERSION),
+                prediction_id=prediction_ids.get(OPEN_METEO_ALGORITHM_VERSION),
+                reason_codes=attempt_reasons(OPEN_METEO_ALGORITHM_VERSION),
+            )
+        ]
+        if self.settings.ecmwf_enabled and self.settings.forecast_v2_enabled:
+            for version in (ECMWF_RAW_ALGORITHM_VERSION, FORECAST_V2_ALGORITHM_VERSION):
+                expected.append(
+                    ForecastAlgorithmEligibility(
+                        source="open-meteo-ecmwf",
+                        model="ECMWF IFS ENS 0.25° daily max via Open-Meteo",
+                        algorithm_version=version,
+                        expected=True,
+                        status=attempt_status(version),
+                        prediction_id=prediction_ids.get(version),
+                        reason_codes=attempt_reasons(version),
+                    )
+                )
+        weathernext_available = self.weathernext.status().state == "snapshot_available"
+        expected.append(
+            ForecastAlgorithmEligibility(
+                source="weathernext3",
+                model="WeatherNext 3 full ensemble",
+                algorithm_version=WEATHERNEXT_ALGORITHM_VERSION,
+                expected=weathernext_available,
+                status=(
+                    attempt_status(WEATHERNEXT_ALGORITHM_VERSION)
+                    if weathernext_available
+                    else ForecastAlgorithmAttemptStatus.NOT_CONFIGURED
+                ),
+                prediction_id=prediction_ids.get(WEATHERNEXT_ALGORITHM_VERSION),
+                reason_codes=(
+                    attempt_reasons(WEATHERNEXT_ALGORITHM_VERSION)
+                    if weathernext_available
+                    else ["WEATHERNEXT_ACCESS_PENDING"]
+                ),
+            )
+        )
+        station_id = None if observation_history is None else observation_history.station_id
+        observation_date = rules.observation_date
+        station_timezone = (
+            None if observation_history is None else observation_history.station_timezone
+        )
+        day_start = day_end = None
+        if observation_history is not None and observation_date is not None:
+            local_start = datetime.combine(
+                observation_date,
+                time.min,
+                tzinfo=ZoneInfo(observation_history.station_timezone),
+            )
+            day_start = local_start.astimezone(UTC)
+            day_end = (local_start + timedelta(days=1)).astimezone(UTC)
+        try:
+            forecast_engine.register_evaluation_event(
+                ForecastEventEligibility(
+                    scan_run_id=run_id,
+                    event_id=event.id,
+                    considered_at_utc=datetime.now(UTC),
+                    event_title=event.title,
+                    event_slug=event.slug,
+                    market_count=len(event.markets),
+                    rules_hash=audit.rules_hash,
+                    rule_parser=audit.parser,
+                    station_id=station_id,
+                    observation_date=observation_date,
+                    station_timezone=station_timezone,
+                    rule_day_start_utc=day_start,
+                    rule_day_end_utc=day_end,
+                    display_unit=rules.unit,
+                    precision_decimal_places=rules.precision_decimal_places,
+                    rounding_rule="displayed_temperature_c=floor(raw_temperature_c+0.5)",
+                    eligible=eligible,
+                    stage=stage,
+                    block_reasons=blockers,
+                    warning_reasons=warnings,
+                    algorithms=expected,
+                )
+            )
+        except Exception as error:
+            errors.append(f"event {event.id}: evaluation registry failed: {error}")
 
     def _finalize_event_decisions(
         self, decisions: list[MarketDecision], *, paper: bool
@@ -806,10 +1013,7 @@ def _runtime_rule_ambiguities(
         if history is not None and ("timezone" in lowered or "source-local date" in lowered):
             warnings.append("RULE_TIMEZONE_VERIFIED_FROM_STATION_SOURCE")
             continue
-        if (
-            history is not None
-            and "weather underground" in lowered
-        ):
+        if history is not None and "weather underground" in lowered:
             warnings.append(
                 "FALLBACK_SOURCE_AMBIGUOUS_PRIMARY_AVAILABLE"
                 if history.observations and not history.stale

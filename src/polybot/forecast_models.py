@@ -23,6 +23,27 @@ class ForecastPhase(StrEnum):
     POST_EVENT = "POST_EVENT"
 
 
+class ForecastEligibilityStage(StrEnum):
+    """Event-level cohort stage, independent of whether a trade was selected."""
+
+    DISCOVERED = "DISCOVERED"
+    RULES_VALIDATED = "RULES_VALIDATED"
+    OBSERVATIONS_VALIDATED = "OBSERVATIONS_VALIDATED"
+    FORECAST_READY = "FORECAST_READY"
+    FORECAST_FAILED = "FORECAST_FAILED"
+    INELIGIBLE = "INELIGIBLE"
+    BACKFILL_UNKNOWN = "BACKFILL_UNKNOWN"
+
+
+class ForecastAlgorithmAttemptStatus(StrEnum):
+    PREDICTED = "PREDICTED"
+    NOT_EXPECTED = "NOT_EXPECTED"
+    NOT_CONFIGURED = "NOT_CONFIGURED"
+    SOURCE_UNAVAILABLE = "SOURCE_UNAVAILABLE"
+    VALIDATION_FAILED = "VALIDATION_FAILED"
+    PERSIST_FAILED = "PERSIST_FAILED"
+
+
 class ForecastModelRun(StrictModel):
     """Immutable source/model artifact provenance.
 
@@ -127,6 +148,87 @@ class ForecastObservationEvidence(StrictModel):
         if self.observed_at_utc.tzinfo is None or self.first_seen_at_utc.tzinfo is None:
             raise ValueError("observation evidence timestamps must be timezone-aware")
         return self
+
+
+class ForecastAlgorithmEligibility(StrictModel):
+    source: str
+    model: str
+    algorithm_version: str
+    expected: bool
+    status: ForecastAlgorithmAttemptStatus
+    prediction_id: int | None = None
+    reason_codes: list[str] = Field(default_factory=list)
+
+
+class ForecastEventEligibility(StrictModel):
+    """One considered event in the frozen evaluation universe for a scan."""
+
+    scan_run_id: int
+    event_id: str
+    cohort_version: str = "weather-evaluation-v1"
+    considered_at_utc: datetime
+    event_title: str
+    event_slug: str | None = None
+    market_count: int
+    rules_hash: str
+    rule_parser: str
+    station_id: str | None = None
+    observation_date: date | None = None
+    station_timezone: str | None = None
+    rule_day_start_utc: datetime | None = None
+    rule_day_end_utc: datetime | None = None
+    display_unit: str
+    precision_decimal_places: int | None = None
+    rounding_rule: str | None = None
+    eligible: bool
+    stage: ForecastEligibilityStage
+    block_reasons: list[str] = Field(default_factory=list)
+    warning_reasons: list[str] = Field(default_factory=list)
+    algorithms: list[ForecastAlgorithmEligibility] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_eligibility(self) -> ForecastEventEligibility:
+        if self.considered_at_utc.tzinfo is None:
+            raise ValueError("considered_at_utc must be timezone-aware")
+        boundaries = (self.rule_day_start_utc, self.rule_day_end_utc)
+        if any(value is not None and value.tzinfo is None for value in boundaries):
+            raise ValueError("registry rule-day boundaries must be timezone-aware")
+        if self.eligible and (
+            self.station_id is None
+            or self.observation_date is None
+            or self.station_timezone is None
+            or self.rule_day_start_utc is None
+            or self.rule_day_end_utc is None
+            or self.precision_decimal_places is None
+            or not self.rounding_rule
+        ):
+            raise ValueError("eligible event requires complete station/rule-day identity")
+        versions = [item.algorithm_version for item in self.algorithms]
+        if len(versions) != len(set(versions)):
+            raise ValueError("algorithm eligibility rows must have unique versions")
+        return self
+
+    @property
+    def phase(self) -> ForecastPhase | None:
+        if self.rule_day_start_utc is None or self.rule_day_end_utc is None:
+            return None
+        if self.considered_at_utc < self.rule_day_start_utc:
+            return ForecastPhase.LEAD_TIME
+        if self.considered_at_utc < self.rule_day_end_utc:
+            return ForecastPhase.INTRADAY
+        return ForecastPhase.POST_EVENT
+
+    @property
+    def lead_time_seconds(self) -> int | None:
+        if self.rule_day_start_utc is None:
+            return None
+        return int((self.rule_day_start_utc - self.considered_at_utc).total_seconds())
+
+    @property
+    def intraday_elapsed_seconds(self) -> int | None:
+        if self.phase != ForecastPhase.INTRADAY or self.rule_day_start_utc is None:
+            return None
+        return int((self.considered_at_utc - self.rule_day_start_utc).total_seconds())
 
 
 class ForecastSubmission(StrictModel):
@@ -244,6 +346,7 @@ class ForecastMetricsQuery(StrictModel):
     model: str | None = None
     algorithm_version: str | None = None
     station_id: str | None = None
+    cohort_version: str = "weather-evaluation-v1"
     phases: tuple[ForecastPhase, ...] = (
         ForecastPhase.LEAD_TIME,
         ForecastPhase.INTRADAY,
@@ -288,6 +391,11 @@ class ForecastMetricsSlice(StrictModel):
     multiclass_brier_score: Decimal | None
     expected_calibration_error: Decimal | None
     top_label_calibration: list[CalibrationBin]
+    eligible_event_count: int = 0
+    eligible_ended_event_count: int = 0
+    forecast_coverage: Decimal = Decimal(0)
+    outcome_coverage: Decimal = Decimal(0)
+    calibration_bin_count: int = 10
 
 
 class ForecastMetricsReport(StrictModel):
@@ -335,8 +443,7 @@ def compute_metrics_slice(
     absolute_errors: list[Decimal] = []
     top_labels: list[tuple[Decimal, Decimal]] = []
     for item in complete:
-        ordered = sorted(item.probabilities.items(), key=lambda pair: pair[0])
-        predicted_market, confidence = max(ordered, key=lambda pair: pair[1])
+        predicted_market, confidence = _select_top_probability(item.probabilities)
         correct = Decimal(1) if predicted_market == item.winning_market_id else Decimal(0)
         correct_values.append(correct)
         top_labels.append((confidence, correct))
@@ -383,7 +490,17 @@ def compute_metrics_slice(
         multiclass_brier_score=_mean(brier_values),
         expected_calibration_error=expected_calibration_error,
         top_label_calibration=calibration,
+        calibration_bin_count=calibration_bin_count,
     )
+
+
+def _select_top_probability(
+    probabilities: dict[str, Decimal],
+) -> tuple[str, Decimal]:
+    """Select a top bracket deterministically, including ties."""
+
+    ordered = sorted(probabilities.items(), key=lambda pair: pair[0])
+    return max(ordered, key=lambda pair: pair[1])
 
 
 def _mean(values: list[Decimal]) -> Decimal | None:

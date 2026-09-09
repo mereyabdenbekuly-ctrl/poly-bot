@@ -4,6 +4,11 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 from polybot.config import Settings
+from polybot.forecast_models import (
+    OPEN_METEO_ALGORITHM_VERSION,
+    ForecastAlgorithmAttemptStatus,
+    ForecastEligibilityStage,
+)
 from polybot.models import (
     BookLevel,
     DecisionAction,
@@ -15,6 +20,7 @@ from polybot.models import (
     WeatherForecast,
 )
 from polybot.observations import ObservationHistory
+from polybot.rules import build_brackets, deterministic_rule_audit
 from polybot.scanner import Scanner, _runtime_rule_ambiguities
 
 
@@ -289,3 +295,65 @@ def test_active_monitoring_does_not_consume_new_candidate_quota(monkeypatch) -> 
     assert ("candidate-event", True) in calls
     assert report.events_scanned == 2
     assert report.paper_orders_opened == 0
+
+
+def test_evaluation_registry_keeps_source_failure_in_eligible_cohort() -> None:
+    now = datetime(2026, 9, 9, 12, tzinfo=UTC)
+    event = _monitoring_event(now)
+    observation = history().model_copy(
+        update={
+            "station_id": "TEST",
+            "station_name": "Test City Airport",
+            "station_timezone": "UTC",
+            "observation_date": date(2026, 9, 10),
+            "fetched_at_utc": now,
+            "day_started": False,
+        }
+    )
+    captured: list[Any] = []
+    scanner = Scanner.__new__(Scanner)
+    scanner.settings = cast(
+        Any,
+        SimpleNamespace(ecmwf_enabled=False, forecast_v2_enabled=False),
+    )
+    scanner.forecasts = cast(
+        Any,
+        SimpleNamespace(register_evaluation_event=lambda item: captured.append(item) or 1),
+    )
+    scanner.weathernext = cast(
+        Any,
+        SimpleNamespace(status=lambda: SimpleNamespace(state="access_pending")),
+    )
+    errors: list[str] = []
+    audit = deterministic_rule_audit(event)
+
+    scanner._register_evaluation_event(  # noqa: SLF001
+        run_id=1,
+        event=event,
+        audit=audit,
+        deterministic=audit,
+        brackets=build_brackets(event),
+        observation_history=observation,
+        observation_blockers=["OBSERVATION_SOURCE_UNAVAILABLE"],
+        rule_blockers=[],
+        rule_warnings=[],
+        observation_warnings=[],
+        baseline_model="open-meteo-ensemble",
+        prediction_ids={},
+        persist_failures=set(),
+        errors=errors,
+    )
+
+    assert errors == []
+    assert len(captured) == 1
+    registration = captured[0]
+    assert registration.eligible is True
+    assert registration.stage == ForecastEligibilityStage.FORECAST_FAILED
+    baseline = next(
+        item
+        for item in registration.algorithms
+        if item.algorithm_version == OPEN_METEO_ALGORITHM_VERSION
+    )
+    assert baseline.expected is True
+    assert baseline.status == ForecastAlgorithmAttemptStatus.VALIDATION_FAILED
+    assert baseline.reason_codes == ["OBSERVATION_SOURCE_UNAVAILABLE"]

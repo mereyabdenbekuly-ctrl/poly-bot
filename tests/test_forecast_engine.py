@@ -1,4 +1,4 @@
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -6,7 +6,11 @@ import pytest
 
 from polybot.forecast_models import (
     OPEN_METEO_ALGORITHM_VERSION,
+    ForecastAlgorithmAttemptStatus,
+    ForecastAlgorithmEligibility,
+    ForecastEligibilityStage,
     ForecastEvaluationCase,
+    ForecastEventEligibility,
     ForecastMetricsQuery,
     ForecastModelRun,
     ForecastObservationEvidence,
@@ -212,6 +216,59 @@ def _outcome(
     )
 
 
+def _register_event(
+    store: ForecastStore,
+    *,
+    run_id: int,
+    event_id: str = "event-1",
+    station_id: str = "TEST",
+    considered_at: datetime = datetime(2026, 9, 8, 12, tzinfo=UTC),
+    predicted: bool = True,
+    prediction_id: int | None = None,
+) -> None:
+    day_start = datetime(2026, 9, 9, tzinfo=UTC)
+    store.register_evaluation_event(
+        ForecastEventEligibility(
+            scan_run_id=run_id,
+            event_id=event_id,
+            considered_at_utc=considered_at,
+            event_title=f"Test {event_id}",
+            event_slug=event_id,
+            market_count=2,
+            rules_hash="rules-v1",
+            rule_parser="test",
+            station_id=station_id,
+            observation_date=date(2026, 9, 9),
+            station_timezone="UTC",
+            rule_day_start_utc=day_start,
+            rule_day_end_utc=day_start + timedelta(days=1),
+            display_unit="C",
+            precision_decimal_places=0,
+            rounding_rule="displayed_temperature_c=floor(raw_temperature_c+0.5)",
+            eligible=True,
+            stage=(
+                ForecastEligibilityStage.FORECAST_READY
+                if predicted
+                else ForecastEligibilityStage.FORECAST_FAILED
+            ),
+            algorithms=[
+                ForecastAlgorithmEligibility(
+                    source="test-source",
+                    model="test-ensemble",
+                    algorithm_version=OPEN_METEO_ALGORITHM_VERSION,
+                    expected=True,
+                    status=(
+                        ForecastAlgorithmAttemptStatus.PREDICTED
+                        if predicted
+                        else ForecastAlgorithmAttemptStatus.SOURCE_UNAVAILABLE
+                    ),
+                    prediction_id=prediction_id,
+                )
+            ],
+        )
+    )
+
+
 def test_v2_persists_full_provenance_scenarios_and_snapshot_links(tmp_path: Path) -> None:
     path, run_id = _prepare_database(tmp_path)
     store = ForecastStore(path)
@@ -260,6 +317,30 @@ def test_v2_persists_full_provenance_scenarios_and_snapshot_links(tmp_path: Path
         "book-market-b",
     ]
     assert evidence["station_observation_version_id"] is not None
+    assert evidence["canonical_first_seen_at_utc"] == evidence["first_seen_at_utc"]
+
+
+def test_repeat_fetch_keeps_canonical_observation_first_seen_time(tmp_path: Path) -> None:
+    path, run_id = _prepare_database(tmp_path)
+    store = ForecastStore(path)
+    submission = _submission(
+        run_id=run_id,
+        issued_at=datetime(2026, 9, 8, 13, tzinfo=UTC),
+        observation_cutoff=datetime(2026, 9, 8, 12, 59, tzinfo=UTC),
+    )
+    repeated = submission.observations[0].model_copy(
+        update={"first_seen_at_utc": datetime(2026, 9, 8, 12, 30, tzinfo=UTC)}
+    )
+    prediction_id = store.record(submission.model_copy(update={"observations": [repeated]}))
+
+    with store.connect() as connection:
+        evidence = connection.execute(
+            "SELECT first_seen_at_utc, canonical_first_seen_at_utc "
+            "FROM forecast_observation_evidence_v2 WHERE prediction_id=?",
+            (prediction_id,),
+        ).fetchone()
+    assert evidence["first_seen_at_utc"] == "2026-09-08T11:59:00+00:00"
+    assert evidence["canonical_first_seen_at_utc"] == "2026-09-08T11:59:00+00:00"
 
 
 def test_archived_model_run_is_reused_with_new_issuance_and_observations(
@@ -316,19 +397,13 @@ def test_prediction_archive_throttles_unchanged_polling_but_keeps_material_chang
         update={
             "issued_at_utc": datetime(2026, 9, 8, 12, 10, tzinfo=UTC),
             "probabilities": [
-                unchanged.probabilities[0].model_copy(
-                    update={"probability": Decimal("0.67")}
-                ),
-                unchanged.probabilities[1].model_copy(
-                    update={"probability": Decimal("0.33")}
-                ),
+                unchanged.probabilities[0].model_copy(update={"probability": Decimal("0.67")}),
+                unchanged.probabilities[1].model_copy(update={"probability": Decimal("0.33")}),
             ],
         }
     )
 
-    first_id = store.record(
-        first, min_interval_seconds=3600, probability_delta=Decimal("0.02")
-    )
+    first_id = store.record(first, min_interval_seconds=3600, probability_delta=Decimal("0.02"))
     assert (
         store.record(
             unchanged,
@@ -375,18 +450,36 @@ def test_phase_uses_prediction_issuance_not_archived_model_fetch(tmp_path: Path)
 def test_metrics_use_unique_events_and_latest_forecast_per_segment(tmp_path: Path) -> None:
     path, run_id = _prepare_database(tmp_path)
     store = ForecastStore(path)
-    store.record(
+    first_prediction_id = store.record(
         _submission(
             run_id=run_id,
             issued_at=datetime(2026, 9, 8, 12, tzinfo=UTC),
         )
     )
-    store.record(
+    _register_event(
+        store,
+        run_id=run_id,
+        prediction_id=first_prediction_id,
+    )
+    storage = Storage(path)
+    second_run_id = storage.start_scan(query="test", mode="paper")
+    for market_id in ("market-a", "market-b"):
+        storage.record_market_snapshot(
+            second_run_id,
+            _market_snapshot(event_id="event-1", market_id=market_id),
+        )
+    second_prediction_id = store.record(
         _submission(
-            run_id=run_id,
+            run_id=second_run_id,
             issued_at=datetime(2026, 9, 8, 13, tzinfo=UTC),
             probabilities=("0.2", "0.8"),
         )
+    )
+    _register_event(
+        store,
+        run_id=second_run_id,
+        considered_at=datetime(2026, 9, 8, 13, tzinfo=UTC),
+        prediction_id=second_prediction_id,
     )
     store.record_outcome(
         _outcome(
@@ -399,6 +492,18 @@ def test_metrics_use_unique_events_and_latest_forecast_per_segment(tmp_path: Pat
     event_two = _outcome(source_revision="rev-event-2").model_copy(
         update={"event_id": "event-2", "station_id": "TEST2"}
     )
+    _register_event(
+        store,
+        run_id=run_id,
+        event_id="event-2",
+        station_id="TEST2",
+        predicted=False,
+    )
+    for market_id in ("market-a", "market-b"):
+        storage.record_market_snapshot(
+            run_id,
+            _market_snapshot(event_id="event-2", market_id=market_id),
+        )
     store.record_outcome(event_two)
 
     report = store.metrics(ForecastMetricsQuery(calibration_bin_count=2))
@@ -450,18 +555,30 @@ def test_multiclass_brier_uses_full_distribution_once_per_event() -> None:
 def test_outcome_revisions_are_append_only_and_as_of_is_reproducible(tmp_path: Path) -> None:
     path, run_id = _prepare_database(tmp_path)
     store = ForecastStore(path)
-    store.record(
+    prediction_id = store.record(
         _submission(
             run_id=run_id,
             issued_at=datetime(2026, 9, 8, 12, tzinfo=UTC),
         )
     )
+    _register_event(store, run_id=run_id, prediction_id=prediction_id)
     first = _outcome(
         source_revision="rev-1",
         recorded_at=datetime(2026, 9, 10, tzinfo=UTC),
     )
     store.record_outcome(first)
     assert store.record_outcome(first) == 1
+    assert (
+        store.record_outcome(
+            first.model_copy(
+                update={
+                    "recorded_at_utc": first.recorded_at_utc + timedelta(hours=1),
+                    "evidence": {"observation_fetch_time": "2026-09-10T01:00:00+00:00"},
+                }
+            )
+        )
+        == 1
+    )
     with pytest.raises(ValueError, match="immutable"):
         store.record_outcome(
             _outcome(
@@ -481,8 +598,14 @@ def test_outcome_revisions_are_append_only_and_as_of_is_reproducible(tmp_path: P
     historical = store.metrics(
         ForecastMetricsQuery(as_of_utc=datetime(2026, 9, 10, 12, tzinfo=UTC))
     )
+    historical_non_utc = store.metrics(
+        ForecastMetricsQuery(
+            as_of_utc=datetime(2026, 9, 10, 17, tzinfo=timezone(timedelta(hours=5)))
+        )
+    )
     current = store.metrics()
     assert historical.overall.exact_bracket_accuracy == Decimal(1)
+    assert historical_non_utc.overall == historical.overall
     assert current.overall.exact_bracket_accuracy == Decimal(0)
     assert store.counts()["outcome_versions"] == 2
 
@@ -490,13 +613,25 @@ def test_outcome_revisions_are_append_only_and_as_of_is_reproducible(tmp_path: P
 def test_outcome_identity_is_checked_when_forecasts_exist(tmp_path: Path) -> None:
     path, run_id = _prepare_database(tmp_path)
     store = ForecastStore(path)
-    store.record(
+    prediction_id = store.record(
         _submission(run_id=run_id, issued_at=datetime(2026, 9, 8, 12, tzinfo=UTC))
     )
+    _register_event(store, run_id=run_id, prediction_id=prediction_id)
 
     with pytest.raises(ValueError, match="rule-day identity mismatch"):
         store.record_outcome(
-            _outcome(source_revision="wrong-station").model_copy(
+            _outcome(source_revision="wrong-station").model_copy(update={"station_id": "OTHER"})
+        )
+
+
+def test_outcome_identity_is_checked_for_eligible_unforecasted_event(tmp_path: Path) -> None:
+    path, run_id = _prepare_database(tmp_path)
+    store = ForecastStore(path)
+    _register_event(store, run_id=run_id, predicted=False)
+
+    with pytest.raises(ValueError, match="rule-day identity mismatch"):
+        store.record_outcome(
+            _outcome(source_revision="wrong-registry-station").model_copy(
                 update={"station_id": "OTHER"}
             )
         )
@@ -507,9 +642,10 @@ def test_forecasted_ended_events_are_polled_and_refreshed_for_corrections(
 ) -> None:
     path, run_id = _prepare_database(tmp_path)
     store = ForecastStore(path)
-    store.record(
+    prediction_id = store.record(
         _submission(run_id=run_id, issued_at=datetime(2026, 9, 8, 12, tzinfo=UTC))
     )
+    _register_event(store, run_id=run_id, prediction_id=prediction_id)
     as_of = datetime(2026, 9, 10, 1, tzinfo=UTC)
 
     assert store.pending_outcome_event_ids(as_of_utc=as_of) == ["event-1"]

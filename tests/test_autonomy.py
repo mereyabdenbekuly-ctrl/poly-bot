@@ -105,6 +105,12 @@ def test_60_and_120_minute_reports_roll_to_a_new_window(tmp_path) -> None:
     assert not rolled
     assert same.id == window.id
     assert {item.kind for item in storage.runtime_reports(window.id)} == {"INTERIM_60M"}
+    interim = storage.runtime_reports(window.id)[0]
+    assert interim.payload["forecast_engine"]["counts"] == {  # type: ignore[index]
+        "model_runs": 0,
+        "predictions": 0,
+        "outcome_versions": 0,
+    }
 
     runner._clock = lambda: base + timedelta(minutes=120)  # noqa: SLF001
     next_window, rolled = runner.process_reporting_boundaries(

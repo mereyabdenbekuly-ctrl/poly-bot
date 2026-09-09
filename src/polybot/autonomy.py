@@ -5,6 +5,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 
 from polybot.config import Settings
+from polybot.forecast_store import ForecastStore
 from polybot.models import RuntimeWindow, ScanReport
 from polybot.scanner import Scanner
 from polybot.storage import Storage
@@ -28,6 +29,7 @@ class AutonomousRunner:
         self.settings = settings
         self.storage = storage
         self.weathernext = WeatherNextProvider(settings)
+        self.forecast_store = ForecastStore(storage.path)
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def run(
@@ -155,6 +157,7 @@ class AutonomousRunner:
             "weathernext": self.weathernext.status().model_dump(mode="json"),
             "portfolio": self.storage.portfolio_summary(),
             "window": self.storage.runtime_window_summary(window_id),
+            "forecast_engine": self._forecast_report(kind),
         }
         if scan_report is not None:
             payload["scan"] = scan_report.model_dump(mode="json")
@@ -166,3 +169,26 @@ class AutonomousRunner:
             elapsed_seconds=elapsed,
             payload=payload,
         )
+
+    def _forecast_report(self, kind: str) -> dict[str, object]:
+        """Persist a compact technical snapshot at every reporting boundary."""
+
+        report: dict[str, object] = {
+            "counts": self.forecast_store.counts(),
+            "source_statuses": self.forecast_store.latest_source_statuses(),
+        }
+        if kind in {"INTERIM_60M", "COMPLETE_120M"}:
+            comparison = self.forecast_store.dashboard_summary(event_limit=1)
+            outcomes = comparison.get("outcomes", [])
+            report.update(
+                {
+                    "metrics": comparison.get("metrics", []),
+                    "station_metrics": comparison.get("station_metrics", []),
+                    "outcome_count": len(outcomes) if isinstance(outcomes, list) else 0,
+                    "eligible_event_count": comparison.get(
+                        "eligible_event_count",
+                        comparison.get("available_event_count", 0),
+                    ),
+                }
+            )
+        return report

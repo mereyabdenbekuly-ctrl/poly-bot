@@ -64,17 +64,31 @@ comparison proves a benefit. This avoids declaring unvalidated features useful.
 
 ## Evaluation
 
-Only officially resolved unique events enter quality metrics. The latest saved
-prediction per event and slice is used, so 20 five-minute updates are not 20
-independent observations. Reports include:
+Each considered opportunity is recorded in an append-only evaluation registry,
+independently of whether a paper order was selected or a provider answered.
+Legacy rows recovered during migration remain in a separate
+`legacy-backfill-v1` cohort and are not used for promotion. Only officially
+resolved unique events enter quality metrics. The latest saved prediction per
+event and slice is used, so 20 five-minute updates are not 20 independent
+observations. Reports include:
 
 - daily maximum MAE in °C;
 - exact winning-bracket accuracy;
 - multiclass Brier score;
 - top-label calibration bins and expected calibration error;
-- event count and forecast coverage;
+- resolved event count;
+- forecast coverage (`unique forecast events / eligible events`);
+- outcome coverage (`resolved ended eligible events / ended eligible events`);
+- evaluation completeness among outcomes;
 - separate lead-time and intraday slices and lead-time bins;
-- station-specific reports.
+- exact 95% binomial intervals for rates and deterministic bootstrap intervals
+  for MAE, Brier and ECE;
+- station-specific reports through the metrics API.
+
+Fewer than 30 resolved unique events are labelled descriptive-only and are not
+used to rank or promote versions. The dashboard keeps v1, raw IFS ENS and v2
+side by side, and WeatherNext stays `access_pending` until an authorized
+64-member export is actually loaded.
 
 A model is not promoted because of a single win or green tests. Promotion must
 use a frozen validation period and a preselected primary metric; uncertainty

@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from polybot.forecast_models import (
     OPEN_METEO_ALGORITHM_VERSION,
     WEATHERNEXT_ALGORITHM_VERSION,
+    ForecastEventEligibility,
     ForecastMetricsQuery,
     ForecastMetricsReport,
     ForecastModelRun,
@@ -45,6 +46,9 @@ class ForecastEngineV2:
             min_interval_seconds=self._min_interval_seconds,
             probability_delta=self._probability_delta,
         )
+
+    def register_evaluation_event(self, item: ForecastEventEligibility) -> int:
+        return self.store.register_evaluation_event(item)
 
     def record_open_meteo(
         self,
@@ -182,9 +186,7 @@ class ForecastEngineV2:
         if len(raw) != len(adjusted):
             raise ValueError("raw and adjusted ECMWF member counts differ")
         observation_cutoff = observations.fetched_at_utc.astimezone(UTC)
-        issued = (issued_at_utc or max(snapshot.fetched_at_utc, observation_cutoff)).astimezone(
-            UTC
-        )
+        issued = (issued_at_utc or max(snapshot.fetched_at_utc, observation_cutoff)).astimezone(UTC)
         submission = ForecastSubmission(
             scan_run_id=scan_run_id,
             event_id=event_id,
@@ -224,9 +226,7 @@ class ForecastEngineV2:
                     adjusted_max_c=adjusted_value,
                     weight=Decimal(1),
                 )
-                for index, (raw_value, adjusted_value) in enumerate(
-                    zip(raw, adjusted, strict=True)
-                )
+                for index, (raw_value, adjusted_value) in enumerate(zip(raw, adjusted, strict=True))
             ],
             point_forecast_c=point_forecast_c,
             observed_floor_c=observed_floor_c,
@@ -248,9 +248,7 @@ def _rule_day(*, audit: RuleAudit, observations: ObservationHistory) -> Forecast
     if rules.observation_date is None or rules.unit != "C":
         raise ValueError("forecast v2 currently requires Celsius and an exact observation date")
     if rules.precision_decimal_places != 0:
-        raise ValueError(
-            "forecast v2 currently supports only whole-degree resolution rules"
-        )
+        raise ValueError("forecast v2 currently supports only whole-degree resolution rules")
     timezone = ZoneInfo(observations.station_timezone)
     local_start = datetime.combine(rules.observation_date, datetime.min.time(), tzinfo=timezone)
     return ForecastRuleDay(

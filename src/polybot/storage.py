@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from polybot.models import (
     MarketDecision,
@@ -24,6 +24,9 @@ from polybot.models import (
     WeatherForecast,
 )
 from polybot.observations import ObservationHistory
+
+if TYPE_CHECKING:
+    from polybot.forecast_store import ForecastStore
 
 
 def utc_now() -> datetime:
@@ -551,7 +554,9 @@ class Storage:
             )
         return result
 
-    def dashboard_payload(self) -> dict[str, object]:
+    def dashboard_payload(
+        self, *, forecast_store: ForecastStore | None = None
+    ) -> dict[str, object]:
         active = self.get_active_runtime_window()
         portfolio = self.portfolio_summary()
         raw_orders = portfolio.pop("recent_orders", [])
@@ -641,9 +646,11 @@ class Storage:
                 )
         forecast_comparison: dict[str, object]
         try:
-            from polybot.forecast_store import ForecastStore
+            if forecast_store is None:
+                from polybot.forecast_store import ForecastStore
 
-            forecast_comparison = ForecastStore(self.path).dashboard_summary()
+                forecast_store = ForecastStore(self.path, read_only=True)
+            forecast_comparison = forecast_store.dashboard_summary()
         except Exception as error:
             forecast_comparison = {
                 "counts": {"model_runs": 0, "predictions": 0, "outcome_versions": 0},
