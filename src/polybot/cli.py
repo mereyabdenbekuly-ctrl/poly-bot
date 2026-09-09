@@ -100,6 +100,8 @@ def _doctor(settings: Settings, storage: Storage, *, as_json: bool) -> None:
         "openai_version": importlib.metadata.version("openai"),
         "astra_model": settings.astra_model,
         "astra_enabled": settings.astra_enabled,
+        "observe_max_events": settings.max_events,
+        "paper_max_events": settings.paper_max_events,
         "openai_base_url": settings.openai_base_url,
         "openai_transport_secure": settings.openai_base_url.lower().startswith("https://"),
         "openai_fallback_configured": bool(
@@ -158,14 +160,13 @@ def _doctor(settings: Settings, storage: Storage, *, as_json: bool) -> None:
 
 
 def _scan_once(settings: Settings, storage: Storage, args: argparse.Namespace) -> None:
-    max_events = args.max_events or settings.max_events
-    if not 1 <= max_events <= 20:
-        raise ValueError("--max-events must be between 1 and 20")
+    paper = bool(args.paper)
+    max_events = _resolve_event_limit(settings, requested=args.max_events, paper=paper)
     report = Scanner(settings=settings, storage=storage).scan(
         query=args.query or settings.market_search_query,
         max_events=max_events,
         use_astra=bool(args.astra or settings.astra_enabled),
-        paper=bool(args.paper),
+        paper=paper,
     )
     if args.as_json:
         print(report.model_dump_json(indent=2))
@@ -175,17 +176,31 @@ def _scan_once(settings: Settings, storage: Storage, args: argparse.Namespace) -
 
 def _run(settings: Settings, storage: Storage, args: argparse.Namespace) -> None:
     interval = max(30, int(args.interval))
+    paper = bool(args.paper)
+    max_events = _resolve_event_limit(settings, requested=args.max_events, paper=paper)
     console.print(
-        f"Starting {'paper' if args.paper else 'observe'} loop every {interval}s. "
+        f"Starting {'paper' if paper else 'observe'} loop every {interval}s "
+        f"with up to {max_events} candidate events. "
         "Press Ctrl-C to stop."
     )
     AutonomousRunner(settings=settings, storage=storage).run(
         query=args.query or settings.market_search_query,
-        max_events=args.max_events or settings.max_events,
+        max_events=max_events,
         use_astra=bool(args.astra or settings.astra_enabled),
-        paper=bool(args.paper),
+        paper=paper,
         interval=interval,
     )
+
+
+def _resolve_event_limit(settings: Settings, *, requested: int | None, paper: bool) -> int:
+    limit = (
+        requested
+        if requested is not None
+        else (settings.paper_max_events if paper else settings.max_events)
+    )
+    if not 1 <= limit <= 20:
+        raise ValueError("--max-events must be between 1 and 20")
+    return limit
 
 
 def _status(storage: Storage, *, as_json: bool) -> None:

@@ -1086,6 +1086,16 @@ class Storage:
             for row in rows
         ]
 
+    def active_paper_event_ids(self) -> set[str]:
+        """Return events that cannot accept another paper position yet."""
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT event_id FROM paper_orders "
+                "WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED')"
+            ).fetchall()
+        return {str(row["event_id"]) for row in rows}
+
     def record_resolution_check(self, order_id: int, check: ResolutionCheck) -> None:
         with self.transaction(immediate=True) as connection:
             row = self._verified_order_row(connection, order_id, check)

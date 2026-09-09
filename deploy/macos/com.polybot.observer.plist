@@ -12,13 +12,12 @@
     <string>HOME=/Users/admin</string>
     <string>PATH=/Users/admin/Documents/ChatGPT/poly-bot/.venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <string>PYTHONUNBUFFERED=1</string>
+    <string>POLYBOT_PAPER_MAX_EVENTS=8</string>
     <string>/Users/admin/Documents/ChatGPT/poly-bot/.venv/bin/polybot</string>
     <string>run</string>
     <string>--interval</string>
     <string>300</string>
     <string>--paper</string>
-    <string>--max-events</string>
-    <string>2</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/Users/admin/Documents/ChatGPT/poly-bot</string>

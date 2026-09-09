@@ -37,10 +37,19 @@ class PolymarketGateway:
     def close(self) -> None:
         self._client.close()
 
-    def discover_weather_events(self, *, query: str, max_events: int) -> list[EventDefinition]:
+    def discover_weather_events(
+        self,
+        *,
+        query: str,
+        max_events: int,
+        excluded_event_ids: set[str] | None = None,
+    ) -> list[EventDefinition]:
         # Search relevance can put already-ended markets before tomorrow's markets.
         # Fetch a wider candidate page and only count events that can still accept orders.
-        candidate_page_size = min(100, max(20, max_events * 10))
+        # Active paper positions can be excluded so they do not consume the discovery
+        # quota even though a second position in the same event is forbidden.
+        excluded = excluded_event_ids or set()
+        candidate_page_size = min(100, max(20, (max_events + len(excluded)) * 10))
         page = self._client.search(
             q=query,
             events_status="active",
@@ -56,7 +65,7 @@ class PolymarketGateway:
         for result in page.items:
             for event_ref in result.events:
                 event_id = str(event_ref.id)
-                if event_id in seen:
+                if event_id in seen or event_id in excluded:
                     continue
                 seen.add(event_id)
                 event = self._client.get_event(id=event_id)

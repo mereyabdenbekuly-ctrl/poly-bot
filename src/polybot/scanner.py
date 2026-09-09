@@ -71,7 +71,12 @@ class Scanner:
                     gateway
                 )
                 errors.extend(settlement_errors)
-                events = gateway.discover_weather_events(query=query, max_events=max_events)
+                excluded_event_ids = self.storage.active_paper_event_ids() if paper else set()
+                events = gateway.discover_weather_events(
+                    query=query,
+                    max_events=max_events,
+                    excluded_event_ids=excluded_event_ids,
+                )
                 for event in events:
                     events_scanned += 1
                     event_decisions, event_errors = self._scan_event(

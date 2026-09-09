@@ -9,8 +9,8 @@ exec /usr/bin/env -i \
   HOME="/Users/admin" \
   PATH="$project/.venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" \
   PYTHONUNBUFFERED="1" \
+  POLYBOT_PAPER_MAX_EVENTS="8" \
   TMPDIR="${TMPDIR:-/tmp}" \
   "$project/.venv/bin/polybot" run \
     --interval 300 \
-    --paper \
-    --max-events 2
+    --paper

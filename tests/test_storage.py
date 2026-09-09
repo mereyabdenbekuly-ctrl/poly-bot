@@ -101,6 +101,7 @@ def test_decimal_exposure_is_not_aggregated_through_float(tmp_path) -> None:
     )
 
     assert storage.portfolio_summary()["open_exposure_usd"] == Decimal("3.1450")
+    assert storage.active_paper_event_ids() == {"event-1", "event-2"}
 
 
 def test_observation_revisions_are_immutable_and_deduplicated(tmp_path) -> None:

@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     geoblock_url: str = "https://polymarket.com/api/geoblock"
     market_search_query: str = "highest temperature"
     max_events: int = Field(default=2, ge=1, le=20)
+    # Broader discovery applies only when --paper is active. Observe-mode keeps
+    # its small default, and all per-event/global exposure controls remain the
+    # same regardless of this research coverage setting.
+    paper_max_events: int = Field(default=8, ge=1, le=20)
 
     astra_enabled: bool = False
     astra_model: str = "gpt-6-astra"
