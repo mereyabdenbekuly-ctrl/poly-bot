@@ -99,6 +99,9 @@ class ForecastEngineV2:
                     "longitude": forecast.longitude,
                     "forecast_timezone": forecast.timezone,
                     "weather_error_sigma_c": str(weather_error_sigma_c),
+                    "conditioning_method": (
+                        "clamp_full_day_members_then_truncated_normal_kernel"
+                    ),
                     **(metadata or {}),
                 },
             ),
@@ -178,6 +181,7 @@ class ForecastEngineV2:
         point_forecast_c: Decimal | None = None,
         issued_at_utc: datetime | None = None,
         metadata: dict[str, object] | None = None,
+        include_observations: bool = True,
     ) -> int:
         """Record raw or corrected IFS ENS scenarios without affecting v1."""
 
@@ -185,6 +189,11 @@ class ForecastEngineV2:
         adjusted = adjusted_member_max_c or raw
         if len(raw) != len(adjusted):
             raise ValueError("raw and adjusted ECMWF member counts differ")
+        member_ids = tuple(snapshot.member_ids or ())
+        if member_ids and len(member_ids) != len(raw):
+            raise ValueError("ECMWF source member IDs and values differ in length")
+        if not member_ids:
+            member_ids = tuple(f"legacy-position-{index + 1:03d}" for index in range(len(raw)))
         observation_cutoff = observations.fetched_at_utc.astimezone(UTC)
         issued = (issued_at_utc or max(snapshot.fetched_at_utc, observation_cutoff)).astimezone(UTC)
         submission = ForecastSubmission(
@@ -209,6 +218,24 @@ class ForecastEngineV2:
                     "latitude": snapshot.latitude,
                     "longitude": snapshot.longitude,
                     "forecast_timezone": snapshot.timezone,
+                    "source_member_ids": list(member_ids),
+                    "member_identity": (
+                        "provider_field_name"
+                        if snapshot.member_ids is not None
+                        else "legacy_positional_fallback"
+                    ),
+                    "control_field_present": snapshot.control_field_present,
+                    "control_member_included": False,
+                    "response_latitude": snapshot.response_latitude,
+                    "response_longitude": snapshot.response_longitude,
+                    "response_elevation_m": snapshot.response_elevation_m,
+                    "response_timezone": snapshot.response_timezone,
+                    "grid_distance_km": snapshot.grid_distance_km,
+                    "daily_units": snapshot.daily_units,
+                    "provider_processing_note": (
+                        "Open-Meteo daily aggregation may include temporal interpolation "
+                        "and terrain downscaling; not a raw station forecast."
+                    ),
                     "provenance_complete": bool(
                         snapshot.source_run_id
                         and snapshot.init_time_utc
@@ -221,7 +248,7 @@ class ForecastEngineV2:
             rule_day=_rule_day(audit=audit, observations=observations),
             scenarios=[
                 ForecastScenario(
-                    member_id=f"member-{index + 1:03d}",
+                    member_id=member_ids[index],
                     raw_max_c=raw_value,
                     adjusted_max_c=adjusted_value,
                     weight=Decimal(1),
@@ -231,8 +258,11 @@ class ForecastEngineV2:
             point_forecast_c=point_forecast_c,
             observed_floor_c=observed_floor_c,
             probabilities=_probabilities(brackets, probabilities),
-            observations=_observation_evidence(observations),
-            metadata=metadata or {},
+            observations=_observation_evidence(observations) if include_observations else [],
+            metadata={
+                **(metadata or {}),
+                "observation_lineage": "included" if include_observations else "excluded",
+            },
         )
         return self._record(submission)
 

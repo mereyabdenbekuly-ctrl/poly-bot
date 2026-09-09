@@ -100,6 +100,8 @@ class OpenMeteoEnsemble:
         floor_value = (
             None if forecast.observed_floor_c is None else float(forecast.observed_floor_c)
         )
+        if floor_value is not None and forecast.unit == "F":
+            floor_value = floor_value * 9 / 5 + 32
         probabilities = [
             _truncated_interval_probability(
                 value,

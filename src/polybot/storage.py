@@ -660,6 +660,21 @@ class Storage:
                 "outcomes": [],
                 "error": str(error),
             }
+        try:
+            from polybot.forecast_diagnostics_view import build_forecast_diagnostics_view
+
+            forecast_diagnostics = build_forecast_diagnostics_view(self.path)
+        except Exception as error:
+            forecast_diagnostics = {
+                "version": "forecast-diagnostics-v1",
+                "summary": {},
+                "history_sigma_proxy": {
+                    "state": "unavailable",
+                    "message": str(error),
+                },
+                "trades": [],
+                "warnings": [str(error)],
+            }
         dashboard_reports: list[dict[str, object]] = []
         if active is not None:
             for report in self.runtime_reports(active.id):
@@ -696,6 +711,7 @@ class Storage:
             "reports": dashboard_reports,
             "recent_windows": compact_windows,
             "forecast_comparison": forecast_comparison,
+            "forecast_diagnostics": forecast_diagnostics,
         }
 
     def start_scan(self, *, query: str, mode: str, window_id: int | None = None) -> int:

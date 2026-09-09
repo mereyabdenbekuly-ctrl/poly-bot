@@ -330,6 +330,18 @@ official result exists. Rates include 95% uncertainty intervals, and fewer than
 30 resolved unique events remain descriptive-only. See `docs/forecast-v1.md`,
 `docs/forecast-v2.md` and `docs/ecmwf.md` for formulas and provenance limits.
 
+For the paper trades that have already settled, run the read-only diagnostic:
+
+```bash
+polybot diagnostics
+polybot diagnostics --json
+```
+
+It separates a wrong weather forecast from buying a different bracket than the
+forecast's top bracket, and compares the historical signal under raw empirical
+members, the immutable `sigma=1.5°C` v1 kernel, and a clearly labelled
+descriptive sigma proxy. These counterfactuals never alter stored decisions.
+
 ### Durable local state and source archive
 
 The deployed macOS LaunchAgents keep the live SQLite database and forecast

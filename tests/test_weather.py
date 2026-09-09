@@ -52,3 +52,26 @@ def test_observed_floor_makes_lower_bracket_impossible() -> None:
 
     assert model.probability(forecast=forecast, bracket=impossible) == 0
     assert model.probability(forecast=forecast, bracket=possible) == pytest.approx(1)
+
+
+def test_fahrenheit_forecast_converts_celsius_observed_floor() -> None:
+    model = OpenMeteoEnsemble(Settings(weather_error_sigma_c=1.0))
+    forecast = WeatherForecast(
+        provider="test",
+        requested_location="Test",
+        matched_location="Test",
+        latitude=0,
+        longitude=0,
+        timezone="UTC",
+        observation_date=date(2026, 9, 9),
+        unit="F",
+        fetched_at=datetime.now(UTC),
+        member_values=[80.0],
+        observed_floor_c=Decimal("27"),
+    )
+
+    impossible = Bracket(market_id="1", label="80.5°F or below", lower=None, upper=80.6)
+    possible = Bracket(market_id="2", label="80.6°F or higher", lower=80.6, upper=None)
+
+    assert model.probability(forecast=forecast, bracket=impossible) == 0
+    assert model.probability(forecast=forecast, bracket=possible) == pytest.approx(1)

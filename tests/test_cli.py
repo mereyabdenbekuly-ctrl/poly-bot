@@ -1,6 +1,6 @@
 import pytest
 
-from polybot.cli import _resolve_event_limit
+from polybot.cli import _resolve_event_limit, build_parser
 from polybot.config import Settings
 
 
@@ -16,6 +16,13 @@ def test_explicit_event_limit_overrides_both_modes() -> None:
 
     assert _resolve_event_limit(settings, requested=5, paper=False) == 5
     assert _resolve_event_limit(settings, requested=5, paper=True) == 5
+
+
+def test_diagnostics_command_is_available_without_runtime_side_effects() -> None:
+    args = build_parser().parse_args(["diagnostics", "--json"])
+
+    assert args.command == "diagnostics"
+    assert args.as_json is True
 
 
 @pytest.mark.parametrize("requested", [0, 21])

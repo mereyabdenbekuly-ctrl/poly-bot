@@ -4,7 +4,7 @@ import argparse
 import importlib.metadata
 import json
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 
 from rich.console import Console
 from rich.table import Table
@@ -46,6 +46,11 @@ def build_parser() -> argparse.ArgumentParser:
     status = subparsers.add_parser("status", help="Show paper portfolio and API spend")
     status.add_argument("--json", action="store_true", dest="as_json")
 
+    diagnostics = subparsers.add_parser(
+        "diagnostics", help="Read-only forecast/trade and sigma-sensitivity diagnostics"
+    )
+    diagnostics.add_argument("--json", action="store_true", dest="as_json")
+
     settle = subparsers.add_parser("settle", help="Settle an open paper order manually")
     settle.add_argument("market_id")
     outcome = settle.add_mutually_exclusive_group(required=True)
@@ -69,6 +74,9 @@ def _add_scan_options(parser: argparse.ArgumentParser) -> None:
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     settings = Settings()
+    if args.command == "diagnostics":
+        _diagnostics(settings, as_json=args.as_json)
+        return
     settings.ensure_runtime_directories()
     storage = Storage(settings.database_path)
 
@@ -221,7 +229,7 @@ def _status(storage: Storage, *, as_json: bool) -> None:
         "net_project_pnl_after_api_usd",
     ):
         table.add_row(key, str(summary[key]))
-    console.print(table)
+        console.print(table)
     if summary["recent_orders"]:
         orders = Table(title="Recent paper orders")
         for column in ("id", "event_id", "market_id", "status", "entry_price", "max_loss_usd"):
@@ -240,7 +248,35 @@ def _status(storage: Storage, *, as_json: bool) -> None:
                     )
                 )
             )
-        console.print(orders)
+            console.print(orders)
+
+
+def _diagnostics(settings: Settings, *, as_json: bool) -> None:
+    from polybot.forecast_diagnostics_view import build_forecast_diagnostics_view
+
+    report = build_forecast_diagnostics_view(settings.database_path, settings=settings)
+    if as_json:
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+        return
+    summary = cast(dict[str, object], report.get("summary", {}))
+    table = Table(title="Forecast diagnostics v1 (read-only)")
+    table.add_column("Metric")
+    table.add_column("Value", justify="right")
+    for key in (
+        "settled_trade_count",
+        "forecast_available_count",
+        "forecast_correct_count",
+        "trade_incorrect_count",
+        "sigma_created_signal_count",
+        "double_conditioning_created_signal_count",
+    ):
+        table.add_row(key, str(summary.get(key, "—")))
+    console.print(table)
+    proxy = cast(dict[str, object], report.get("history_sigma_proxy", {}))
+    console.print(
+        f"Diagnostic sigma proxy: {proxy.get('value_c', '—')}°C · "
+        f"state={proxy.get('state', 'unknown')} · {proxy.get('message', '')}"
+    )
 
 
 def _print_scan_report(report: dict[str, Any]) -> None:

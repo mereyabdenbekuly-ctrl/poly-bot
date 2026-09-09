@@ -91,7 +91,8 @@ def test_station_calibrator_is_explicitly_untrained_without_resolved_history(
     Storage(database)
     store = ForecastStore(database)
     profile = ForecastV2Calibrator(
-        Settings(_env_file=None), store  # type: ignore[call-arg]
+        Settings(_env_file=None),  # type: ignore[call-arg]
+        store,  # type: ignore[call-arg]
     ).profile(station_id="TEST", as_of_utc=datetime(2026, 9, 9, 12, tzinfo=UTC))
 
     assert profile.state == "insufficient_history"

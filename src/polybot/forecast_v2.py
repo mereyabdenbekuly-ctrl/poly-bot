@@ -22,6 +22,9 @@ from polybot.observations import ObservationHistory
 
 ECMWF_RAW_ALGORITHM_VERSION = "ecmwf-ifs025-raw-ensemble-v1"
 FORECAST_V2_ALGORITHM_VERSION = "forecast-engine-v2-station-intraday@1"
+ECMWF_IFS_PERTURBED_MEMBER_IDS = tuple(
+    f"temperature_2m_max_member{number:02d}" for number in range(1, 51)
+)
 
 
 class EcmwfShadowSnapshot(StrictModel):
@@ -49,6 +52,14 @@ class EcmwfShadowSnapshot(StrictModel):
     payload_sha256: str
     archive_path: str
     member_max_c: list[Decimal] = Field(min_length=20, max_length=50)
+    member_ids: list[str] | None = None
+    control_field_present: bool | None = None
+    response_latitude: float | None = None
+    response_longitude: float | None = None
+    response_elevation_m: float | None = None
+    response_timezone: str | None = None
+    grid_distance_km: float | None = None
+    daily_units: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _validate_provenance(self) -> EcmwfShadowSnapshot:
@@ -56,6 +67,15 @@ class EcmwfShadowSnapshot(StrictModel):
             raise ValueError("fetched_at_utc must be timezone-aware")
         if not self.source_uri.startswith("https://"):
             raise ValueError("ECMWF shadow source must use HTTPS")
+        if self.member_ids is not None:
+            if len(self.member_ids) != len(self.member_max_c):
+                raise ValueError("ECMWF member IDs and values must have equal length")
+            if len(set(self.member_ids)) != len(self.member_ids):
+                raise ValueError("ECMWF member IDs must be unique")
+            if self.upstream_model == "ecmwf_ifs025" and tuple(self.member_ids) != (
+                ECMWF_IFS_PERTURBED_MEMBER_IDS
+            ):
+                raise ValueError("ECMWF IFS shadow must contain perturbed members 01..50")
         return self
 
 
@@ -130,13 +150,30 @@ class OpenMeteoEcmwfIfsEns:
             raise ValueError("ECMWF shadow response lacks the requested date")
         index = dates.index(date_value)
         member_rows: list[tuple[str, Decimal]] = []
-        for key, values in daily.items():
-            if not key.startswith("temperature_2m_max_member") or not isinstance(values, list):
-                continue
-            if index >= len(values) or values[index] is None:
-                continue
-            member_rows.append((key, Decimal(str(values[index]))))
-        member_rows.sort(key=lambda item: item[0])
+        if self.settings.ecmwf_shadow_model == "ecmwf_ifs025":
+            unexpected = sorted(
+                key
+                for key in daily
+                if key.startswith("temperature_2m_max_member")
+                and key not in ECMWF_IFS_PERTURBED_MEMBER_IDS
+            )
+            if unexpected:
+                raise ValueError(
+                    "ECMWF shadow returned unexpected member fields: " + ", ".join(unexpected)
+                )
+            for key in ECMWF_IFS_PERTURBED_MEMBER_IDS:
+                values = daily.get(key)
+                if not isinstance(values, list) or index >= len(values) or values[index] is None:
+                    raise ValueError(f"ECMWF shadow is missing perturbed member field {key}")
+                member_rows.append((key, Decimal(str(values[index]))))
+        else:
+            for key, values in daily.items():
+                if not key.startswith("temperature_2m_max_member") or not isinstance(values, list):
+                    continue
+                if index >= len(values) or values[index] is None:
+                    continue
+                member_rows.append((key, Decimal(str(values[index]))))
+            member_rows.sort(key=lambda item: item[0])
         if len(member_rows) < self.settings.ecmwf_min_members:
             raise ValueError(
                 f"ECMWF shadow returned {len(member_rows)} members; "
@@ -155,7 +192,45 @@ class OpenMeteoEcmwfIfsEns:
             separators=(",", ":"),
         ).encode()
         digest = hashlib.sha256(canonical).hexdigest()
-        archive_path = self._archive(digest=digest, payload=canonical, fetched_at=fetched_at)
+        control_field_present = "temperature_2m_max" in daily
+        response_latitude = _optional_float(payload.get("latitude"))
+        response_longitude = _optional_float(payload.get("longitude"))
+        response_elevation = _optional_float(payload.get("elevation"))
+        grid_distance = (
+            None
+            if response_latitude is None or response_longitude is None
+            else _haversine_km(
+                baseline.latitude,
+                baseline.longitude,
+                response_latitude,
+                response_longitude,
+            )
+        )
+        units_payload = payload.get("daily_units")
+        daily_units = (
+            {
+                str(key): str(value)
+                for key, value in units_payload.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
+            if isinstance(units_payload, dict)
+            else {}
+        )
+        archive_path = self._archive(
+            digest=digest,
+            payload=canonical,
+            fetched_at=fetched_at,
+            member_ids=[key for key, _ in member_rows],
+            control_field_present=control_field_present,
+            response_grid={
+                "latitude": response_latitude,
+                "longitude": response_longitude,
+                "elevation_m": response_elevation,
+                "timezone": payload.get("timezone"),
+                "grid_distance_km": grid_distance,
+                "daily_units": daily_units,
+            },
+        )
         return EcmwfShadowSnapshot(
             upstream_model=self.settings.ecmwf_shadow_model,
             requested_location=baseline.requested_location,
@@ -169,9 +244,28 @@ class OpenMeteoEcmwfIfsEns:
             payload_sha256=digest,
             archive_path=str(archive_path),
             member_max_c=[value for _, value in member_rows],
+            member_ids=[key for key, _ in member_rows],
+            control_field_present=control_field_present,
+            response_latitude=response_latitude,
+            response_longitude=response_longitude,
+            response_elevation_m=response_elevation,
+            response_timezone=(
+                str(payload["timezone"]) if isinstance(payload.get("timezone"), str) else None
+            ),
+            grid_distance_km=grid_distance,
+            daily_units=daily_units,
         )
 
-    def _archive(self, *, digest: str, payload: bytes, fetched_at: datetime) -> Path:
+    def _archive(
+        self,
+        *,
+        digest: str,
+        payload: bytes,
+        fetched_at: datetime,
+        member_ids: list[str] | None = None,
+        control_field_present: bool | None = None,
+        response_grid: dict[str, object] | None = None,
+    ) -> Path:
         root = self.settings.ecmwf_json_archive_root.expanduser().resolve()
         root.mkdir(parents=True, exist_ok=True)
         destination = root / digest
@@ -194,6 +288,14 @@ class OpenMeteoEcmwfIfsEns:
                 "source_run_id": None,
                 "init_time_utc": None,
                 "published_at_utc": None,
+                "perturbed_member_ids": member_ids,
+                "control_field_present": control_field_present,
+                "control_member_included": False,
+                "response_grid": response_grid or {},
+                "provider_processing_note": (
+                    "Open-Meteo daily aggregation may include temporal interpolation and "
+                    "terrain downscaling; this is not a raw station forecast."
+                ),
                 "provenance_note": (
                     "Transport pins ECMWF IFS ENS, but this response does not expose "
                     "the upstream run/publication timestamps."
@@ -212,13 +314,42 @@ class OpenMeteoEcmwfIfsEns:
         finally:
             # Never recursively remove a caller-provided path.  The temporary
             # directory name and parent are both verified before cleanup.
-            if staging.exists() and staging.parent == root and staging.name.startswith(
-                ".tmp-ecmwf-json-"
+            if (
+                staging.exists()
+                and staging.parent == root
+                and staging.name.startswith(".tmp-ecmwf-json-")
             ):
                 for child in staging.iterdir():
                     child.chmod(0o600)
                     child.unlink()
                 staging.rmdir()
+
+
+def _optional_float(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, str | int | float):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _haversine_km(
+    latitude_a: float,
+    longitude_a: float,
+    latitude_b: float,
+    longitude_b: float,
+) -> float:
+    radius_km = 6371.0088
+    lat_a = math.radians(latitude_a)
+    lat_b = math.radians(latitude_b)
+    delta_lat = lat_b - lat_a
+    delta_lon = math.radians(longitude_b - longitude_a)
+    haversine = (
+        math.sin(delta_lat / 2) ** 2
+        + math.cos(lat_a) * math.cos(lat_b) * math.sin(delta_lon / 2) ** 2
+    )
+    return 2 * radius_km * math.asin(min(1.0, math.sqrt(haversine)))
 
 
 class ForecastV2Calibrator:
@@ -312,9 +443,7 @@ class ForecastV2Calibrator:
         rms = math.sqrt(sum(x * x for x in centered) / len(centered))
         residual = Decimal(str(max(0.35, min(4.0, rms))))
         spreads = [spread for _, _, spread in samples if spread > 0]
-        mean_spread = (
-            sum(spreads, Decimal(0)) / Decimal(len(spreads)) if spreads else Decimal(0)
-        )
+        mean_spread = sum(spreads, Decimal(0)) / Decimal(len(spreads)) if spreads else Decimal(0)
         scale = Decimal(1) if mean_spread <= 0 else residual / mean_spread
         scale = max(Decimal("0.5"), min(Decimal("2.5"), scale))
         return StationCorrectionProfile(
@@ -338,13 +467,11 @@ def build_v2_forecast(
     raw = tuple(snapshot.member_max_c)
     raw_mean = _mean(raw)
     corrected = tuple(
-        raw_mean + profile.bias_c + profile.spread_scale * (value - raw_mean)
-        for value in raw
+        raw_mean + profile.bias_c + profile.spread_scale * (value - raw_mean) for value in raw
     )
     observed_floor = observations.observed_max_c
     adjusted = tuple(
-        max(value, observed_floor) if observed_floor is not None else value
-        for value in corrected
+        max(value, observed_floor) if observed_floor is not None else value for value in corrected
     )
     raw_probabilities = _empirical_probabilities(raw, brackets)
     v2_probabilities = _kernel_probabilities(
@@ -371,8 +498,16 @@ def build_v2_forecast(
 def extract_intraday_features(
     *, observations: ObservationHistory, issued_at_utc: datetime
 ) -> dict[str, object]:
-    rows = [item for item in observations.observations if item.observed_at_utc <= issued_at_utc]
+    rows = [
+        item
+        for item in observations.observations
+        if item.observed_at_utc <= issued_at_utc and item.first_seen_at_utc <= issued_at_utc
+    ]
     latest = rows[-1] if rows else None
+    available_observed_max = max(
+        (item.temperature_c for item in rows),
+        default=None,
+    )
     trend = None
     if len(rows) >= 2:
         cutoff = rows[-1].observed_at_utc.timestamp() - 3 * 3600
@@ -383,14 +518,10 @@ def extract_intraday_features(
         trend = rows[-1].temperature_c - earlier.temperature_c
     raw = {} if latest is None else latest.raw_payload
     return {
-        "observed_max_c": (
-            None if observations.observed_max_c is None else str(observations.observed_max_c)
-        ),
+        "observed_max_c": (None if available_observed_max is None else str(available_observed_max)),
         "latest_temperature_c": None if latest is None else str(latest.temperature_c),
         "temperature_change_3h_c": None if trend is None else str(trend),
-        "latest_observed_at_utc": (
-            None if latest is None else latest.observed_at_utc.isoformat()
-        ),
+        "latest_observed_at_utc": (None if latest is None else latest.observed_at_utc.isoformat()),
         "wind_speed": _first_raw_feature(raw, "wind_speed"),
         "cloud": _first_raw_feature(raw, "cloud"),
         "feature_adjustment_applied": False,

@@ -393,19 +393,18 @@ class Scanner:
         if analysis_rules.tradeable and brackets and not observation_blockers and not rule_blockers:
             try:
                 forecast = self.weather.forecast(analysis_rules)
+                observed_floor_c = (
+                    None if observation_history is None else observation_history.observed_max_c
+                )
                 adjusted_members = apply_observed_max(
                     forecast.member_values,
-                    None if observation_history is None else observation_history.observed_max_c,
+                    _floor_in_forecast_unit(observed_floor_c, forecast.unit),
                 )
                 forecast = forecast.model_copy(
                     update={
                         "unadjusted_member_values": forecast.member_values,
                         "member_values": adjusted_members,
-                        "observed_floor_c": (
-                            None
-                            if observation_history is None
-                            else observation_history.observed_max_c
-                        ),
+                        "observed_floor_c": (observed_floor_c),
                     }
                 )
                 self.storage.record_weather(run_id, event.id, forecast)
@@ -468,19 +467,18 @@ class Scanner:
                     post_event_reused_snapshot = True
                     forecast = previous
                     raw_members = forecast.unadjusted_member_values or forecast.member_values
+                    observed_floor_c = (
+                        None if observation_history is None else observation_history.observed_max_c
+                    )
                     adjusted_members = apply_observed_max(
                         raw_members,
-                        None if observation_history is None else observation_history.observed_max_c,
+                        _floor_in_forecast_unit(observed_floor_c, forecast.unit),
                     )
                     forecast = forecast.model_copy(
                         update={
                             "unadjusted_member_values": raw_members,
                             "member_values": adjusted_members,
-                            "observed_floor_c": (
-                                None
-                                if observation_history is None
-                                else observation_history.observed_max_c
-                            ),
+                            "observed_floor_c": (observed_floor_c),
                         }
                     )
                     probabilities = {
@@ -625,6 +623,7 @@ class Scanner:
                     observations=observation_history,
                     algorithm_version=ECMWF_RAW_ALGORITHM_VERSION,
                     point_forecast_c=v2_result.raw_point_c,
+                    include_observations=False,
                     metadata={
                         "uses_station_correction": False,
                         "uses_observations": False,
@@ -964,6 +963,14 @@ def _failed_astra_audit(deterministic: RuleAudit, error: str) -> RuleAudit:
     return deterministic.model_copy(
         update={"parser": "astra-error", "interpretation": interpretation}
     )
+
+
+def _floor_in_forecast_unit(observed_floor_c: Decimal | None, unit: str) -> Decimal | None:
+    if observed_floor_c is None or unit == "C":
+        return observed_floor_c
+    if unit == "F":
+        return observed_floor_c * Decimal(9) / Decimal(5) + Decimal(32)
+    raise ValueError(f"unsupported forecast unit {unit!r}")
 
 
 def _paper_idempotency_key(decision: MarketDecision) -> str:

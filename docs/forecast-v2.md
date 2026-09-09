@@ -93,3 +93,22 @@ side by side, and WeatherNext stays `access_pending` until an authorized
 A model is not promoted because of a single win or green tests. Promotion must
 use a frozen validation period and a preselected primary metric; uncertainty
 must make a random explanation implausible. Until then, v2 stays shadow-only.
+
+## Forecast diagnostics v1
+
+`polybot diagnostics --json` reconstructs settled paper positions from the
+immutable order, decision, market-snapshot, forecast and outcome tables. It
+reports separately:
+
+- the top forecast bracket at entry;
+- the bracket actually bought;
+- the official winning bracket;
+- forecast correctness versus trade-selection correctness;
+- entry price, probability, edge, EV and exact book hashes;
+- sensitivity of the archived signal to raw empirical members, the immutable
+  `sigma=1.5°C` kernel, a descriptive history-derived sigma proxy, and a
+  clamped intraday counterfactual.
+
+The history-derived sigma is deliberately marked insufficient until at least
+20 auditable outcomes and is never fed back into the running strategy. The
+diagnostic reader opens SQLite read-only and cannot rewrite paper history.
