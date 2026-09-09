@@ -65,7 +65,9 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt
 function latestCycle(d){ return [...(d.reports||[])].reverse().find(r=>r.kind==='CYCLE' && r.payload && r.payload.scan); }
 function renderMetrics(d){
   const p=d.portfolio||{}, scan=d.latest_scan||{};
-  const allowed=scan.geoblocked===0;
+  const cycle=latestCycle(d)?.payload?.scan||{}, cycleGeo=cycle.geoblock||{};
+  const allowed=cycleGeo.blocked===false || (cycleGeo.blocked==null && scan.geoblocked===0);
+  const networkLocation=[cycleGeo.country,cycleGeo.region].filter(Boolean).join(' / ');
   const status=allowed?'good':'warn';
   $('mode').textContent=d.active_window?.paper===false?'OBSERVE ONLY':'PAPER ONLY';
   $('mode').className='pill '+(d.active_window?.paper===false?'gray':'blue');
@@ -73,7 +75,7 @@ function renderMetrics(d){
     ['Open exposure',compactMoney(p.open_exposure_usd),'risk reserved','neutral'],
     ['Realized P&L',compactMoney(p.realized_pnl_usd),'settled paper only',Number(p.realized_pnl_usd||0)>=0?'good':'warn'],
     ['API spend',compactMoney(p.api_spend_usd),'persistent project budget','neutral'],
-    ['Network',allowed?'KZ / allowed':'blocked',allowed?'public API reachable':'new entries disabled',status]
+    ['Network',allowed?(networkLocation||'allowed'):'blocked',allowed?'public API reachable':'new entries disabled',status]
   ].map(x=>`<div class="card metric"><div class="eyebrow">${x[0]}</div><div class="value ${x[3]}">${x[1]}</div><div class="hint">${x[2]}</div></div>`).join('');
 }
 function renderWindow(d){
@@ -87,11 +89,12 @@ function renderWindow(d){
 function renderPositions(d){
   const rows=d.positions||[];
   if(!rows.length){$('positions').innerHTML='<div class="empty">No open paper positions.</div>';return}
-  $('positions').innerHTML=`<table class="positions"><thead><tr><th>Market</th><th>State</th><th>Entry</th><th>Exit mark</th><th>P&L</th></tr></thead><tbody>${rows.map(o=>{const pnl=o.estimated_full_exit_pnl_usd; const title=o.market_question||o.market_id; return `<tr><td><div class="market">${esc(title)} <span class="pill gray">${esc(o.outcome_label||o.outcome||'YES')}</span></div><div class="sub">market ${esc(o.market_id)} · ${o.shares} shares</div></td><td><span class="pill ${o.status==='PAPER_SETTLED'?'green':'blue'}">${esc(o.status)}</span><div class="sub">v${esc(o.strategy_version||'0')}</div></td><td class="num">${money(o.entry_price)}<div class="sub">cost ${money(o.notional_usd)}</div></td><td class="num">${o.current_bid_price==null?'—':money(o.current_bid_price)}<div class="sub">${o.immediately_sellable_shares||0}/${o.shares} sellable</div></td><td class="num ${pnl!=null?(Number(pnl)>=0?'positive':'negative'):''}">${pnl==null?'—':money(pnl)}<div class="sub">${o.full_exit_value_usd==null?'no full exit':'hypothetical'}</div></td></tr>`}).join('')}</tbody></table>`;
+  $('positions').innerHTML=`<table class="positions"><thead><tr><th>Market</th><th>State</th><th>Entry</th><th>Exit mark</th><th>P&L</th></tr></thead><tbody>${rows.map(o=>{const pnl=o.estimated_full_exit_pnl_usd; const title=o.market_question||o.market_id; return `<tr><td><div class="market">${esc(title)} <span class="pill gray">${esc(o.outcome_label||o.outcome||'YES')}</span></div><div class="sub">market ${esc(o.market_id)} · ${o.shares} shares</div></td><td><span class="pill ${o.status==='PAPER_SETTLED'?'green':'blue'}">${esc(o.status)}</span><div class="sub">${esc(o.strategy_version||'v0')}</div></td><td class="num">${money(o.entry_price)}<div class="sub">cost ${money(o.notional_usd)}</div></td><td class="num">${o.current_bid_price==null?'—':money(o.current_bid_price)}<div class="sub">${o.immediately_sellable_shares||0}/${o.shares} sellable</div></td><td class="num ${pnl!=null?(Number(pnl)>=0?'positive':'negative'):''}">${pnl==null?'—':money(pnl)}<div class="sub">${o.full_exit_value_usd==null?'no full exit':'hypothetical'}</div></td></tr>`}).join('')}</tbody></table>`;
 }
 function renderSources(d){
- const reports=d.reports||[], latest=[...reports].reverse().find(r=>r.payload?.weathernext), wn=(latest?.payload?.weathernext)||{state:'unknown',message:'No status'}; const scan=d.latest_scan||{};
- $('sources').innerHTML=`<div class="source"><div><div class="source-name">Polymarket API</div><div class="source-detail">${scan.geoblocked===0?'KZ endpoint accepted':'status from latest scan'}</div></div><div class="source-state pill ${scan.geoblocked===0?'green':'amber'}">${scan.geoblocked===0?'AVAILABLE':'CHECK'}</div></div>
+ const reports=d.reports||[], latest=[...reports].reverse().find(r=>r.payload?.weathernext), wn=(latest?.payload?.weathernext)||{state:'unknown',message:'No status'}; const scan=d.latest_scan||{}; const cycle=latestCycle(d)?.payload?.scan||{}, cycleGeo=cycle.geoblock||{}; const allowed=cycleGeo.blocked===false || (cycleGeo.blocked==null && scan.geoblocked===0);
+ const networkLocation=[cycleGeo.country,cycleGeo.region].filter(Boolean).join(' / ');
+ $('sources').innerHTML=`<div class="source"><div><div class="source-name">Polymarket API</div><div class="source-detail">${allowed?`${networkLocation||'API'} endpoint accepted`:'status from latest scan'}</div></div><div class="source-state pill ${allowed?'green':'amber'}">${allowed?'AVAILABLE':'CHECK'}</div></div>
  <div class="source"><div><div class="source-name">Station observations</div><div class="source-detail">NOAA WRH / Synoptic + AWC cross-check</div></div><div class="source-state pill green">ACTIVE</div></div>
  <div class="source"><div><div class="source-name">GPT-6 Astra</div><div class="source-detail">Rules only · cached · no wallet access</div></div><div class="source-state pill ${d.active_window?.astra?'green':'gray'}">${d.active_window?.astra?'ON':'OFF'}</div></div>
  <div class="source"><div><div class="source-name">WeatherNext 3</div><div class="source-detail">${esc(wn.message||'')}</div></div><div class="source-state pill ${wn.state==='snapshot_available'?'green':'amber'}">${esc(wn.state||'UNKNOWN')}</div></div>`;
