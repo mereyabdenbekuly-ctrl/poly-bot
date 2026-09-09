@@ -56,3 +56,46 @@ def plan_buy_fill(
         vwap=vwap,
         fully_fillable=remaining == 0,
     )
+
+
+def plan_sell_fill(
+    *,
+    bids: list[BookLevel],
+    shares: Decimal,
+    fee_rate: Decimal,
+    fee_exponent: Decimal,
+) -> FillPlan:
+    """Walk bids from best to worst and value an immediately executable sale."""
+
+    remaining = shares
+    fills: list[Fill] = []
+    # The official SDK returns bids ascending, so the best bid is last.
+    for level in reversed(bids):
+        if remaining <= 0:
+            break
+        take = min(remaining, level.size)
+        if take <= 0:
+            continue
+        notional = take * level.price
+        fee = platform_fee(
+            shares=take,
+            price=level.price,
+            rate=fee_rate,
+            exponent=fee_exponent,
+        )
+        fills.append(Fill(price=level.price, shares=take, notional=notional, fee=fee))
+        remaining -= take
+
+    filled = shares - remaining
+    total_notional = sum((fill.notional for fill in fills), Decimal(0))
+    total_fee = sum((fill.fee for fill in fills), Decimal(0))
+    vwap = total_notional / filled if filled > 0 else None
+    return FillPlan(
+        requested_shares=shares,
+        filled_shares=filled,
+        fills=fills,
+        total_notional=total_notional,
+        total_fee=total_fee,
+        vwap=vwap,
+        fully_fillable=remaining == 0,
+    )

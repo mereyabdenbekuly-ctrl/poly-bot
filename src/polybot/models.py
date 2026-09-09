@@ -97,6 +97,13 @@ class BookLevel(StrictModel):
     size: Decimal
 
 
+class OutcomeSide(StrEnum):
+    """Binary outcome represented by a Polymarket token."""
+
+    YES = "YES"
+    NO = "NO"
+
+
 class MarketSnapshot(StrictModel):
     event_id: str
     event_slug: str | None
@@ -106,7 +113,9 @@ class MarketSnapshot(StrictModel):
     market_question: str
     outcome_label: str
     asset_id: str
+    token_id: str | None = None
     condition_id: str | None
+    outcome: OutcomeSide = OutcomeSide.YES
     end_date: datetime | None
     accepting_orders: bool
     book_timestamp: datetime | None
@@ -143,6 +152,15 @@ class DecisionAction(StrEnum):
     PAPER_BUY = "PAPER_BUY"
 
 
+class PaperOrderStatus(StrEnum):
+    """Internal paper-position lifecycle; these are not Polymarket API values."""
+
+    OPEN = "OPEN"
+    AWAITING_RESULT = "AWAITING_RESULT"
+    RESOLVED = "RESOLVED"
+    PAPER_SETTLED = "PAPER_SETTLED"
+
+
 class MarketDecision(StrictModel):
     action: DecisionAction
     reason_codes: list[str]
@@ -150,6 +168,9 @@ class MarketDecision(StrictModel):
     event_id: str
     market_id: str
     asset_id: str
+    token_id: str | None = None
+    condition_id: str | None = None
+    outcome: OutcomeSide = OutcomeSide.YES
     probability: Decimal | None = None
     shares: Decimal | None = None
     executable_price: Decimal | None = None
@@ -160,8 +181,70 @@ class MarketDecision(StrictModel):
     execution_buffer_usd: Decimal = Decimal(0)
     max_loss_usd: Decimal | None = None
     expected_profit_usd: Decimal | None = None
+    fee_rate: Decimal = Decimal(0)
+    fee_exponent: Decimal = Decimal(0)
+    end_date: datetime | None = None
     book_hash: str
     created_at: datetime
+
+
+class PaperOrderTarget(StrictModel):
+    """Identity and accounting fields needed to maintain one paper position."""
+
+    id: int
+    event_id: str
+    market_id: str
+    condition_id: str | None
+    token_id: str
+    outcome: OutcomeSide
+    status: PaperOrderStatus
+    shares: Decimal
+    entry_cost_usd: Decimal
+    fee_rate: Decimal
+    fee_exponent: Decimal
+    end_date: datetime | None
+    identity_verified: bool
+
+
+class ResolutionCheck(StrictModel):
+    """Resolution evidence read for one exact condition/outcome token."""
+
+    market_id: str
+    condition_id: str
+    token_id: str
+    outcome: OutcomeSide
+    checked_at: datetime
+    accepting_orders: bool
+    closed: bool
+    end_date: datetime | None
+    resolution_status: str | None
+    resolution_source: str | None
+    resolved_by: str | None
+    confirmed: bool
+    won: bool | None
+    yes_price: Decimal | None
+    no_price: Decimal | None
+
+
+class PaperMark(StrictModel):
+    """Executable, same-token bid-side mark for a paper position."""
+
+    order_id: int
+    market_id: str
+    condition_id: str
+    token_id: str
+    outcome: OutcomeSide
+    captured_at: datetime
+    book_timestamp: datetime | None
+    book_hash: str
+    requested_shares: Decimal
+    current_bid_price: Decimal | None
+    current_bid_size: Decimal
+    immediately_sellable_shares: Decimal
+    current_bid_mark_usd: Decimal | None
+    full_exit_value_usd: Decimal | None
+    full_exit_fee_usd: Decimal | None
+    estimated_full_exit_pnl_usd: Decimal | None
 
 
 class ScanReport(StrictModel):

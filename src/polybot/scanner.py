@@ -109,15 +109,45 @@ class Scanner:
     def _settle_resolved_paper_orders(self, gateway: PolymarketGateway) -> tuple[int, list[str]]:
         settled = 0
         errors: list[str] = []
-        for market_id in self.storage.open_paper_market_ids():
+        for order in self.storage.active_paper_orders():
             try:
-                outcome = gateway.get_yes_resolution(market_id=market_id)
-                if outcome is None:
+                if order.status.value == "RESOLVED":
+                    self.storage.settle_resolved_paper_order(order.id)
+                    settled += 1
                     continue
-                self.storage.settle_paper_order(market_id, won=outcome)
-                settled += 1
+                if order.condition_id is None or not order.identity_verified:
+                    raise ValueError(
+                        f"paper order {order.id} has no verified condition/token identity"
+                    )
+                try:
+                    snapshot = gateway.get_snapshot_for_token(
+                        event_id=order.event_id,
+                        market_id=order.market_id,
+                        condition_id=order.condition_id,
+                        token_id=order.token_id,
+                        outcome=order.outcome,
+                    )
+                    self.storage.record_paper_mark(order, snapshot)
+                except Exception as error:
+                    errors.append(f"paper mark {order.market_id} failed: {error}")
+
+                check = gateway.get_resolution(
+                    market_id=order.market_id,
+                    condition_id=order.condition_id,
+                    token_id=order.token_id,
+                    outcome=order.outcome,
+                )
+                self.storage.record_resolution_check(order.id, check)
+                if check.confirmed:
+                    self.storage.resolve_paper_order(order.id, check)
+                    self.storage.settle_resolved_paper_order(order.id)
+                    settled += 1
+                else:
+                    # endDate/closed/empty book only moves the position to an
+                    # accounting wait state; it never books payout by itself.
+                    self.storage.mark_awaiting_result(order.id, check)
             except Exception as error:
-                errors.append(f"paper settlement {market_id} failed: {error}")
+                errors.append(f"paper settlement {order.market_id} failed: {error}")
         return settled, errors
 
     def _scan_event(

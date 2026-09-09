@@ -3,7 +3,14 @@ from decimal import Decimal
 
 import pytest
 
-from polybot.models import DecisionAction, MarketDecision, RuleAudit, RuleInterpretation
+from polybot.models import (
+    DecisionAction,
+    MarketDecision,
+    OutcomeSide,
+    ResolutionCheck,
+    RuleAudit,
+    RuleInterpretation,
+)
 from polybot.storage import BudgetExceededError, PaperRiskRejectedError, Storage
 
 
@@ -14,6 +21,8 @@ def decision(*, event_id: str = "event-1", market_id: str = "market-1") -> Marke
         event_id=event_id,
         market_id=market_id,
         asset_id=f"asset-{market_id}",
+        token_id=f"asset-{market_id}",
+        condition_id=f"condition-{market_id}",
         probability=Decimal("0.7"),
         shares=Decimal("5"),
         executable_price=Decimal("0.3"),
@@ -72,6 +81,72 @@ def test_only_one_open_paper_order_per_event(tmp_path) -> None:
     pnl = storage.settle_paper_order("market-1", won=False)
     assert pnl == -Decimal("1.5725")
     assert storage.open_paper_market_ids() == []
+
+
+def test_end_date_only_moves_order_to_awaiting_result(tmp_path) -> None:
+    storage = Storage(tmp_path / "test.sqlite3")
+    order_id = storage.open_paper_order(
+        decision(),
+        idempotency_key="first",
+        max_event_risk=Decimal("2"),
+        max_total_risk=Decimal("6"),
+    )
+    check = ResolutionCheck(
+        market_id="market-1",
+        condition_id="condition-market-1",
+        token_id="asset-market-1",
+        outcome=OutcomeSide.YES,
+        checked_at=datetime.now(UTC),
+        accepting_orders=False,
+        closed=True,
+        end_date=datetime.now(UTC),
+        resolution_status=None,
+        resolution_source="source",
+        resolved_by=None,
+        confirmed=False,
+        won=None,
+        yes_price=Decimal("0.9"),
+        no_price=Decimal("0.1"),
+    )
+
+    storage.record_resolution_check(order_id, check)
+    assert storage.mark_awaiting_result(order_id, check)
+    target = storage.active_paper_orders()[0]
+    assert target.status.value == "AWAITING_RESULT"
+    assert storage.portfolio_summary()["realized_pnl_usd"] == Decimal(0)
+
+
+def test_confirmed_identity_matched_result_uses_full_lifecycle(tmp_path) -> None:
+    storage = Storage(tmp_path / "test.sqlite3")
+    order_id = storage.open_paper_order(
+        decision(),
+        idempotency_key="first",
+        max_event_risk=Decimal("2"),
+        max_total_risk=Decimal("6"),
+    )
+    check = ResolutionCheck(
+        market_id="market-1",
+        condition_id="condition-market-1",
+        token_id="asset-market-1",
+        outcome=OutcomeSide.YES,
+        checked_at=datetime.now(UTC),
+        accepting_orders=False,
+        closed=True,
+        end_date=datetime.now(UTC),
+        resolution_status="resolved",
+        resolution_source="source",
+        resolved_by="resolver",
+        confirmed=True,
+        won=True,
+        yes_price=Decimal(1),
+        no_price=Decimal(0),
+    )
+    storage.record_resolution_check(order_id, check)
+    assert storage.resolve_paper_order(order_id, check)
+    assert storage.active_paper_orders()[0].status.value == "RESOLVED"
+    assert storage.settle_resolved_paper_order(order_id) == Decimal("3.4275")
+    summary = storage.portfolio_summary()
+    assert summary["orders_by_status"] == {"PAPER_SETTLED": 1}
 
 
 def test_cached_astra_audit_has_zero_marginal_cost(tmp_path) -> None:

@@ -10,7 +10,17 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from polybot.models import MarketDecision, MarketSnapshot, RuleAudit, WeatherForecast
+from polybot.models import (
+    MarketDecision,
+    MarketSnapshot,
+    OutcomeSide,
+    PaperMark,
+    PaperOrderStatus,
+    PaperOrderTarget,
+    ResolutionCheck,
+    RuleAudit,
+    WeatherForecast,
+)
 
 
 def utc_now() -> datetime:
@@ -125,6 +135,9 @@ class Storage:
                     market_id TEXT NOT NULL,
                     asset_id TEXT NOT NULL,
                     status TEXT NOT NULL,
+                    condition_id TEXT,
+                    token_id TEXT,
+                    outcome TEXT NOT NULL DEFAULT 'YES',
                     shares TEXT NOT NULL,
                     entry_price TEXT NOT NULL,
                     notional_usd TEXT NOT NULL,
@@ -133,18 +146,155 @@ class Storage:
                     execution_buffer_usd TEXT NOT NULL,
                     max_loss_usd TEXT NOT NULL,
                     expected_profit_usd TEXT,
+                    fee_rate TEXT NOT NULL DEFAULT '0',
+                    fee_exponent TEXT NOT NULL DEFAULT '0',
+                    end_date TEXT,
+                    identity_verified INTEGER NOT NULL DEFAULT 0,
                     opened_at TEXT NOT NULL,
+                    awaiting_result_at TEXT,
+                    resolved_at TEXT,
+                    resolution_checked_at TEXT,
+                    resolution_status TEXT,
+                    resolution_source TEXT,
+                    resolved_by TEXT,
+                    resolution_json TEXT,
+                    settled_at TEXT,
                     closed_at TEXT,
                     won INTEGER,
                     realized_pnl_usd TEXT
                 );
 
-                CREATE UNIQUE INDEX IF NOT EXISTS paper_one_open_order_per_event
-                    ON paper_orders(event_id) WHERE status = 'open';
+                CREATE TABLE IF NOT EXISTS paper_order_transitions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paper_order_id INTEGER NOT NULL REFERENCES paper_orders(id),
+                    from_status TEXT,
+                    to_status TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS paper_resolution_checks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paper_order_id INTEGER NOT NULL REFERENCES paper_orders(id),
+                    checked_at TEXT NOT NULL,
+                    confirmed INTEGER NOT NULL,
+                    won INTEGER,
+                    payload_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS paper_marks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paper_order_id INTEGER NOT NULL REFERENCES paper_orders(id),
+                    captured_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS decisions_run_idx ON decisions(run_id);
                 CREATE INDEX IF NOT EXISTS snapshots_run_idx ON market_snapshots(run_id);
+                CREATE INDEX IF NOT EXISTS paper_transitions_order_idx
+                    ON paper_order_transitions(paper_order_id, id);
+                CREATE INDEX IF NOT EXISTS paper_resolution_order_idx
+                    ON paper_resolution_checks(paper_order_id, id);
+                CREATE INDEX IF NOT EXISTS paper_marks_order_idx
+                    ON paper_marks(paper_order_id, id);
                 """
             )
+            self._migrate_paper_orders(connection)
+
+    def _migrate_paper_orders(self, connection: sqlite3.Connection) -> None:
+        """Migrate databases created by pre-lifecycle releases in place.
+
+        The old schema used lowercase ``open``/``closed`` and only stored an
+        ``asset_id``.  Existing rows are retained as historical v0 records;
+        token_id is backfilled from asset_id and status is mapped to the new
+        lifecycle without inventing a resolution result.
+        """
+
+        columns = {
+            str(row[1]) for row in connection.execute("PRAGMA table_info(paper_orders)").fetchall()
+        }
+        additions: dict[str, str] = {
+            "condition_id": "TEXT",
+            "token_id": "TEXT",
+            "outcome": "TEXT NOT NULL DEFAULT 'YES'",
+            "fee_rate": "TEXT NOT NULL DEFAULT '0'",
+            "fee_exponent": "TEXT NOT NULL DEFAULT '0'",
+            "end_date": "TEXT",
+            "identity_verified": "INTEGER NOT NULL DEFAULT 0",
+            "awaiting_result_at": "TEXT",
+            "resolved_at": "TEXT",
+            "resolution_checked_at": "TEXT",
+            "resolution_status": "TEXT",
+            "resolution_source": "TEXT",
+            "resolved_by": "TEXT",
+            "resolution_json": "TEXT",
+            "settled_at": "TEXT",
+        }
+        for name, declaration in additions.items():
+            if name not in columns:
+                connection.execute(f"ALTER TABLE paper_orders ADD COLUMN {name} {declaration}")
+
+        # The historical index was bound to lowercase ``open``. Rebuild it
+        # after normalizing statuses, preserving the one-position-per-event
+        # invariant for all active lifecycle states.
+        connection.execute("DROP INDEX IF EXISTS paper_one_open_order_per_event")
+        connection.execute("UPDATE paper_orders SET status = 'OPEN' WHERE lower(status) = 'open'")
+        connection.execute(
+            "UPDATE paper_orders SET status = 'PAPER_SETTLED', "
+            "settled_at = COALESCE(settled_at, closed_at) "
+            "WHERE lower(status) IN ('closed', 'settled', 'paper_settled')"
+        )
+        connection.execute(
+            "UPDATE paper_orders SET token_id = asset_id WHERE token_id IS NULL OR token_id = ''"
+        )
+        # Try to recover exact condition/token identity from the immutable
+        # market snapshot captured at entry. Never guess a condition id.
+        rows = connection.execute(
+            "SELECT id, market_id, opened_at FROM paper_orders "
+            "WHERE condition_id IS NULL OR identity_verified = 0"
+        ).fetchall()
+        for row in rows:
+            snapshot = connection.execute(
+                "SELECT payload_json FROM market_snapshots WHERE market_id = ? "
+                "ORDER BY captured_at ASC, id ASC LIMIT 1",
+                (row["market_id"],),
+            ).fetchone()
+            if snapshot is None:
+                continue
+            try:
+                payload = json.loads(snapshot["payload_json"])
+            except (TypeError, ValueError):
+                continue
+            condition_id = payload.get("condition_id")
+            token_id = payload.get("token_id") or payload.get("asset_id")
+            outcome = str(payload.get("outcome") or "YES").upper()
+            end_date = payload.get("end_date")
+            if outcome not in {"YES", "NO"}:
+                outcome = "YES"
+            connection.execute(
+                "UPDATE paper_orders SET condition_id = COALESCE(condition_id, ?), "
+                "token_id = COALESCE(token_id, ?), outcome = ?, end_date = COALESCE(end_date, ?), "
+                "fee_rate = COALESCE(NULLIF(fee_rate, '0'), ?), "
+                "fee_exponent = COALESCE(NULLIF(fee_exponent, '0'), ?), "
+                "identity_verified = CASE WHEN ? IS NOT NULL AND ? IS NOT NULL "
+                "THEN 1 ELSE identity_verified END "
+                "WHERE id = ?",
+                (
+                    condition_id,
+                    token_id,
+                    outcome,
+                    end_date,
+                    str(payload.get("fee_rate", "0")),
+                    str(payload.get("fee_exponent", "0")),
+                    condition_id,
+                    token_id,
+                    row["id"],
+                ),
+            )
+        connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS paper_one_active_order_per_event "
+            "ON paper_orders(event_id) WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED')"
+        )
 
     def start_scan(self, *, query: str, mode: str) -> int:
         with self.connect() as connection:
@@ -369,6 +519,8 @@ class Storage:
             "notional": decision.notional_usd,
             "fee": decision.fee_usd,
             "max_loss": decision.max_loss_usd,
+            "condition_id": decision.condition_id,
+            "token_id": decision.token_id or decision.asset_id,
         }
         missing = [key for key, value in required.items() if value is None]
         if missing:
@@ -385,14 +537,15 @@ class Storage:
             event_row = connection.execute(
                 """
                 SELECT COALESCE(SUM(CAST(max_loss_usd AS REAL)), 0) AS exposure
-                FROM paper_orders WHERE status = 'open' AND event_id = ?
+                FROM paper_orders
+                WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED') AND event_id = ?
                 """,
                 (decision.event_id,),
             ).fetchone()
             total_row = connection.execute(
                 """
                 SELECT COALESCE(SUM(CAST(max_loss_usd AS REAL)), 0) AS exposure
-                FROM paper_orders WHERE status = 'open'
+                FROM paper_orders WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED')
                 """
             ).fetchone()
             event_exposure = Decimal(str(event_row["exposure"]))
@@ -412,16 +565,21 @@ class Storage:
                 cursor = connection.execute(
                     """
                     INSERT INTO paper_orders(
-                        idempotency_key, event_id, market_id, asset_id, status, shares,
+                        idempotency_key, event_id, market_id, asset_id, condition_id,
+                        token_id, outcome, status, shares,
                         entry_price, notional_usd, fee_usd, api_cost_usd,
-                        execution_buffer_usd, max_loss_usd, expected_profit_usd, opened_at
-                    ) VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        execution_buffer_usd, max_loss_usd, expected_profit_usd,
+                        fee_rate, fee_exponent, end_date, identity_verified, opened_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
                     """,
                     (
                         idempotency_key,
                         decision.event_id,
                         decision.market_id,
                         decision.asset_id,
+                        decision.condition_id,
+                        decision.token_id or decision.asset_id,
+                        decision.outcome.value,
                         str(decision.shares),
                         str(decision.executable_price),
                         str(decision.notional_usd),
@@ -432,6 +590,9 @@ class Storage:
                         None
                         if decision.expected_profit_usd is None
                         else str(decision.expected_profit_usd),
+                        str(decision.fee_rate),
+                        str(decision.fee_exponent),
+                        None if decision.end_date is None else decision.end_date.isoformat(),
                         decision.created_at.isoformat(),
                     ),
                 )
@@ -441,45 +602,261 @@ class Storage:
                 ) from error
             return _lastrowid(cursor)
 
-    def settle_paper_order(self, market_id: str, *, won: bool) -> Decimal:
+    def active_paper_orders(self) -> list[PaperOrderTarget]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM paper_orders "
+                "WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED') ORDER BY id"
+            ).fetchall()
+        return [
+            PaperOrderTarget(
+                id=int(row["id"]),
+                event_id=str(row["event_id"]),
+                market_id=str(row["market_id"]),
+                condition_id=row["condition_id"],
+                token_id=str(row["token_id"] or row["asset_id"]),
+                outcome=OutcomeSide(str(row["outcome"] or "YES").upper()),
+                status=PaperOrderStatus(str(row["status"]).upper()),
+                shares=Decimal(row["shares"]),
+                entry_cost_usd=sum(
+                    (
+                        Decimal(row[name])
+                        for name in (
+                            "notional_usd",
+                            "fee_usd",
+                            "api_cost_usd",
+                            "execution_buffer_usd",
+                        )
+                    ),
+                    Decimal(0),
+                ),
+                fee_rate=Decimal(row["fee_rate"] or "0"),
+                fee_exponent=Decimal(row["fee_exponent"] or "0"),
+                end_date=(
+                    None if row["end_date"] is None else datetime.fromisoformat(row["end_date"])
+                ),
+                identity_verified=bool(row["identity_verified"]),
+            )
+            for row in rows
+        ]
+
+    def record_resolution_check(self, order_id: int, check: ResolutionCheck) -> None:
+        with self.transaction(immediate=True) as connection:
+            row = self._verified_order_row(connection, order_id, check)
+            connection.execute(
+                "INSERT INTO paper_resolution_checks("
+                "paper_order_id, checked_at, confirmed, won, payload_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    order_id,
+                    check.checked_at.isoformat(),
+                    int(check.confirmed),
+                    None if check.won is None else int(check.won),
+                    check.model_dump_json(),
+                ),
+            )
+            connection.execute(
+                "UPDATE paper_orders SET resolution_checked_at = ?, resolution_status = ?, "
+                "resolution_source = ?, resolved_by = ?, resolution_json = ? WHERE id = ?",
+                (
+                    check.checked_at.isoformat(),
+                    check.resolution_status,
+                    check.resolution_source,
+                    check.resolved_by,
+                    check.model_dump_json(),
+                    row["id"],
+                ),
+            )
+
+    def mark_awaiting_result(self, order_id: int, check: ResolutionCheck) -> bool:
+        if check.confirmed:
+            raise ValueError("confirmed results must transition through RESOLVED")
+        ended = (
+            check.closed
+            or not check.accepting_orders
+            or (check.end_date is not None and check.end_date <= check.checked_at)
+        )
+        if not ended:
+            return False
+        with self.transaction(immediate=True) as connection:
+            row = self._verified_order_row(connection, order_id, check)
+            if row["status"] != PaperOrderStatus.OPEN.value:
+                return False
+            self._transition(
+                connection,
+                order_id=order_id,
+                from_status=PaperOrderStatus.OPEN,
+                to_status=PaperOrderStatus.AWAITING_RESULT,
+                reason="market ended or stopped accepting orders; official result not confirmed",
+            )
+            connection.execute(
+                "UPDATE paper_orders SET awaiting_result_at = ? WHERE id = ?",
+                (check.checked_at.isoformat(), order_id),
+            )
+        return True
+
+    def resolve_paper_order(self, order_id: int, check: ResolutionCheck) -> bool:
+        if not check.confirmed or check.won is None:
+            raise ValueError("paper order cannot resolve without a confirmed binary result")
+        with self.transaction(immediate=True) as connection:
+            row = self._verified_order_row(connection, order_id, check)
+            current = PaperOrderStatus(row["status"])
+            if current == PaperOrderStatus.RESOLVED:
+                return False
+            if current not in {PaperOrderStatus.OPEN, PaperOrderStatus.AWAITING_RESULT}:
+                raise ValueError(f"paper order {order_id} cannot resolve from {current}")
+            self._transition(
+                connection,
+                order_id=order_id,
+                from_status=current,
+                to_status=PaperOrderStatus.RESOLVED,
+                reason=f"confirmed {check.outcome} result for condition {check.condition_id}",
+            )
+            connection.execute(
+                "UPDATE paper_orders SET resolved_at = ?, won = ?, resolution_checked_at = ?, "
+                "resolution_status = ?, resolution_source = ?, resolved_by = ?, "
+                "resolution_json = ? "
+                "WHERE id = ?",
+                (
+                    check.checked_at.isoformat(),
+                    int(check.won),
+                    check.checked_at.isoformat(),
+                    check.resolution_status,
+                    check.resolution_source,
+                    check.resolved_by,
+                    check.model_dump_json(),
+                    order_id,
+                ),
+            )
+        return True
+
+    def settle_resolved_paper_order(self, order_id: int) -> Decimal:
         with self.transaction(immediate=True) as connection:
             row = connection.execute(
-                """
-                SELECT * FROM paper_orders
-                WHERE market_id = ? AND status = 'open'
-                ORDER BY id DESC LIMIT 1
-                """,
-                (market_id,),
+                "SELECT * FROM paper_orders WHERE id = ? AND status = 'RESOLVED'",
+                (order_id,),
             ).fetchone()
             if row is None:
-                raise ValueError(f"No open paper order for market {market_id}")
-            payout = Decimal(row["shares"]) if won else Decimal(0)
+                raise ValueError(f"No RESOLVED paper order {order_id}")
+            if row["won"] is None or row["resolution_json"] is None:
+                raise ValueError(f"Paper order {order_id} lacks confirmed resolution evidence")
+            payout = Decimal(row["shares"]) if bool(row["won"]) else Decimal(0)
             costs = sum(
-                Decimal(row[name])
-                for name in (
-                    "notional_usd",
-                    "fee_usd",
-                    "api_cost_usd",
-                    "execution_buffer_usd",
-                )
+                (
+                    Decimal(row[name])
+                    for name in (
+                        "notional_usd",
+                        "fee_usd",
+                        "api_cost_usd",
+                        "execution_buffer_usd",
+                    )
+                ),
+                Decimal(0),
             )
             pnl = payout - costs
+            now = utc_now()
+            self._transition(
+                connection,
+                order_id=order_id,
+                from_status=PaperOrderStatus.RESOLVED,
+                to_status=PaperOrderStatus.PAPER_SETTLED,
+                reason="paper payout booked from confirmed resolution",
+            )
             connection.execute(
                 """
                 UPDATE paper_orders
-                SET status = 'closed', closed_at = ?, won = ?, realized_pnl_usd = ?
+                SET settled_at = ?, closed_at = ?, realized_pnl_usd = ?
                 WHERE id = ?
                 """,
-                (utc_now().isoformat(), int(won), str(pnl), row["id"]),
+                (now.isoformat(), now.isoformat(), str(pnl), row["id"]),
             )
         return pnl
 
-    def open_paper_market_ids(self) -> list[str]:
+    def record_paper_mark(self, order: PaperOrderTarget, snapshot: MarketSnapshot) -> PaperMark:
+        token_id = snapshot.token_id or snapshot.asset_id
+        if order.condition_id is None or not order.identity_verified:
+            raise ValueError(f"paper order {order.id} has unverified identity")
+        if (
+            snapshot.market_id != order.market_id
+            or snapshot.condition_id != order.condition_id
+            or token_id != order.token_id
+            or snapshot.outcome != order.outcome
+        ):
+            raise ValueError(f"paper mark identity mismatch for order {order.id}")
+
+        from polybot.fees import plan_sell_fill
+
+        plan = plan_sell_fill(
+            bids=snapshot.bids,
+            shares=order.shares,
+            fee_rate=order.fee_rate,
+            fee_exponent=order.fee_exponent,
+        )
+        best = max(snapshot.bids, key=lambda level: level.price) if snapshot.bids else None
+        mark = PaperMark(
+            order_id=order.id,
+            market_id=order.market_id,
+            condition_id=order.condition_id,
+            token_id=order.token_id,
+            outcome=order.outcome,
+            captured_at=utc_now(),
+            book_timestamp=snapshot.book_timestamp,
+            book_hash=snapshot.book_hash,
+            requested_shares=order.shares,
+            current_bid_price=None if best is None else best.price,
+            current_bid_size=Decimal(0) if best is None else best.size,
+            immediately_sellable_shares=plan.filled_shares,
+            current_bid_mark_usd=(None if best is None else order.shares * best.price),
+            full_exit_value_usd=(
+                plan.total_notional - plan.total_fee if plan.fully_fillable else None
+            ),
+            full_exit_fee_usd=plan.total_fee if plan.fully_fillable else None,
+            estimated_full_exit_pnl_usd=(
+                plan.total_notional - plan.total_fee - order.entry_cost_usd
+                if plan.fully_fillable
+                else None
+            ),
+        )
         with self.connect() as connection:
-            rows = connection.execute(
-                "SELECT market_id FROM paper_orders WHERE status = 'open' ORDER BY id"
-            ).fetchall()
-        return [str(row["market_id"]) for row in rows]
+            connection.execute(
+                "INSERT INTO paper_marks(paper_order_id, captured_at, payload_json) "
+                "VALUES (?, ?, ?)",
+                (order.id, mark.captured_at.isoformat(), mark.model_dump_json()),
+            )
+        return mark
+
+    def settle_paper_order(self, market_id: str, *, won: bool) -> Decimal:
+        """Manually resolve and settle a paper order with explicit operator evidence."""
+
+        orders = [order for order in self.active_paper_orders() if order.market_id == market_id]
+        if not orders:
+            raise ValueError(f"No active paper order for market {market_id}")
+        order = orders[-1]
+        if order.condition_id is None or not order.identity_verified:
+            raise ValueError(f"Paper order {order.id} has unverified condition/token identity")
+        check = ResolutionCheck(
+            market_id=order.market_id,
+            condition_id=order.condition_id,
+            token_id=order.token_id,
+            outcome=order.outcome,
+            checked_at=utc_now(),
+            accepting_orders=False,
+            closed=True,
+            end_date=order.end_date,
+            resolution_status="manual",
+            resolution_source="manual CLI assertion",
+            resolved_by="operator",
+            confirmed=True,
+            won=won,
+            yes_price=Decimal(1) if won == (order.outcome == OutcomeSide.YES) else Decimal(0),
+            no_price=Decimal(0) if won == (order.outcome == OutcomeSide.YES) else Decimal(1),
+        )
+        self.record_resolution_check(order.id, check)
+        self.resolve_paper_order(order.id, check)
+        return self.settle_resolved_paper_order(order.id)
+
+    def open_paper_market_ids(self) -> list[str]:
+        return [order.market_id for order in self.active_paper_orders()]
 
     def portfolio_summary(self) -> dict[str, Any]:
         with self.connect() as connection:
@@ -487,14 +864,14 @@ class Storage:
                 """
                 SELECT COUNT(*) AS count,
                        COALESCE(SUM(CAST(max_loss_usd AS REAL)), 0) AS exposure
-                FROM paper_orders WHERE status = 'open'
+                FROM paper_orders WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED')
                 """
             ).fetchone()
             closed_row = connection.execute(
                 """
                 SELECT COUNT(*) AS count,
                        COALESCE(SUM(CAST(realized_pnl_usd AS REAL)), 0) AS pnl
-                FROM paper_orders WHERE status = 'closed'
+                FROM paper_orders WHERE status = 'PAPER_SETTLED'
                 """
             ).fetchone()
             last_scan = connection.execute(
@@ -502,6 +879,15 @@ class Storage:
             ).fetchone()
             recent_orders = connection.execute(
                 "SELECT * FROM paper_orders ORDER BY id DESC LIMIT 20"
+            ).fetchall()
+            status_rows = connection.execute(
+                "SELECT status, COUNT(*) AS count FROM paper_orders GROUP BY status"
+            ).fetchall()
+            latest_marks = connection.execute(
+                "SELECT p.paper_order_id, p.payload_json FROM paper_marks p "
+                "JOIN (SELECT paper_order_id, MAX(id) AS id FROM paper_marks "
+                "GROUP BY paper_order_id) latest "
+                "ON latest.id = p.id ORDER BY p.paper_order_id"
             ).fetchall()
         settled, reserved = self.api_spend()
         return {
@@ -513,6 +899,8 @@ class Storage:
             "api_reserved_usd": reserved,
             "last_scan": None if last_scan is None else dict(last_scan),
             "recent_orders": [dict(row) for row in recent_orders],
+            "orders_by_status": {str(row["status"]): int(row["count"]) for row in status_rows},
+            "latest_marks": [json.loads(row["payload_json"]) for row in latest_marks],
         }
 
     def realized_pnl_for_day(self, day: date) -> Decimal:
@@ -522,11 +910,61 @@ class Storage:
                 """
                 SELECT COALESCE(SUM(CAST(realized_pnl_usd AS REAL)), 0) AS pnl
                 FROM paper_orders
-                WHERE status = 'closed' AND substr(closed_at, 1, 10) = ?
+                WHERE status = 'PAPER_SETTLED' AND substr(settled_at, 1, 10) = ?
                 """,
                 (prefix,),
             ).fetchone()
         return Decimal(str(row["pnl"]))
+
+    @staticmethod
+    def _verified_order_row(
+        connection: sqlite3.Connection, order_id: int, check: ResolutionCheck
+    ) -> sqlite3.Row:
+        row = connection.execute("SELECT * FROM paper_orders WHERE id = ?", (order_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"Unknown paper order {order_id}")
+        expected = (
+            str(row["market_id"]),
+            row["condition_id"],
+            str(row["token_id"] or row["asset_id"]),
+            str(row["outcome"] or "YES").upper(),
+        )
+        actual = (
+            check.market_id,
+            check.condition_id,
+            check.token_id,
+            check.outcome.value,
+        )
+        if not bool(row["identity_verified"]) or expected != actual:
+            raise ValueError(
+                f"paper order {order_id} condition/token identity mismatch: "
+                f"stored={expected}, checked={actual}"
+            )
+        return row
+
+    @staticmethod
+    def _transition(
+        connection: sqlite3.Connection,
+        *,
+        order_id: int,
+        from_status: PaperOrderStatus,
+        to_status: PaperOrderStatus,
+        reason: str,
+    ) -> None:
+        cursor = connection.execute(
+            "UPDATE paper_orders SET status = ? WHERE id = ? AND status = ?",
+            (to_status.value, order_id, from_status.value),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError(
+                f"paper order {order_id} did not transition from {from_status} to {to_status}"
+            )
+        connection.execute(
+            "INSERT INTO paper_order_transitions("
+            "paper_order_id, from_status, to_status, reason, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (order_id, from_status.value, to_status.value, reason, utc_now().isoformat()),
+        )
 
 
 def _lastrowid(cursor: sqlite3.Cursor) -> int:

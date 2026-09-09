@@ -12,6 +12,8 @@ from polybot.models import (
     EventDefinition,
     MarketDefinition,
     MarketSnapshot,
+    OutcomeSide,
+    ResolutionCheck,
 )
 
 
@@ -76,7 +78,9 @@ class PolymarketGateway:
             market_question=market.question,
             outcome_label=market.group_item_title,
             asset_id=market.asset_id,
+            token_id=market.asset_id,
             condition_id=market.condition_id,
+            outcome=OutcomeSide.YES,
             end_date=market.end_date,
             accepting_orders=market.accepting_orders,
             book_timestamp=book.timestamp,
@@ -90,19 +94,122 @@ class PolymarketGateway:
             fee_taker_only=market.fee_taker_only,
         )
 
-    def get_yes_resolution(self, *, market_id: str) -> bool | None:
-        """Return a finalized YES result, or ``None`` while unresolved."""
+    def get_resolution(
+        self,
+        *,
+        market_id: str,
+        condition_id: str,
+        token_id: str,
+        outcome: OutcomeSide,
+    ) -> ResolutionCheck:
+        """Return resolution evidence after verifying exact condition/token identity."""
 
         market = self._client.get_market(id=market_id)
-        if not market.state.closed:
-            return None
+        actual_condition_id = None if market.condition_id is None else str(market.condition_id)
+        if actual_condition_id != condition_id:
+            raise ValueError(
+                f"condition identity mismatch for market {market_id}: "
+                f"stored={condition_id}, api={actual_condition_id}"
+            )
+        market_outcome = market.outcomes.yes if outcome == OutcomeSide.YES else market.outcomes.no
+        actual_token_id = None if market_outcome.token_id is None else str(market_outcome.token_id)
+        if actual_token_id != token_id:
+            raise ValueError(
+                f"token identity mismatch for market {market_id} {outcome}: "
+                f"stored={token_id}, api={actual_token_id}"
+            )
+
         yes = market.outcomes.yes.price
         no = market.outcomes.no.price
-        if yes == Decimal(1) and no == Decimal(0):
-            return True
-        if yes == Decimal(0) and no == Decimal(1):
-            return False
-        return None
+        resolution_status = market.resolution.uma_resolution_status
+        status_value = None if resolution_status is None else str(resolution_status.value)
+        # ``closed`` alone can mean merely closed. A binary payout plus an
+        # explicit final UMA state is required before paper accounting resolves.
+        binary_payout = (yes == Decimal(1) and no == Decimal(0)) or (
+            yes == Decimal(0) and no == Decimal(1)
+        )
+        confirmed = bool(
+            market.state.closed
+            and status_value in {"resolved", "settled"}
+            and market.resolution.resolved_by is not None
+            and binary_payout
+        )
+        yes_won = bool(yes == Decimal(1) and no == Decimal(0))
+        won = (yes_won if outcome == OutcomeSide.YES else not yes_won) if confirmed else None
+        return ResolutionCheck(
+            market_id=str(market.id),
+            condition_id=condition_id,
+            token_id=token_id,
+            outcome=outcome,
+            checked_at=datetime.now(UTC),
+            accepting_orders=bool(market.state.accepting_orders),
+            closed=bool(market.state.closed),
+            end_date=market.state.end_date,
+            resolution_status=status_value,
+            resolution_source=market.resolution.source,
+            resolved_by=(
+                None
+                if market.resolution.resolved_by is None
+                else str(market.resolution.resolved_by)
+            ),
+            confirmed=confirmed,
+            won=won,
+            yes_price=yes,
+            no_price=no,
+        )
+
+    def get_snapshot_for_token(
+        self,
+        *,
+        event_id: str,
+        market_id: str,
+        condition_id: str,
+        token_id: str,
+        outcome: OutcomeSide,
+    ) -> MarketSnapshot:
+        """Fetch an order book only after the stored condition/token pair is verified."""
+
+        market = self._client.get_market(id=market_id)
+        actual_condition_id = None if market.condition_id is None else str(market.condition_id)
+        if actual_condition_id != condition_id:
+            raise ValueError(
+                f"condition identity mismatch for market {market_id}: "
+                f"stored={condition_id}, api={actual_condition_id}"
+            )
+        market_outcome = market.outcomes.yes if outcome == OutcomeSide.YES else market.outcomes.no
+        actual_token_id = None if market_outcome.token_id is None else str(market_outcome.token_id)
+        if actual_token_id != token_id:
+            raise ValueError(
+                f"token identity mismatch for market {market_id} {outcome}: "
+                f"stored={token_id}, api={actual_token_id}"
+            )
+        book = self._client.get_order_book(asset_id=token_id)
+        schedule = market.trading.fee_schedule
+        event = market.events[0] if market.events else None
+        return MarketSnapshot(
+            event_id=event_id,
+            event_slug=None if event is None else event.slug,
+            event_title=(market.question or market.group_item_title or market_id),
+            market_id=market_id,
+            market_slug=market.slug,
+            market_question=market.question or market.group_item_title or market_id,
+            outcome_label=market_outcome.label,
+            asset_id=token_id,
+            token_id=token_id,
+            condition_id=condition_id,
+            outcome=outcome,
+            end_date=market.state.end_date,
+            accepting_orders=bool(market.state.accepting_orders),
+            book_timestamp=book.timestamp,
+            book_hash=book.hash,
+            bids=[BookLevel(price=level.price, size=level.size) for level in book.bids],
+            asks=[BookLevel(price=level.price, size=level.size) for level in book.asks],
+            min_order_size=book.min_order_size,
+            tick_size=book.tick_size,
+            fee_rate=Decimal(0) if schedule is None else schedule.rate,
+            fee_exponent=(Decimal(0) if schedule is None else Decimal(str(schedule.exponent))),
+            fee_taker_only=False if schedule is None else schedule.taker_only,
+        )
 
     @staticmethod
     def _normalize_event(event: Event) -> EventDefinition:
