@@ -1435,7 +1435,8 @@ class Storage:
                 "WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED')"
             ).fetchall()
             closed_rows = connection.execute(
-                "SELECT realized_pnl_usd FROM paper_orders WHERE status = 'PAPER_SETTLED'"
+                "SELECT realized_pnl_usd, api_cost_usd "
+                "FROM paper_orders WHERE status = 'PAPER_SETTLED'"
             ).fetchall()
             last_scan = connection.execute(
                 "SELECT * FROM scan_runs ORDER BY id DESC LIMIT 1"
@@ -1462,14 +1463,28 @@ class Storage:
             ),
             Decimal(0),
         )
+        allocated_settled_api = sum(
+            (
+                Decimal(row["api_cost_usd"] or "0")
+                for row in closed_rows
+                if row["api_cost_usd"] is not None
+            ),
+            Decimal(0),
+        )
+        gross_trade_pnl = realized_pnl + allocated_settled_api
         return {
             "open_orders": len(open_rows),
             "open_exposure_usd": open_exposure,
             "closed_orders": len(closed_rows),
             "realized_pnl_usd": realized_pnl,
+            "gross_trade_pnl_usd": gross_trade_pnl,
+            "allocated_settled_order_api_cost_usd": allocated_settled_api,
             "api_spend_usd": settled,
             "api_reserved_usd": reserved,
-            "net_project_pnl_after_api_usd": realized_pnl - settled,
+            # Order-level realized P&L already includes each settled order's
+            # allocated API cost. Add that allocation back before subtracting
+            # the global API ledger, otherwise those costs are charged twice.
+            "net_project_pnl_after_api_usd": gross_trade_pnl - settled,
             "last_scan": None if last_scan is None else dict(last_scan),
             "recent_orders": [dict(row) for row in recent_orders],
             "orders_by_status": {str(row["status"]): int(row["count"]) for row in status_rows},

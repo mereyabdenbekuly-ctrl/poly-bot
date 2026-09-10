@@ -18,3 +18,5 @@ def test_diagnostics_view_is_read_only_on_empty_database(tmp_path: Path) -> None
     assert before == after
     assert report["version"] == "forecast-diagnostics-v1"
     assert report["summary"]["settled_trade_count"] == 0  # type: ignore[index]
+    assert report["summary"]["strategy_pnl"] == {}  # type: ignore[index]
+    assert report["summary"]["winning_trades"] == []  # type: ignore[index]

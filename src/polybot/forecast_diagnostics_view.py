@@ -56,6 +56,30 @@ def build_forecast_diagnostics_view(
         ]
 
     sensitivity_rows = [row for row in rows if row["sensitivity_status"] == "available"]
+    strategy_pnl = _strategy_pnl(rows)
+    winning_trades = [
+        {
+            key: item.get(key)
+            for key in (
+                "paper_order_id",
+                "event_id",
+                "event_title",
+                "strategy_version",
+                "bought_label",
+                "winning_label",
+                "entry_price",
+                "realized_pnl_usd",
+                "forecast_vs_trade",
+                "top_label",
+                "top_probability",
+                "sensitivity_status",
+                "sigma_created_signal",
+            )
+            if key in item
+        }
+        for item in rows
+        if item.get("trade_correct") is True
+    ]
     return {
         "version": DIAGNOSTICS_VERSION,
         "generated_at_utc": report.generated_at_utc.isoformat(),
@@ -71,6 +95,8 @@ def build_forecast_diagnostics_view(
             "history_sigma_ceases_to_qualify_count": sum(
                 bool(row.get("history_sigma_ceases_to_qualify")) for row in sensitivity_rows
             ),
+            "strategy_pnl": strategy_pnl,
+            "winning_trades": winning_trades,
         },
         "history_sigma_proxy": sigma_proxy,
         "trades": rows,
@@ -79,6 +105,54 @@ def build_forecast_diagnostics_view(
             "Forecast correctness and trade selection are separate. Sigma sensitivity "
             "is descriptive and never changes immutable v1 or live decisions."
         ),
+    }
+
+
+def _strategy_pnl(rows: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+    """Split settled P&L by the version recorded at entry.
+
+    ``realized_pnl_usd`` already includes the order's allocated API cost in
+    this project. ``gross_trade_pnl_usd`` adds that allocation back so the
+    diagnostic cannot accidentally subtract the same cost twice.
+    """
+
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        strategy = str(row.get("strategy_version") or "unknown")
+        bucket = result.setdefault(
+            strategy,
+            {
+                "settled_count": 0,
+                "wins": 0,
+                "losses": 0,
+                "realized_pnl_usd": Decimal(0),
+                "allocated_order_api_cost_usd": Decimal(0),
+                "gross_trade_pnl_usd": Decimal(0),
+            },
+        )
+        bucket["settled_count"] = int(bucket["settled_count"]) + 1
+        if row.get("trade_correct") is True:
+            bucket["wins"] = int(bucket["wins"]) + 1
+        elif row.get("trade_correct") is False:
+            bucket["losses"] = int(bucket["losses"]) + 1
+        realized = _decimal_or_none(row.get("realized_pnl_usd")) or Decimal(0)
+        api_cost = _decimal_or_none(row.get("api_cost_usd")) or Decimal(0)
+        bucket["realized_pnl_usd"] = (
+            bucket["realized_pnl_usd"] + realized
+        )
+        bucket["allocated_order_api_cost_usd"] = (
+            bucket["allocated_order_api_cost_usd"] + api_cost
+        )
+        bucket["gross_trade_pnl_usd"] = bucket["gross_trade_pnl_usd"] + realized + api_cost
+    return {
+        strategy: {
+            **values,
+            "realized_pnl_usd": str(values["realized_pnl_usd"]),
+            "allocated_order_api_cost_usd": str(values["allocated_order_api_cost_usd"]),
+            "gross_trade_pnl_usd": str(values["gross_trade_pnl_usd"]),
+            "accounting_note": "realized includes allocated order API cost",
+        }
+        for strategy, values in sorted(result.items())
     }
 
 
@@ -141,6 +215,7 @@ def _compact_trade(
         "bought_probability": _string(trade.bought_probability),
         "entry_price": _string(trade.entry_price),
         "expected_profit_usd": _string(trade.expected_profit_usd),
+        "api_cost_usd": _string(trade.api_cost_usd),
         "realized_pnl_usd": _string(trade.realized_pnl_usd),
         "top_market_id": trade.top_forecast_market_id,
         "top_label": trade.top_forecast_bracket_label,

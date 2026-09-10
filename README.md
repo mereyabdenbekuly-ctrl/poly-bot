@@ -341,6 +341,9 @@ It separates a wrong weather forecast from buying a different bracket than the
 forecast's top bracket, and compares the historical signal under raw empirical
 members, the immutable `sigma=1.5°C` v1 kernel, and a clearly labelled
 descriptive sigma proxy. These counterfactuals never alter stored decisions.
+The report also splits realized P&L by the strategy version recorded at entry;
+trade fees remain included, while allocated order API cost is shown separately
+so it is not charged twice.
 
 ### Durable local state and source archive
 

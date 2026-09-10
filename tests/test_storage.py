@@ -219,6 +219,51 @@ def test_confirmed_identity_matched_result_uses_full_lifecycle(tmp_path) -> None
     assert summary["orders_by_status"] == {"PAPER_SETTLED": 1}
 
 
+def test_portfolio_net_after_api_does_not_double_charge_order_allocations(tmp_path) -> None:
+    storage = Storage(tmp_path / "test.sqlite3")
+    order_decision = decision().model_copy(update={"api_cost_usd": Decimal("0.10")})
+    order_id = storage.open_paper_order(
+        order_decision,
+        idempotency_key="api-accounting",
+        max_event_risk=Decimal("2"),
+        max_total_risk=Decimal("6"),
+    )
+    reservation = storage.reserve_api_budget(
+        model="gpt-6-astra", estimate=Decimal("0.10"), budget=Decimal("5")
+    )
+    storage.settle_api_budget(
+        reservation, actual_cost=Decimal("0.10"), input_tokens=1, output_tokens=1
+    )
+    check = ResolutionCheck(
+        market_id="market-1",
+        condition_id="condition-market-1",
+        token_id="asset-market-1",
+        outcome=OutcomeSide.YES,
+        checked_at=datetime.now(UTC),
+        accepting_orders=False,
+        closed=True,
+        end_date=datetime.now(UTC),
+        resolution_status="resolved",
+        resolution_source="source",
+        resolved_by="resolver",
+        confirmed=True,
+        won=False,
+        yes_price=Decimal(0),
+        no_price=Decimal(1),
+    )
+    storage.record_resolution_check(order_id, check)
+    storage.resolve_paper_order(order_id, check)
+    storage.settle_resolved_paper_order(order_id)
+
+    summary = storage.portfolio_summary()
+
+    # The order's realized value includes its $0.10 allocation. The global
+    # ledger is subtracted once, so net remains gross trade P&L minus $0.10.
+    assert summary["realized_pnl_usd"] == Decimal("-1.6525")
+    assert summary["gross_trade_pnl_usd"] == Decimal("-1.5525")
+    assert summary["net_project_pnl_after_api_usd"] == Decimal("-1.6525")
+
+
 def test_cached_astra_audit_has_zero_marginal_cost(tmp_path) -> None:
     storage = Storage(tmp_path / "test.sqlite3")
     audit = RuleAudit(
