@@ -1,12 +1,71 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from polybot.forecast_comparison import COMPARISON_VERSION, compare_forecasts
 from polybot.forecast_store import ForecastStore
 from polybot.storage import Storage
+
+# The page refreshes every 30 seconds while forecast data normally changes on
+# the much slower observer cadence.  A one-minute TTL prevents every refresh
+# from rebuilding the same bootstrap report while keeping it visibly fresh.
+COMPARISON_CACHE_TTL_SECONDS = 60.0
+
+
+class ComparisonCache:
+    """Single-flight, short-lived cache for the read-only comparison report.
+
+    Building a comparison report scans several forecast tables and computes
+    deterministic bootstrap intervals.  The dashboard is served by a threaded
+    HTTP server and may receive concurrent requests, so a plain per-request
+    call would duplicate the work (and could make a refresh burst expensive).
+    Holding the lock while refreshing deliberately gives the cache single-flight
+    semantics: one request computes, concurrent requests reuse the result once
+    it is available.  No write-capable storage object is used here.
+    """
+
+    def __init__(
+        self,
+        database: Path | str,
+        *,
+        ttl_seconds: float = COMPARISON_CACHE_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if ttl_seconds < 0:
+            raise ValueError("comparison cache TTL must be non-negative")
+        self.database = Path(database).expanduser().resolve()
+        self.ttl_seconds = float(ttl_seconds)
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._payload: dict[str, object] | None = None
+        self._expires_at = 0.0
+
+    def get(self) -> dict[str, object]:
+        """Return a cached report or build one exactly once per TTL window."""
+
+        now = float(self._clock())
+        with self._lock:
+            if self._payload is not None and now < self._expires_at:
+                return self._payload
+            payload = compare_forecasts(self.database)
+            self._payload = payload
+            self._expires_at = float(self._clock()) + self.ttl_seconds
+            return payload
+
+    def clear(self) -> None:
+        """Invalidate the cached report (used after an explicit refresh)."""
+
+        with self._lock:
+            self._payload = None
+            self._expires_at = 0.0
+
 
 _HTML = """<!doctype html>
 <html lang="en">
@@ -156,6 +215,7 @@ def serve_dashboard(storage: Storage, *, host: str, port: int) -> None:
     # Scanner/observer owns schema migrations. The dashboard opens SQLite in
     # read-only URI mode and HTTP GET handlers can never mutate runtime state.
     forecast_store = ForecastStore(storage.path, read_only=True)
+    comparison_cache = ComparisonCache(storage.path)
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
@@ -164,6 +224,20 @@ def serve_dashboard(storage: Storage, *, host: str, port: int) -> None:
                 self._send_json({"ok": True})
             elif path in {"/api/dashboard", "/api/status"}:
                 self._send_json(storage.dashboard_payload(forecast_store=forecast_store))
+            elif path == "/api/comparison":
+                try:
+                    self._send_json(comparison_cache.get())
+                except Exception as error:
+                    # Comparison is diagnostic-only. A transient read error
+                    # must not affect the observer or expose a traceback.
+                    self._send_json(
+                        {
+                            "version": COMPARISON_VERSION,
+                            "error": str(error),
+                            "promotion": {"status": "unavailable", "v2_promoted": False},
+                        },
+                        status=503,
+                    )
             elif path == "/":
                 body = _HTML.encode("utf-8")
                 self.send_response(200)
@@ -181,9 +255,9 @@ def serve_dashboard(storage: Storage, *, host: str, port: int) -> None:
             else:
                 self.send_error(404)
 
-        def _send_json(self, payload: dict[str, Any]) -> None:
+        def _send_json(self, payload: dict[str, Any], *, status: int = 200) -> None:
             body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
-            self.send_response(200)
+            self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
             self.send_header(

@@ -51,6 +51,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     diagnostics.add_argument("--json", action="store_true", dest="as_json")
 
+    comparison = subparsers.add_parser(
+        "comparison", help="Read-only v1/ECMWF/v2 forecast comparison report"
+    )
+    comparison.add_argument("--json", action="store_true", dest="as_json")
+
     settle = subparsers.add_parser("settle", help="Settle an open paper order manually")
     settle.add_argument("market_id")
     outcome = settle.add_mutually_exclusive_group(required=True)
@@ -76,6 +81,9 @@ def main(argv: list[str] | None = None) -> None:
     settings = Settings()
     if args.command == "diagnostics":
         _diagnostics(settings, as_json=args.as_json)
+        return
+    if args.command == "comparison":
+        _comparison(settings, as_json=args.as_json)
         return
     settings.ensure_runtime_directories()
     storage = Storage(settings.database_path)
@@ -277,6 +285,52 @@ def _diagnostics(settings: Settings, *, as_json: bool) -> None:
         f"Diagnostic sigma proxy: {proxy.get('value_c', '—')}°C · "
         f"state={proxy.get('state', 'unknown')} · {proxy.get('message', '')}"
     )
+
+
+def _comparison(settings: Settings, *, as_json: bool) -> None:
+    from polybot.forecast_comparison import compare_forecasts
+
+    report = compare_forecasts(settings.database_path)
+    if as_json:
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+        return
+    table = Table(title="Forecast comparison (read-only, descriptive)")
+    table.add_column("Model")
+    table.add_column("Phase")
+    table.add_column("Resolved", justify="right")
+    table.add_column("MAE", justify="right")
+    table.add_column("Exact", justify="right")
+    table.add_column("Brier", justify="right")
+    table.add_column("State")
+    model_rows = report.get("models")
+    for model in model_rows if isinstance(model_rows, list) else []:
+        if not isinstance(model, dict):
+            continue
+        phase_rows = model.get("phase_summaries")
+        for phase in phase_rows if isinstance(phase_rows, list) else []:
+            if not isinstance(phase, dict):
+                continue
+            metrics = phase.get("metrics", {})
+            metrics = metrics if isinstance(metrics, dict) else {}
+            table.add_row(
+                str(model.get("name", model.get("algorithm_version", "unknown"))),
+                str(phase.get("phase", "unknown")),
+                str(phase.get("evaluated_event_count", 0)),
+                _display_metric(metrics.get("mae")),
+                _display_metric(metrics.get("accuracy")),
+                _display_metric(metrics.get("brier")),
+                str(phase.get("sample_state", "unknown")),
+            )
+    console.print(table)
+    promotion = report.get("promotion", {})
+    if isinstance(promotion, dict):
+        console.print(
+            f"Promotion: {promotion.get('status', 'unknown')} — {promotion.get('reason', '')}"
+        )
+
+
+def _display_metric(value: object) -> str:
+    return "—" if value is None else str(value)
 
 
 def _print_scan_report(report: dict[str, Any]) -> None:

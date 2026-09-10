@@ -174,6 +174,11 @@ uv run polybot dashboard --host 127.0.0.1 --port 8787
 Откройте `http://127.0.0.1:8787`. Страница только читает SQLite, обновляется
 раз в 30 секунд и никогда не запускает анализ или торговое решение.
 
+Полный сравнительный отчёт v1/ECMWF/v2 доступен отдельно по
+`GET /api/comparison`. Ответ строится только из read-only SQLite-снимка и
+кэшируется в памяти на 60 секунд, поэтому тяжёлые диагностические расчёты не
+дублируются при одновременных запросах и не влияют на paper-цикл.
+
 ### WeatherNext 3
 
 По умолчанию отображается честный статус `disabled`. Чтобы показать
@@ -220,6 +225,8 @@ polybot scan --paper           один цикл с виртуальными п�
 polybot run --interval 300     непрерывный цикл
 polybot dashboard              локальная read-only страница состояния
 polybot status                 экспозиция, P&L и расходы API
+polybot diagnostics [--json]   forecast-vs-trade и sigma-диагностика
+polybot comparison [--json]    сравнительный отчёт v1 / ECMWF / v2
 polybot settle ID --won|--lost ручной результат paper-позиции
 ```
 
@@ -344,6 +351,22 @@ descriptive sigma proxy. These counterfactuals never alter stored decisions.
 The report also splits realized P&L by the strategy version recorded at entry;
 trade fees remain included, while allocated order API cost is shown separately
 so it is not charged twice.
+
+Для автоматического сравнения трёх сохранённых погодных версий:
+
+```bash
+polybot comparison
+polybot comparison --json
+```
+
+Отчёт использует один последний сохранённый checkpoint на событие в каждой
+фазе, показывает coverage, MAE, точность диапазона, multiclass Brier, ECE и
+парные разницы кандидата относительно v1 только внутри одной строки evaluation
+registry. Разница времени выпуска прогнозов выводится явно. Срезы по lead-time
+остаются описательными: фиксированного holdout-периода пока нет, поэтому
+`v2_promoted=false` независимо от текущих чисел. Отдельный раздел проверяет
+архивную `sigma=1.5°C`, raw members, observed-floor conditioning и clamped
+контрфактуал, не меняя историю или paper-решения.
 
 ### Durable local state and source archive
 
