@@ -178,3 +178,9 @@ def test_comparison_endpoint_is_separate_from_dashboard_payload(tmp_path, monkey
     assert dashboard_request.payload is not None
     assert "forecast_comparison" in dashboard_request.payload
     assert comparison_calls == 1
+
+
+def test_dashboard_renders_cached_comparison_gate() -> None:
+    assert 'id="comparison-gate"' in dashboard_module._HTML  # noqa: SLF001
+    assert "fetch('/api/comparison'" in dashboard_module._HTML  # noqa: SLF001
+    assert "v1 remains active" in dashboard_module._HTML  # noqa: SLF001
