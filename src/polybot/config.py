@@ -78,6 +78,21 @@ class Settings(BaseSettings):
     weathernext_enabled: bool = False
     weathernext_surface: str = "gcs_full_ensemble"
     weathernext_snapshot_path: str | None = None
+    # Official WeatherNext statistics surface.  This is deliberately kept
+    # separate from the raw 64-member export: statistics are descriptive
+    # percentiles and must never be interpreted as synthetic scenarios.
+    weathernext_statistics_snapshot_path: str | None = None
+    weathernext_statistics_variable: Literal[
+        "temperature_2m", "station_head_temperature_2m"
+    ] = "station_head_temperature_2m"
+    weathernext_statistics_bucket: str = "weathernext3_statistics_spatial"
+    weathernext_statistics_prefix: str = "weathernext_3_0_0_statistics/zarr"
+    weathernext_statistics_store_prefix: str | None = None
+    weathernext_statistics_read_max_bytes: int = Field(default=2_000_000_000, ge=1_000_000)
+    # Keep an implicit refresh small enough to remain below the transfer
+    # ceiling.  A full local day is intentionally opt-in via an explicit
+    # bounded setting and may still be refused before any payload read.
+    weathernext_statistics_max_hours: int = Field(default=4, ge=1, le=48)
     # Requester Pays: the billing project charged for WeatherNext3 GCS reads.
     # Google access uses local ADC only; API keys are intentionally unsupported.
     weathernext_gcs_bucket: str = "weathernext3_spatial"

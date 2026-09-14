@@ -76,6 +76,66 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the raw full-ensemble transfer safety ceiling",
     )
     wn_refresh.add_argument("--output", default=None)
+    wn_raw_estimate = wn_sub.add_parser(
+        "raw-estimate",
+        aliases=["estimate"],
+        help="Estimate a raw full-ensemble point/day transfer using metadata only",
+    )
+    wn_raw_estimate.add_argument("--latitude", type=float, required=True)
+    wn_raw_estimate.add_argument("--longitude", type=float, required=True)
+    wn_raw_estimate.add_argument("--location", required=True)
+    wn_raw_estimate.add_argument("--date", required=True, dest="observation_date")
+    wn_raw_estimate.add_argument(
+        "--timezone",
+        default="UTC",
+        help="IANA timezone for the station-local observation date (default: UTC)",
+    )
+    wn_raw_estimate.add_argument("--json", action="store_true", dest="as_json")
+    wn_raw_estimate.add_argument(
+        "--output",
+        default=None,
+        help="Optional local JSON path for the metadata-only provenance report",
+    )
+    wn_stats_check = wn_sub.add_parser(
+        "statistics-check",
+        aliases=["stats-check"],
+        help="Verify official statistics-surface access",
+    )
+    wn_stats_check.add_argument("--json", action="store_true", dest="as_json")
+    wn_stats_refresh = wn_sub.add_parser(
+        "statistics-refresh",
+        aliases=["stats-refresh", "summary-refresh"],
+        help="Pull one bounded SUMMARY_ONLY statistics snapshot",
+    )
+    wn_stats_refresh.add_argument("--latitude", type=float, required=True)
+    wn_stats_refresh.add_argument("--longitude", type=float, required=True)
+    wn_stats_refresh.add_argument("--location", required=True)
+    wn_stats_refresh.add_argument(
+        "--station-id",
+        default=None,
+        help="Optional ICAO/station identifier kept with the summary provenance",
+    )
+    wn_stats_refresh.add_argument("--date", required=True, dest="observation_date")
+    wn_stats_refresh.add_argument(
+        "--timezone",
+        default="UTC",
+        help="IANA timezone for the station-local observation date (default: UTC)",
+    )
+    wn_stats_refresh.add_argument(
+        "--hours",
+        type=int,
+        default=None,
+        help=(
+            "Number of earliest valid hours to retain from the station-local window "
+            "(bounded by configured read limit)"
+        ),
+    )
+    wn_stats_refresh.add_argument(
+        "--include-past",
+        action="store_true",
+        help="Include already elapsed hours in the station-local day",
+    )
+    wn_stats_refresh.add_argument("--output", default=None)
 
     settle = subparsers.add_parser("settle", help="Settle an open paper order manually")
     settle.add_argument("market_id")
@@ -104,9 +164,47 @@ def main(argv: list[str] | None = None) -> None:
         try:
             from datetime import date as _date
 
-            from polybot.weathernext import WeatherNextGcsClient, WeatherNextProvider
+            from polybot.weathernext import (
+                WeatherNextGcsClient,
+                WeatherNextProvider,
+                WeatherNextStatisticsGcsClient,
+            )
 
             provider = WeatherNextProvider(settings)
+            if args.weathernext_command in {"raw-estimate", "estimate"}:
+                from pathlib import Path
+
+                report = WeatherNextGcsClient(settings).estimate_point_day_read(
+                    latitude=args.latitude,
+                    longitude=args.longitude,
+                    location=args.location,
+                    observation_date=_date.fromisoformat(args.observation_date),
+                    timezone_name=args.timezone,
+                )
+                if args.output:
+                    output = Path(args.output).expanduser()
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = output.with_name(output.name + ".tmp")
+                    temporary.write_text(
+                        json.dumps(report, ensure_ascii=False, indent=2, default=str),
+                        encoding="utf-8",
+                    )
+                    temporary.replace(output)
+                if args.as_json:
+                    print(json.dumps(report, indent=2, default=str))
+                else:
+                    for key, value in report.items():
+                        print(f"{key}: {value}")
+                return
+            if args.weathernext_command in {"statistics-check", "stats-check"}:
+                client = WeatherNextStatisticsGcsClient(settings)
+                report = client.check_access()
+                if args.as_json:
+                    print(json.dumps(report, indent=2, default=str))
+                else:
+                    for key, value in report.items():
+                        print(f"{key}: {value}")
+                return
             if args.weathernext_command == "check":
                 client = WeatherNextGcsClient(settings)
                 report = client.check_access()
@@ -115,6 +213,26 @@ def main(argv: list[str] | None = None) -> None:
                 else:
                     for key, value in report.items():
                         print(f"{key}: {value}")
+                return
+            if args.weathernext_command in {
+                "statistics-refresh",
+                "stats-refresh",
+                "summary-refresh",
+            }:
+                from pathlib import Path
+
+                snapshot = provider.refresh_statistics_from_gcs(
+                    latitude=args.latitude,
+                    longitude=args.longitude,
+                    location=args.location,
+                    station_id=args.station_id,
+                    observation_date=_date.fromisoformat(args.observation_date),
+                    timezone_name=args.timezone,
+                    max_hours=args.hours,
+                    include_past_hours=args.include_past,
+                    output_path=None if args.output is None else Path(args.output),
+                )
+                print(snapshot.model_dump_json(indent=2))
                 return
             snapshot = provider.refresh_from_gcs(
                 latitude=args.latitude,

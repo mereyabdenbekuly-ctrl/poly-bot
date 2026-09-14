@@ -701,6 +701,26 @@ class Storage:
             {key: value for key, value in window.items() if key != "reports"}
             for window in self.recent_runtime_windows(limit=2)
         ]
+        try:
+            from polybot.weathernext import WeatherNextProvider
+
+            weathernext_statistics = WeatherNextProvider(
+                __import__("polybot.config", fromlist=["Settings"]).Settings()
+            ).statistics_dashboard_payload()
+        except Exception as error:
+            # Dashboard remains read-only and local even when optional
+            # WeatherNext statistics configuration is absent or malformed.
+            weathernext_statistics = {
+                "status": {
+                    "access_state": "error",
+                    "load_state": "error",
+                    "enabled": False,
+                    "surface": "gcs_statistics",
+                    "snapshot_path": None,
+                    "message": str(error),
+                },
+                "snapshot": None,
+            }
         return {
             "generated_at": utc_now().isoformat(),
             "portfolio": portfolio,
@@ -712,6 +732,7 @@ class Storage:
             "recent_windows": compact_windows,
             "forecast_comparison": forecast_comparison,
             "forecast_diagnostics": forecast_diagnostics,
+            "weathernext_statistics": weathernext_statistics,
         }
 
     def start_scan(self, *, query: str, mode: str, window_id: int | None = None) -> int:

@@ -184,3 +184,25 @@ def test_dashboard_renders_cached_comparison_gate() -> None:
     assert 'id="comparison-gate"' in dashboard_module._HTML  # noqa: SLF001
     assert "fetch('/api/comparison'" in dashboard_module._HTML  # noqa: SLF001
     assert "v1 remains active" in dashboard_module._HTML  # noqa: SLF001
+
+
+def test_dashboard_renders_weathernext_statistics_as_summary_only() -> None:
+    html = dashboard_module._HTML  # noqa: SLF001
+    assert 'id="weathernext-summary"' in html
+    assert "SUMMARY_ONLY" in html
+    assert "weathernext_statistics" in html
+    assert "access_state" in html
+    assert "load_state" in html
+    assert "temperature_mean_c" in html
+    assert "p10_c" in html and "p90_c" in html
+    # The statistics surface must not be presented as a synthetic member set
+    # or fed into daily-maximum probability rendering.
+    assert "not a 64-member scenario set" in html
+    assert "daily-maximum probabilities" in html
+    assert "Read provenance and transfer estimate" in html
+    assert "Global logical size (reference)" in html
+    assert "Selected logical bytes" in html
+    assert "Expected network bytes" in html
+    assert "Codecs" in html
+    assert "Shard shape (count)" in html
+    assert "Transfer unit" in html

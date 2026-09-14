@@ -13,6 +13,10 @@
     <string>PATH=/Users/admin/Documents/ChatGPT/poly-bot/.venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     <string>PYTHONUNBUFFERED=1</string>
     <string>POLYBOT_DATABASE_PATH=/Users/admin/Library/Application Support/Polybot/polybot.sqlite3</string>
+    <string>POLYBOT_WEATHERNEXT_ENABLED=true</string>
+    <string>POLYBOT_WEATHERNEXT_GCS_PROJECT=weather-508105</string>
+    <string>POLYBOT_WEATHERNEXT_STATISTICS_VARIABLE=station_head_temperature_2m</string>
+    <string>POLYBOT_WEATHERNEXT_STATISTICS_SNAPSHOT_PATH=/Users/admin/Library/Application Support/Polybot/weathernext-statistics-snapshot.json</string>
     <string>/Users/admin/Documents/ChatGPT/poly-bot/.venv/bin/polybot</string>
     <string>dashboard</string>
     <string>--host</string>

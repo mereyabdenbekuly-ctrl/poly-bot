@@ -209,6 +209,8 @@ POLYBOT_WEATHERNEXT_SNAPSHOT_PATH=/absolute/path/to/weathernext-snapshot.json
 POLYBOT_WEATHERNEXT_GCS_PROJECT=weather-508105
 POLYBOT_WEATHERNEXT_GCS_BUCKET=weathernext3_spatial
 POLYBOT_WEATHERNEXT_GCS_PREFIX=weathernext_3_0_0/zarr
+POLYBOT_WEATHERNEXT_STATISTICS_VARIABLE=station_head_temperature_2m
+POLYBOT_WEATHERNEXT_STATISTICS_SNAPSHOT_PATH=/absolute/path/to/weathernext-statistics-snapshot.json
 ```
 
 Для чтения Zarr v3 установите необязательную группу зависимостей:
@@ -223,6 +225,22 @@ uv sync --group weathernext
 uv run polybot weathernext check --json
 ```
 
+Отдельная metadata-only диагностика объясняет большой raw-transfer estimate и
+не читает тела chunk-объектов:
+
+```bash
+uv run polybot weathernext raw-estimate \
+  --latitude 52.3086 --longitude 4.7639 --location "EHAM Amsterdam Schiphol" \
+  --date 2026-09-15 --timezone Europe/Amsterdam --json \
+  --output /absolute/path/to/weathernext-raw-estimate.json
+```
+
+Отчёт разделяет глобальный logical array, выбранные chunks, codecs, sharding и
+фактические compressed object sizes. `global_uncompressed_array_bytes` и
+целый shard не считаются обязательным transfer сами по себе; transfer unit
+берётся из Zarr metadata. `metadata_only=true` и `payload_read=false` должны
+оставаться неизменными.
+
 Первый снимок загружается явно, а не во время каждого observer-цикла:
 
 ```bash
@@ -231,11 +249,29 @@ uv run polybot weathernext refresh \
   --date 2026-09-15 --timezone Europe/Berlin
 ```
 
+Для официальной сводки WeatherNext statistics используйте отдельный bounded
+refresh. Он сохраняет только mean/p10/p25/p50/p75/p90 для одной станции и
+часов, помечает snapshot как `SUMMARY_ONLY` и не создаёт 64 synthetic members:
+
+```bash
+uv run polybot weathernext summary-refresh \
+  --latitude 52.3086 --longitude 4.7639 --station-id EHAM \
+  --location "EHAM Amsterdam Schiphol" \
+  --date 2026-09-15 --timezone Europe/Amsterdam --hours 4
+```
+
+`--hours` удерживает ранние valid hours выбранного station-local окна и
+фиксирует partial/bounded coverage в provenance. Чтение останавливается до
+скачивания, если ожидаемые network bytes превышают
+`POLYBOT_WEATHERNEXT_STATISTICS_READ_MAX_BYTES`.
+
 По умолчанию refresh блокирует потенциально очень большой raw-запрос до
 скачивания данных. В full-ensemble Zarr пространственные chunks содержат
 глобальную сетку, поэтому точечная выборка может потребовать десятки или сотни
-гигабайт. Флаг `--allow-large-read` используйте только после отдельного
-подтверждения стоимости; observer такие запросы сам не запускает.
+гигабайт. В этой конфигурации `--allow-large-read` намеренно не используется;
+observer такие raw-запросы сам не запускает. Для объяснения transfer cost
+используйте metadata-only `raw-estimate`, а для данных — bounded statistics
+surface ниже.
 
 Часовой пояс нужен для преобразования локальной даты станции в UTC. Снимок
 сохраняет фактический `init_time` из Zarr; значения `station_head_temperature_2m`
