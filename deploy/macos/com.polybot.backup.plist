@@ -14,7 +14,7 @@
     <string>--root</string>
     <string>/Users/admin/Library/Application Support/Polybot/backups</string>
     <string>--keep</string>
-    <string>96</string>
+    <string>12</string>
   </array>
   <key>WorkingDirectory</key>
   <string>/Users/admin/Documents/ChatGPT/poly-bot</string>

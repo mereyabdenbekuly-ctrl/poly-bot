@@ -171,9 +171,7 @@ def main() -> None:
             return
 
         _ensure_free_space(root, source, keep=keep)
-        fd, temporary_name = tempfile.mkstemp(
-            prefix=_TEMP_PREFIX, suffix=".sqlite3", dir=root
-        )
+        fd, temporary_name = tempfile.mkstemp(prefix=_TEMP_PREFIX, suffix=".sqlite3", dir=root)
         os.close(fd)
         temporary = Path(temporary_name)
         try:
@@ -187,9 +185,7 @@ def main() -> None:
                 # beside the published backup; the remaining empty sidecar is
                 # removed by ``_cleanup_temporary`` below.
                 target_connection.commit()
-                journal_mode = target_connection.execute(
-                    "PRAGMA journal_mode=DELETE"
-                ).fetchone()
+                journal_mode = target_connection.execute("PRAGMA journal_mode=DELETE").fetchone()
                 if journal_mode is None or str(journal_mode[0]).lower() != "delete":
                     raise RuntimeError(f"could not finalize backup journal mode: {journal_mode}")
                 result = target_connection.execute("PRAGMA integrity_check").fetchone()

@@ -421,7 +421,8 @@ archives outside the Git checkout:
 ```
 
 `com.polybot.backup` creates an integrity-checked SQLite backup every 15 minutes
-and retains the latest 96 snapshots. `com.polybot.ecmwf-archive` runs every six
+and retains at most the latest 12 snapshots, with an additional free-space
+guard. `com.polybot.ecmwf-archive` runs every six
 hours and archives the official ECMWF Open Data IFS ENS `enfo/pf/mx2t3` byte
 ranges for all 50 perturbed members. This raw official archive is shown
 separately from the lightweight `IFS ENS via Open-Meteo` comparison feed; the
