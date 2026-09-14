@@ -563,3 +563,49 @@ def test_statistics_reader_falls_back_from_nonfinite_publication(tmp_path, monke
     assert snapshot.init_time_utc == previous
     fallback = cast(dict[str, object], snapshot.read_provenance["publication_read_fallback"])
     assert fallback["failed_run_init_time_utc"] == first.isoformat()
+
+
+def test_statistics_access_and_load_states_are_independent(tmp_path, monkeypatch) -> None:
+    snapshot_path = tmp_path / "summary.json"
+    snapshot_path.write_text(
+        WeatherNextStatisticsSnapshot(
+            init_time_utc=datetime(2026, 9, 14, tzinfo=UTC),
+            received_at_utc=datetime(2026, 9, 14, 1, tzinfo=UTC),
+            location="EHAM",
+            station_id="EHAM",
+            latitude=52.3,
+            longitude=4.8,
+            observation_date=date(2026, 9, 15),
+            observation_timezone="Europe/Amsterdam",
+            variable="station_head_temperature_2m",
+            points=[
+                WeatherNextStatisticsPoint(
+                    valid_time_utc=datetime(2026, 9, 14, 22, tzinfo=UTC),
+                    temperature_mean_c=18,
+                    p10_c=17,
+                    p25_c=17.5,
+                    p50_c=18,
+                    p75_c=18.5,
+                    p90_c=19,
+                )
+            ],
+            source_uri="gs://weathernext3_statistics_spatial/run/predictions.zarr",
+            read_provenance={},
+        ).model_dump_json(),
+        encoding="utf-8",
+    )
+    settings = _settings(
+        tmp_path,
+        weathernext_statistics_snapshot_path=str(snapshot_path),
+        weathernext_statistics_variable="station_head_temperature_2m",
+    )
+
+    def denied(_self):  # type: ignore[no-untyped-def]
+        raise RuntimeError("temporary access outage")
+
+    monkeypatch.setattr(WeatherNextStatisticsGcsClient, "check_access", denied)
+    status = WeatherNextProvider(settings).statistics_status(check_access=True)
+
+    assert status.access_state == "error"
+    assert status.load_state == "available"
+    assert status.init_time_utc == datetime(2026, 9, 14, tzinfo=UTC)

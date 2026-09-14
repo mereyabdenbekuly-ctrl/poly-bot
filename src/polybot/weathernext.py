@@ -2268,63 +2268,69 @@ class WeatherNextProvider:
                 snapshot_path=path,
                 message="WeatherNext statistics surface is disabled; v1 continues unchanged.",
             )
+
+        # Load state is always derived independently from the optional access
+        # probe.  A temporary GCS failure must not erase a valid local snapshot
+        # from the dashboard, and a corrupt/missing file must not be reported as
+        # an access failure.
+        snapshot: WeatherNextStatisticsSnapshot | None = None
+        load_error: str | None = None
+        load_state: Literal["not_loaded", "available", "error"] = "not_loaded"
+        if path:
+            try:
+                snapshot = self._load_statistics_snapshot(Path(path).expanduser())
+            except Exception as error:
+                load_state = "error"
+                load_error = str(error)
+            else:
+                load_state = "available"
+
         access_report: dict[str, object] | None = None
+        access_state: Literal["pending", "granted", "error"] = (
+            "granted" if snapshot is not None else "pending"
+        )
+        access_message: str | None = None
         if check_access:
             try:
                 client = WeatherNextStatisticsGcsClient(self.settings)
                 access_report = client.check_access()
             except Exception as error:
-                return WeatherNextStatisticsStatus(
-                    access_state="error",
-                    load_state="error" if path else "not_loaded",
-                    enabled=True,
-                    snapshot_path=path,
-                    message=f"WeatherNext statistics access check failed: {error}",
-                )
-            if not bool(access_report.get("access_granted")):
-                return WeatherNextStatisticsStatus(
-                    access_state="error",
-                    load_state="error" if path else "not_loaded",
-                    enabled=True,
-                    snapshot_path=path,
-                    message=str(
+                access_state = "error"
+                access_message = f"WeatherNext statistics access check failed: {error}"
+            else:
+                if bool(access_report.get("access_granted")):
+                    access_state = "granted"
+                    access_message = "WeatherNext statistics access granted."
+                else:
+                    access_state = "error"
+                    access_message = str(
                         access_report.get("error") or "WeatherNext statistics access denied"
-                    ),
-                    access_report=access_report,
-                )
-        if not path:
-            return WeatherNextStatisticsStatus(
-                access_state="pending" if not check_access else "granted",
-                load_state="not_loaded",
-                enabled=True,
-                snapshot_path=None,
-                message=(
-                    "WeatherNext statistics access is not checked by the dashboard; "
-                    "run `polybot weathernext statistics-check` explicitly."
-                    if not check_access
-                    else "WeatherNext statistics access granted; no SUMMARY_ONLY snapshot saved."
-                ),
-                access_report=access_report,
+                    )
+
+        if load_error is not None:
+            message = f"WeatherNext statistics snapshot could not be loaded: {load_error}"
+        elif snapshot is not None:
+            message = "Official WeatherNext statistics snapshot loaded as SUMMARY_ONLY."
+        elif check_access and access_message:
+            message = access_message
+        elif check_access:
+            message = "WeatherNext statistics access checked; no SUMMARY_ONLY snapshot saved."
+        else:
+            message = (
+                "WeatherNext statistics access is not checked by the dashboard; "
+                "run `polybot weathernext statistics-check` explicitly."
             )
-        try:
-            snapshot = self._load_statistics_snapshot(Path(path).expanduser())
-        except Exception as error:
-            return WeatherNextStatisticsStatus(
-                access_state="pending" if not check_access else "granted",
-                load_state="error",
-                enabled=True,
-                snapshot_path=path,
-                message=f"WeatherNext statistics snapshot could not be loaded: {error}",
-                access_report=access_report,
-            )
+        if access_message and snapshot is not None and access_state == "error":
+            message = f"{message} Access probe: {access_message}"
+
         return WeatherNextStatisticsStatus(
-            access_state="granted",
-            load_state="available",
+            access_state=access_state,
+            load_state=load_state,
             enabled=True,
             snapshot_path=path,
-            init_time_utc=snapshot.init_time_utc,
-            received_at_utc=snapshot.received_at_utc,
-            message="Official WeatherNext statistics snapshot loaded as SUMMARY_ONLY.",
+            init_time_utc=None if snapshot is None else snapshot.init_time_utc,
+            received_at_utc=None if snapshot is None else snapshot.received_at_utc,
+            message=message,
             access_report=access_report,
         )
 
