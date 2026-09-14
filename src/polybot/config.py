@@ -78,6 +78,20 @@ class Settings(BaseSettings):
     weathernext_enabled: bool = False
     weathernext_surface: str = "gcs_full_ensemble"
     weathernext_snapshot_path: str | None = None
+    # Requester Pays: the billing project charged for WeatherNext3 GCS reads.
+    # Google access uses local ADC only; API keys are intentionally unsupported.
+    weathernext_gcs_bucket: str = "weathernext3_spatial"
+    # The full-ensemble WeatherNext 3 bucket is a Zarr-v3 hierarchy.  Keep the
+    # root configurable because historical and operational archives live below
+    # different year prefixes.  A concrete ``.../predictions.zarr`` prefix can
+    # be supplied to avoid discovery/listing during a refresh.
+    weathernext_gcs_prefix: str = "weathernext_3_0_0/zarr"
+    weathernext_gcs_store_prefix: str | None = None
+    weathernext_gcs_project: str | None = None
+    # Raw full-ensemble station chunks contain the global grid and can be
+    # hundreds of gigabytes for one daily point extraction.  Keep reads
+    # opt-in and bounded unless an operator explicitly overrides the guard.
+    weathernext_raw_read_max_bytes: int = Field(default=2_000_000_000, ge=1_000_000)
 
     http_timeout_seconds: float = Field(default=20.0, ge=1, le=120)
 

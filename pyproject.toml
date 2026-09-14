@@ -23,10 +23,17 @@ polybot = "polybot.cli:main"
 
 [dependency-groups]
 dev = [
-  "pytest>=8.4,<9",
-  "pytest-cov>=6,<8",
-  "pyright>=1.1,<2",
-  "ruff>=0.12,<1",
+ "pytest>=8,<9",
+ "pytest-cov>=6,<8",
+ "pyright>=1.1,<2",
+ "ruff>=0.12,<1",
+]
+
+weathernext = [
+ "google-cloud-storage>=2.16",
+ "obstore>=0.11,<1",
+ "xarray>=2024.10,<2027",
+ "zarr>=3,<4",
 ]
 
 [tool.hatch.build.targets.wheel]

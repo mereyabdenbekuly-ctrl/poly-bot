@@ -56,6 +56,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     comparison.add_argument("--json", action="store_true", dest="as_json")
 
+    wn = subparsers.add_parser("weathernext", help="WeatherNext3 GCS comparison source")
+    wn_sub = wn.add_subparsers(dest="weathernext_command", required=True)
+    wn_check = wn_sub.add_parser("check", help="Verify ADC and Requester Pays access")
+    wn_check.add_argument("--json", action="store_true", dest="as_json")
+    wn_refresh = wn_sub.add_parser("refresh", help="Pull a fresh snapshot from GCS")
+    wn_refresh.add_argument("--latitude", type=float, required=True)
+    wn_refresh.add_argument("--longitude", type=float, required=True)
+    wn_refresh.add_argument("--location", required=True)
+    wn_refresh.add_argument("--date", required=True, dest="observation_date")
+    wn_refresh.add_argument(
+        "--timezone",
+        default="UTC",
+        help="IANA timezone for the station-local observation date (default: UTC)",
+    )
+    wn_refresh.add_argument(
+        "--allow-large-read",
+        action="store_true",
+        help="Override the raw full-ensemble transfer safety ceiling",
+    )
+    wn_refresh.add_argument("--output", default=None)
+
     settle = subparsers.add_parser("settle", help="Settle an open paper order manually")
     settle.add_argument("market_id")
     outcome = settle.add_mutually_exclusive_group(required=True)
@@ -79,6 +100,37 @@ def _add_scan_options(parser: argparse.ArgumentParser) -> None:
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     settings = Settings()
+    if args.command == "weathernext":
+        try:
+            from datetime import date as _date
+
+            from polybot.weathernext import WeatherNextGcsClient, WeatherNextProvider
+
+            provider = WeatherNextProvider(settings)
+            if args.weathernext_command == "check":
+                client = WeatherNextGcsClient(settings)
+                report = client.check_access()
+                if args.as_json:
+                    print(json.dumps(report, indent=2, default=str))
+                else:
+                    for key, value in report.items():
+                        print(f"{key}: {value}")
+                return
+            snapshot = provider.refresh_from_gcs(
+                latitude=args.latitude,
+                longitude=args.longitude,
+                location=args.location,
+                observation_date=_date.fromisoformat(args.observation_date),
+                timezone_name=args.timezone,
+                allow_large_read=args.allow_large_read,
+                output_path=args.output,
+            )
+            print(snapshot.model_dump_json(indent=2))
+        except Exception as error:
+            error_console.print(f"[bold red]Error:[/bold red] {error}")
+            raise SystemExit(1) from error
+        return
+
     if args.command == "diagnostics":
         _diagnostics(settings, as_json=args.as_json)
         return

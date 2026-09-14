@@ -202,6 +202,46 @@ POLYBOT_WEATHERNEXT_SNAPSHOT_PATH=/absolute/path/to/weathernext-snapshot.json
 базовой вероятностью, но **не меняет решения стратегии v1**. Если доступ или
 файл отсутствует, бот продолжает работу на текущих источниках.
 
+Для официального полного 64-member Zarr-v3 bucket используется Requester Pays.
+Укажите Google Cloud **Project ID** (например, `weather-508105`), а не API key:
+
+```env
+POLYBOT_WEATHERNEXT_GCS_PROJECT=weather-508105
+POLYBOT_WEATHERNEXT_GCS_BUCKET=weathernext3_spatial
+POLYBOT_WEATHERNEXT_GCS_PREFIX=weathernext_3_0_0/zarr
+```
+
+Для чтения Zarr v3 установите необязательную группу зависимостей:
+
+```bash
+uv sync --group weathernext
+```
+
+Проверка выполняет только ограниченный metadata-запрос:
+
+```bash
+uv run polybot weathernext check --json
+```
+
+Первый снимок загружается явно, а не во время каждого observer-цикла:
+
+```bash
+uv run polybot weathernext refresh \
+  --latitude 48.3538 --longitude 11.7861 --location Munich \
+  --date 2026-09-15 --timezone Europe/Berlin
+```
+
+По умолчанию refresh блокирует потенциально очень большой raw-запрос до
+скачивания данных. В full-ensemble Zarr пространственные chunks содержат
+глобальную сетку, поэтому точечная выборка может потребовать десятки или сотни
+гигабайт. Флаг `--allow-large-read` используйте только после отдельного
+подтверждения стоимости; observer такие запросы сам не запускает.
+
+Часовой пояс нужен для преобразования локальной даты станции в UTC. Снимок
+сохраняет фактический `init_time` из Zarr; значения `station_head_temperature_2m`
+переводятся из Kelvin в Celsius. WeatherNext остаётся shadow/read-only и не
+включает реальные сделки.
+
 ## Docker Compose
 
 По умолчанию контейнер запускается только как observer:

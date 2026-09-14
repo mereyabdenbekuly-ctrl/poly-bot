@@ -1,12 +1,15 @@
+import os
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
 def test_backup_script_creates_integrity_checked_copy(tmp_path: Path) -> None:
     source = tmp_path / "source.sqlite3"
     with sqlite3.connect(source) as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("CREATE TABLE sample(value TEXT NOT NULL)")
         connection.execute("INSERT INTO sample VALUES ('preserved')")
     root = tmp_path / "backups"
@@ -28,7 +31,9 @@ def test_backup_script_creates_integrity_checked_copy(tmp_path: Path) -> None:
     with sqlite3.connect(backups[0]) as connection:
         assert connection.execute("SELECT value FROM sample").fetchone() == ("preserved",)
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert connection.execute("PRAGMA journal_mode").fetchone() == ("delete",)
     assert backups[0].with_suffix(".sqlite3.sha256").is_file()
+    assert not list(root.glob(".polybot-backup-*.sqlite3*"))
 
 
 def test_backup_script_prunes_only_its_oldest_named_backups(tmp_path: Path) -> None:
@@ -60,3 +65,70 @@ def test_backup_script_prunes_only_its_oldest_named_backups(tmp_path: Path) -> N
 
     assert len(list(root.glob("polybot-*.sqlite3"))) == 2
     assert unrelated.read_bytes() == b"unrelated"
+
+
+def test_backup_script_cleans_old_orphaned_temporary_sidecars(tmp_path: Path) -> None:
+    source = tmp_path / "source.sqlite3"
+    with sqlite3.connect(source) as connection:
+        connection.execute("CREATE TABLE sample(value TEXT NOT NULL)")
+        connection.execute("INSERT INTO sample VALUES ('preserved')")
+    root = tmp_path / "backups"
+    root.mkdir()
+    orphan = root / ".polybot-backup-orphan.sqlite3"
+    orphan.write_bytes(b"incomplete")
+    for suffix in ("-wal", "-shm", "-journal"):
+        orphan.with_name(orphan.name + suffix).write_bytes(b"orphan")
+    old = time.time() - 2 * 60 * 60
+    for path in root.glob(".polybot-backup-orphan.sqlite3*"):
+        path.touch()
+        path.chmod(0o400)
+        os.utime(path, (old, old))
+
+    subprocess.run(
+        [
+            sys.executable,
+            "scripts/backup-state.py",
+            "--database",
+            str(source),
+            "--root",
+            str(root),
+        ],
+        check=True,
+    )
+
+    assert not list(root.glob(".polybot-backup-orphan.sqlite3*"))
+
+
+def test_backup_script_prunes_before_a_failed_copy_and_keeps_latest_backup(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.sqlite3"
+    source.write_bytes(b"not a sqlite database")
+    root = tmp_path / "backups"
+    root.mkdir()
+    for stamp in ("20260101T000000Z", "20260102T000000Z"):
+        backup = root / f"polybot-{stamp}.sqlite3"
+        backup.write_bytes(b"old")
+        backup.with_suffix(".sqlite3.sha256").write_text("old", encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/backup-state.py",
+            "--database",
+            str(source),
+            "--root",
+            str(root),
+            "--keep",
+            "2",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert [path.name for path in root.glob("polybot-*.sqlite3")] == [
+        "polybot-20260102T000000Z.sqlite3"
+    ]
+    assert not list(root.glob(".polybot-backup-*.sqlite3*"))
