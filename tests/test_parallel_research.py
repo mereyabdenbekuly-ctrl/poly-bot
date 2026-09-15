@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any, cast
@@ -12,8 +12,19 @@ from polybot.forecast_models import (
     ForecastEligibilityStage,
     ForecastEventEligibility,
 )
-from polybot.models import EventDefinition, MarketDefinition
-from polybot.scanner import Scanner
+from polybot.forecast_v2 import (
+    ECMWF_RAW_ALGORITHM_VERSION,
+    FORECAST_V2_ALGORITHM_VERSION,
+)
+from polybot.models import (
+    BookLevel,
+    EventDefinition,
+    MarketDefinition,
+    MarketSnapshot,
+    WeatherForecast,
+)
+from polybot.observations import ObservationHistory
+from polybot.scanner import Scanner, _EcmwfShadowJob
 from polybot.storage import Storage
 
 
@@ -203,3 +214,267 @@ def test_background_scheduler_skips_without_queuing(tmp_path) -> None:
     assert status is not None
     assert status[0] == "skipped_busy"
     assert "no work queued" in status[1]
+
+
+def _deferred_event_payload() -> tuple[
+    EventDefinition,
+    ObservationHistory,
+    WeatherForecast,
+    MarketSnapshot,
+]:
+    now = datetime.now(UTC)
+    observation_date = date(2026, 9, 10)
+    event = EventDefinition(
+        id="deferred-event",
+        slug="deferred-event",
+        title="Highest temperature in Test City on September 10?",
+        description=(
+            "This market will resolve to the temperature range that contains the highest "
+            "temperature recorded by NOAA at the Test City Airport Station in degrees "
+            "Celsius on September 10. The resolution source is "
+            "https://www.weather.gov/wrh/timeseries?site=test and measures temperatures "
+            "to whole degrees Celsius."
+        ),
+        observation_date=observation_date,
+        markets=[
+            MarketDefinition(
+                id="deferred-market",
+                slug="deferred-market",
+                question="Will the highest temperature be 20°C?",
+                group_item_title="20°C",
+                asset_id="deferred-asset",
+                condition_id="deferred-condition",
+                end_date=now + timedelta(hours=1),
+                accepting_orders=True,
+                fee_rate=Decimal(0),
+                fee_exponent=Decimal(0),
+                fee_taker_only=False,
+            )
+        ],
+    )
+    observation = ObservationHistory(
+        station_id="TEST",
+        station_name="Test City Airport",
+        station_timezone="UTC",
+        source_url="https://www.weather.gov/wrh/timeseries?site=test",
+        observation_date=observation_date,
+        fetched_at_utc=now,
+        day_started=False,
+        day_finished=False,
+        expected_cadence_minutes=60,
+        observations=[],
+        observed_max_c=None,
+        displayed_max_c=None,
+        latest_observed_at_utc=None,
+        stale=False,
+    )
+    forecast = WeatherForecast(
+        provider="test-ensemble",
+        requested_location="Test City",
+        matched_location="Test City Airport",
+        latitude=1,
+        longitude=2,
+        timezone="UTC",
+        observation_date=observation_date,
+        unit="C",
+        fetched_at=now,
+        member_values=[20.5] * 20,
+    )
+    snapshot = MarketSnapshot(
+        event_id=event.id,
+        event_slug=event.slug,
+        event_title=event.title,
+        market_id="deferred-market",
+        market_slug="deferred-market",
+        market_question=event.markets[0].question,
+        outcome_label="20°C",
+        asset_id="deferred-asset",
+        token_id="deferred-token",
+        condition_id="deferred-condition",
+        end_date=event.markets[0].end_date,
+        accepting_orders=True,
+        book_timestamp=now,
+        book_hash="deferred-book",
+        bids=[],
+        asks=[BookLevel(price=Decimal("0.10"), size=Decimal(100))],
+        min_order_size=Decimal(5),
+        tick_size=Decimal("0.01"),
+        fee_rate=Decimal(0),
+        fee_exponent=Decimal(0),
+        fee_taker_only=False,
+    )
+    return event, observation, forecast, snapshot
+
+
+def test_primary_lane_defers_ecmwf_shadow_until_after_market_snapshots() -> None:
+    event, observation, forecast, market_snapshot = _deferred_event_payload()
+
+    class FakeStorage:
+        calls: list[str] = []
+
+        def record_observation_history(self, run_id, event_id, value):  # noqa: ANN001
+            self.calls.append("observation")
+
+        def record_weather(self, run_id, event_id, value):  # noqa: ANN001
+            self.calls.append("weather")
+
+        def record_weathernext_snapshot(self, run_id, event_id, value):  # noqa: ANN001
+            self.calls.append("weathernext")
+
+        def record_market_snapshot(self, run_id, value):  # noqa: ANN001
+            self.calls.append("market")
+
+    class FakeForecasts:
+        def __init__(self):
+            self.registrations: list[Any] = []
+            self.store = SimpleNamespace()
+
+        def record_open_meteo(self, **kwargs):  # noqa: ANN003
+            return 101
+
+        def register_evaluation_event(self, item):  # noqa: ANN001
+            self.registrations.append(item)
+            return 202
+
+    class FailingAdapter:
+        calls = 0
+
+        def forecast_from_baseline(self, baseline):  # noqa: ANN001
+            self.calls += 1
+            raise AssertionError("ECMWF must not run in the primary lane")
+
+    scanner = Scanner.__new__(Scanner)
+    scanner.settings = cast(
+        Any,
+        Settings(
+            ecmwf_enabled=True,
+            forecast_v2_enabled=True,
+            shadow_research_enabled=True,
+        ),
+    )
+    scanner.storage = cast(Any, FakeStorage())
+    scanner.weather = cast(
+        Any,
+        SimpleNamespace(
+            forecast=lambda rules: forecast,
+            probability=lambda **kwargs: 0.60,
+        ),
+    )
+    scanner.observations = cast(Any, SimpleNamespace(fetch=lambda rules: observation))
+    scanner.weathernext = cast(
+        Any,
+        SimpleNamespace(
+            snapshot_for=lambda rules: None,
+            status=lambda: SimpleNamespace(state="access_pending"),
+        ),
+    )
+    scanner.forecasts = cast(Any, FakeForecasts())
+    scanner.ecmwf = cast(Any, FailingAdapter())
+    scanner._background_research_enabled = True
+    gateway = cast(Any, SimpleNamespace(get_snapshot=lambda **kwargs: market_snapshot))
+    jobs: list[Any] = []
+
+    decisions, errors = scanner._scan_event(  # noqa: SLF001
+        run_id=77,
+        gateway=gateway,
+        event=event,
+        use_astra=False,
+        paper=True,
+        shadow_jobs=jobs,
+    )
+
+    assert errors == []
+    assert len(decisions) == 1
+    assert len(jobs) == 1
+    assert scanner.ecmwf.calls == 0
+    assert scanner.storage.calls[-1] == "market"
+    registration = scanner.forecasts.registrations[0]
+    by_version = {item.algorithm_version: item for item in registration.algorithms}
+    for version in (ECMWF_RAW_ALGORITHM_VERSION, FORECAST_V2_ALGORITHM_VERSION):
+        assert by_version[version].status == ForecastAlgorithmAttemptStatus.SOURCE_UNAVAILABLE
+        assert by_version[version].reason_codes == ["SHADOW_DEFERRED"]
+    assert jobs[0].scan_run_id == 77
+    assert jobs[0].event_id == event.id
+
+
+def test_ecmwf_shadow_worker_preserves_scan_run_and_updates_attempts(monkeypatch) -> None:
+    event, observation, forecast, _ = _deferred_event_payload()
+    from polybot.rules import build_brackets, deterministic_rule_audit
+
+    class FakeAdapter:
+        def __init__(self, settings):  # noqa: ANN001
+            pass
+
+        def forecast_from_baseline(self, baseline):  # noqa: ANN001
+            return SimpleNamespace(member_max_c=[Decimal("20")] * 20)
+
+    class FakeProfile:
+        state = "insufficient_history"
+
+        def as_metadata(self):
+            return {"state": self.state}
+
+    class FakeCalibrator:
+        def __init__(self, settings, store):  # noqa: ANN001
+            pass
+
+        def profile(self, **kwargs):  # noqa: ANN003
+            return FakeProfile()
+
+    result = SimpleNamespace(
+        raw_probabilities={"deferred-market": Decimal("1")},
+        v2_probabilities={"deferred-market": Decimal("1")},
+        raw_point_c=Decimal("20"),
+        v2_point_c=Decimal("20"),
+        corrected_member_max_c=(Decimal("20"),) * 20,
+        profile=FakeProfile(),
+        intraday_features={},
+    )
+    monkeypatch.setattr("polybot.scanner.OpenMeteoEcmwfIfsEns", FakeAdapter)
+    monkeypatch.setattr("polybot.scanner.ForecastV2Calibrator", FakeCalibrator)
+    monkeypatch.setattr("polybot.scanner.build_v2_forecast", lambda **kwargs: result)
+
+    class FakeStore:
+        def __init__(self):
+            self.attempts: list[dict[str, Any]] = []
+
+        def update_algorithm_attempt(self, **kwargs):  # noqa: ANN003
+            self.attempts.append(kwargs)
+
+    class FakeEngine:
+        def __init__(self):
+            self.store = FakeStore()
+            self.records: list[dict[str, Any]] = []
+
+        def record_ecmwf_shadow(self, **kwargs):  # noqa: ANN003
+            self.records.append(kwargs)
+            return 501 + len(self.records)
+
+    scanner = Scanner.__new__(Scanner)
+    scanner.settings = cast(Any, Settings(ecmwf_enabled=True, forecast_v2_enabled=True))
+    scanner.storage = cast(Any, SimpleNamespace())
+    engine = FakeEngine()
+    scanner_job = _EcmwfShadowJob(
+        scan_run_id=88,
+        event_id=event.id,
+        audit=deterministic_rule_audit(event),
+        brackets=build_brackets(event),
+        observation_history=observation,
+        baseline_forecast=forecast,
+    )
+
+    completed, failed, errors = scanner._run_ecmwf_shadow_jobs(  # noqa: SLF001
+        (scanner_job,),
+        forecast_engine=cast(Any, engine),
+    )
+
+    assert (completed, failed, errors) == (1, 0, [])
+    assert [item["scan_run_id"] for item in engine.records] == [88, 88]
+    assert {item["algorithm_version"] for item in engine.records} == {
+        ECMWF_RAW_ALGORITHM_VERSION,
+        FORECAST_V2_ALGORITHM_VERSION,
+    }
+    assert {(item["algorithm_version"], item["status"]) for item in engine.store.attempts} == {
+        (ECMWF_RAW_ALGORITHM_VERSION, ForecastAlgorithmAttemptStatus.PREDICTED),
+        (FORECAST_V2_ALGORITHM_VERSION, ForecastAlgorithmAttemptStatus.PREDICTED),
+    }

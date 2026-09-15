@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
@@ -36,6 +37,7 @@ from polybot.models import (
     RuleAudit,
     RuleInterpretation,
     ScanReport,
+    WeatherForecast,
 )
 from polybot.observations import (
     ObservationHistory,
@@ -58,6 +60,24 @@ class _ShadowResearchResult:
     outcome_pending: int
     extra_registered: int
     status: str
+
+
+@dataclass(frozen=True, slots=True)
+class _EcmwfShadowJob:
+    """Immutable input captured by the primary lane for deferred ECMWF work.
+
+    The primary lane has already validated the event, fetched observations, and
+    recorded every market snapshot by the time this job is submitted.  The
+    worker therefore only produces shadow forecast artifacts; it never has
+    enough information to create a decision or paper order.
+    """
+
+    scan_run_id: int
+    event_id: str
+    audit: RuleAudit
+    brackets: dict[str, Bracket]
+    observation_history: ObservationHistory
+    baseline_forecast: WeatherForecast
 
 
 class Scanner:
@@ -115,6 +135,7 @@ class Scanner:
         markets_scanned = 0
         active_event_ids: set[str] = set()
         candidate_event_ids: set[str] = set()
+        shadow_jobs: list[_EcmwfShadowJob] = []
         weather_next_status = self.weathernext.status().model_dump(mode="json")
 
         try:
@@ -151,6 +172,7 @@ class Scanner:
                         use_astra=use_astra,
                         paper=paper,
                         allow_paper_open=False,
+                        shadow_jobs=shadow_jobs,
                     )
                     errors.extend(event_errors)
                     markets_scanned += len(event_decisions)
@@ -172,6 +194,7 @@ class Scanner:
                         use_astra=use_astra,
                         paper=paper,
                         allow_paper_open=True,
+                        shadow_jobs=shadow_jobs,
                     )
                     errors.extend(event_errors)
                     markets_scanned += len(event_decisions)
@@ -189,6 +212,7 @@ class Scanner:
                 parent_scan_run_id=run_id,
                 query=query,
                 excluded_event_ids=active_event_ids | candidate_event_ids,
+                shadow_jobs=tuple(shadow_jobs),
             )
 
             self.storage.finish_scan(
@@ -246,6 +270,7 @@ class Scanner:
         parent_scan_run_id: int,
         query: str,
         excluded_event_ids: set[str],
+        shadow_jobs: Sequence[_EcmwfShadowJob] = (),
     ) -> None:
         """Launch at most one no-queue research batch beside the v1 lane."""
 
@@ -276,7 +301,8 @@ class Scanner:
             )
         )
         extra_requested = self.settings.shadow_extra_max_events
-        if not outcome_event_ids and extra_requested == 0:
+        shadow_jobs = tuple(shadow_jobs)
+        if not outcome_event_ids and extra_requested == 0 and not shadow_jobs:
             return
         research_run_id = self.storage.start_shadow_research(
             parent_scan_run_id=parent_scan_run_id,
@@ -302,6 +328,7 @@ class Scanner:
                 excluded_event_ids=frozenset(excluded_event_ids),
                 outcome_event_ids=tuple(outcome_event_ids),
                 extra_requested=extra_requested,
+                shadow_jobs=shadow_jobs,
             )
         except Exception as error:
             self.storage.finish_shadow_research(
@@ -321,12 +348,22 @@ class Scanner:
         excluded_event_ids: frozenset[str],
         outcome_event_ids: tuple[str, ...],
         extra_requested: int,
+        shadow_jobs: tuple[_EcmwfShadowJob, ...] = (),
     ) -> _ShadowResearchResult:
-        """Refresh outcomes and register extra metadata with independent clients."""
+        """Run bounded research without sharing the primary decision client.
+
+        Outcome refreshes and discovery retain their existing order.  Deferred
+        ECMWF/v2 jobs run only after that position-supporting work and use a
+        separate forecast store instance.  They never call the market decision
+        or paper-order paths.
+        """
 
         outcome_completed = 0
         outcome_pending = 0
         extra_registered = 0
+        shadow_completed = 0
+        shadow_failed = 0
+        shadow_errors: list[str] = []
         status = "completed"
         terminal_error: str | None = None
         observations = StationObservationCollector(self.settings)
@@ -370,8 +407,31 @@ class Scanner:
                         extra_events,
                     )
         except Exception as error:
-            status = "partial" if outcome_completed or outcome_pending else "failed"
             terminal_error = str(error)
+
+        if shadow_jobs:
+            shadow_completed, shadow_failed, shadow_errors = self._run_ecmwf_shadow_jobs(
+                shadow_jobs,
+                forecast_engine=forecasts,
+            )
+
+        if shadow_failed:
+            status = "partial" if (
+                outcome_completed
+                or outcome_pending
+                or extra_registered
+                or shadow_completed
+            ) else "failed"
+            shadow_summary = "; ".join(shadow_errors[:4])
+            terminal_error = "; ".join(
+                item for item in (terminal_error, shadow_summary) if item
+            ) or "one or more ECMWF/v2 shadow jobs failed"
+        elif terminal_error:
+            status = (
+                "partial"
+                if outcome_completed or outcome_pending or extra_registered
+                else "failed"
+            )
 
         self.storage.finish_shadow_research(
             research_run_id,
@@ -388,6 +448,184 @@ class Scanner:
             status=status,
         )
 
+    def _run_ecmwf_shadow_jobs(
+        self,
+        jobs: tuple[_EcmwfShadowJob, ...],
+        *,
+        forecast_engine: ForecastEngineV2,
+    ) -> tuple[int, int, list[str]]:
+        """Fetch/build/archive only ECMWF/v2 artifacts for deferred jobs.
+
+        Each job is isolated so a slow or malformed provider response cannot
+        prevent later jobs from being attempted.  Registry attempt rows are
+        updated through ``ForecastStore.update_algorithm_attempt`` using the
+        original scan run id; no v1 decision or order is touched here.
+        """
+
+        adapter = OpenMeteoEcmwfIfsEns(self.settings)
+        completed = 0
+        failed = 0
+        errors: list[str] = []
+        for job in jobs:
+            try:
+                snapshot = adapter.forecast_from_baseline(job.baseline_forecast)
+                issued_at = datetime.now(UTC)
+                profile = ForecastV2Calibrator(
+                    self.settings,
+                    forecast_engine.store,
+                ).profile(
+                    station_id=job.observation_history.station_id,
+                    as_of_utc=issued_at,
+                )
+                result = build_v2_forecast(
+                    snapshot=snapshot,
+                    observations=job.observation_history,
+                    brackets=job.brackets,
+                    profile=profile,
+                    issued_at_utc=issued_at,
+                )
+            except Exception as error:
+                failed += 1
+                message = f"event {job.event_id}: ECMWF/v2 shadow unavailable: {error}"
+                errors.append(message[:500])
+                self._update_shadow_attempt(
+                    forecast_engine,
+                    scan_run_id=job.scan_run_id,
+                    event_id=job.event_id,
+                    algorithm_version=ECMWF_RAW_ALGORITHM_VERSION,
+                    status=ForecastAlgorithmAttemptStatus.SOURCE_UNAVAILABLE,
+                    reason_codes=["SHADOW_SOURCE_UNAVAILABLE"],
+                )
+                self._update_shadow_attempt(
+                    forecast_engine,
+                    scan_run_id=job.scan_run_id,
+                    event_id=job.event_id,
+                    algorithm_version=FORECAST_V2_ALGORITHM_VERSION,
+                    status=ForecastAlgorithmAttemptStatus.SOURCE_UNAVAILABLE,
+                    reason_codes=["SHADOW_SOURCE_UNAVAILABLE"],
+                )
+                continue
+
+            raw_prediction_id: int | None = None
+            try:
+                raw_prediction_id = forecast_engine.record_ecmwf_shadow(
+                    scan_run_id=job.scan_run_id,
+                    event_id=job.event_id,
+                    audit=job.audit,
+                    snapshot=snapshot,
+                    brackets=job.brackets,
+                    probabilities=result.raw_probabilities,
+                    observations=job.observation_history,
+                    algorithm_version=ECMWF_RAW_ALGORITHM_VERSION,
+                    point_forecast_c=result.raw_point_c,
+                    include_observations=False,
+                    metadata={
+                        "uses_station_correction": False,
+                        "uses_observations": False,
+                        "distribution": "empirical_50_member",
+                        "shadow_lane": "bounded_background",
+                    },
+                    issued_at_utc=issued_at,
+                )
+            except Exception as error:
+                failed += 1
+                errors.append(
+                    f"event {job.event_id}: raw ECMWF forecast archive failed: {error}"[:500]
+                )
+                self._update_shadow_attempt(
+                    forecast_engine,
+                    scan_run_id=job.scan_run_id,
+                    event_id=job.event_id,
+                    algorithm_version=ECMWF_RAW_ALGORITHM_VERSION,
+                    status=ForecastAlgorithmAttemptStatus.PERSIST_FAILED,
+                    reason_codes=["SHADOW_ARCHIVE_FAILED"],
+                )
+            else:
+                self._update_shadow_attempt(
+                    forecast_engine,
+                    scan_run_id=job.scan_run_id,
+                    event_id=job.event_id,
+                    algorithm_version=ECMWF_RAW_ALGORITHM_VERSION,
+                    status=ForecastAlgorithmAttemptStatus.PREDICTED,
+                    prediction_id=raw_prediction_id,
+                )
+
+            try:
+                v2_prediction_id = forecast_engine.record_ecmwf_shadow(
+                    scan_run_id=job.scan_run_id,
+                    event_id=job.event_id,
+                    audit=job.audit,
+                    snapshot=snapshot,
+                    brackets=job.brackets,
+                    probabilities=result.v2_probabilities,
+                    observations=job.observation_history,
+                    algorithm_version=FORECAST_V2_ALGORITHM_VERSION,
+                    adjusted_member_max_c=result.corrected_member_max_c,
+                    observed_floor_c=job.observation_history.observed_max_c,
+                    point_forecast_c=result.v2_point_c,
+                    metadata={
+                        "uses_station_correction": result.profile.state == "fitted",
+                        "uses_observations": True,
+                        "station_correction": result.profile.as_metadata(),
+                        "intraday_features": result.intraday_features,
+                        "distribution": "bias_spread_corrected_truncated_normal_mixture",
+                        "shadow_lane": "bounded_background",
+                    },
+                    issued_at_utc=issued_at,
+                )
+            except Exception as error:
+                failed += 1
+                errors.append(
+                    f"event {job.event_id}: v2 ECMWF forecast archive failed: {error}"[:500]
+                )
+                self._update_shadow_attempt(
+                    forecast_engine,
+                    scan_run_id=job.scan_run_id,
+                    event_id=job.event_id,
+                    algorithm_version=FORECAST_V2_ALGORITHM_VERSION,
+                    status=ForecastAlgorithmAttemptStatus.PERSIST_FAILED,
+                    reason_codes=["SHADOW_ARCHIVE_FAILED"],
+                )
+            else:
+                completed += 1
+                self._update_shadow_attempt(
+                    forecast_engine,
+                    scan_run_id=job.scan_run_id,
+                    event_id=job.event_id,
+                    algorithm_version=FORECAST_V2_ALGORITHM_VERSION,
+                    status=ForecastAlgorithmAttemptStatus.PREDICTED,
+                    prediction_id=v2_prediction_id,
+                )
+
+        return completed, failed, errors
+
+    @staticmethod
+    def _update_shadow_attempt(
+        forecast_engine: ForecastEngineV2,
+        *,
+        scan_run_id: int,
+        event_id: str,
+        algorithm_version: str,
+        status: ForecastAlgorithmAttemptStatus,
+        prediction_id: int | None = None,
+        reason_codes: list[str] | None = None,
+    ) -> None:
+        """Best-effort registry update; telemetry must not fail the worker."""
+
+        try:
+            forecast_engine.store.update_algorithm_attempt(
+                scan_run_id=scan_run_id,
+                event_id=event_id,
+                algorithm_version=algorithm_version,
+                status=status,
+                prediction_id=prediction_id,
+                reason_codes=reason_codes,
+            )
+        except Exception:
+            # The immutable forecast artifact (or source failure) remains the
+            # source of truth even if a late registry update cannot be written.
+            return
+
     def _process_event(
         self,
         *,
@@ -397,6 +635,7 @@ class Scanner:
         use_astra: bool,
         paper: bool,
         allow_paper_open: bool,
+        shadow_jobs: list[_EcmwfShadowJob] | None = None,
     ) -> tuple[list[MarketDecision], int, list[str]]:
         event_decisions, errors = self._scan_event(
             run_id=run_id,
@@ -404,6 +643,7 @@ class Scanner:
             event=event,
             use_astra=use_astra,
             paper=paper,
+            shadow_jobs=shadow_jobs,
         )
         if allow_paper_open:
             final_decisions, opened = self._finalize_event_decisions(event_decisions, paper=paper)
@@ -535,6 +775,7 @@ class Scanner:
         event: EventDefinition,
         use_astra: bool,
         paper: bool,
+        shadow_jobs: list[_EcmwfShadowJob] | None = None,
     ) -> tuple[list[MarketDecision], list[str]]:
         errors: list[str] = []
         deterministic = deterministic_rule_audit(event)
@@ -606,6 +847,13 @@ class Scanner:
         post_event_reused_snapshot = False
         prediction_ids: dict[str, int] = {}
         persist_failures: set[str] = set()
+        deferred_shadow_versions: set[str] = set()
+        deferred_shadow_payload: tuple[
+            RuleAudit,
+            dict[str, Bracket],
+            ObservationHistory,
+            WeatherForecast,
+        ] | None = None
         analysis_rules = deterministic.interpretation
         if analysis_rules.tradeable and brackets and not observation_blockers and not rule_blockers:
             try:
@@ -644,29 +892,50 @@ class Scanner:
                 except Exception as error:
                     errors.append(f"event {event.id}: WeatherNext comparison failed: {error}")
 
-                ecmwf_adapter = getattr(self, "ecmwf", None)
-                if (
-                    self.settings.ecmwf_enabled
-                    and self.settings.forecast_v2_enabled
-                    and ecmwf_adapter is not None
-                    and observation_history is not None
-                ):
-                    try:
-                        ecmwf_snapshot = ecmwf_adapter.forecast_from_baseline(forecast)
-                        issued_at = datetime.now(UTC)
-                        profile = ForecastV2Calibrator(self.settings, self.forecasts.store).profile(
-                            station_id=observation_history.station_id,
-                            as_of_utc=issued_at,
+                ecmwf_enabled = bool(getattr(self.settings, "ecmwf_enabled", False))
+                forecast_v2_enabled = bool(getattr(self.settings, "forecast_v2_enabled", False))
+                if ecmwf_enabled and forecast_v2_enabled and observation_history is not None:
+                    # In the autonomous runner this is the normal path: the
+                    # expensive provider request/calibration is captured as an
+                    # immutable job and executed after the primary lane returns.
+                    # Keep the synchronous branch only for callers that do not
+                    # provide the bounded worker (for example a one-shot CLI
+                    # invocation), preserving that compatibility contract.
+                    if (
+                        shadow_jobs is not None
+                        and getattr(self, "_background_research_enabled", False)
+                    ):
+                        deferred_shadow_payload = (
+                            audit,
+                            brackets,
+                            observation_history,
+                            forecast,
                         )
-                        v2_result = build_v2_forecast(
-                            snapshot=ecmwf_snapshot,
-                            observations=observation_history,
-                            brackets=brackets,
-                            profile=profile,
-                            issued_at_utc=issued_at,
+                        deferred_shadow_versions.update(
+                            (ECMWF_RAW_ALGORITHM_VERSION, FORECAST_V2_ALGORITHM_VERSION)
                         )
-                    except Exception as error:
-                        errors.append(f"event {event.id}: ECMWF/v2 shadow failed: {error}")
+                    else:
+                        ecmwf_adapter = getattr(self, "ecmwf", None)
+                        if ecmwf_adapter is not None:
+                            try:
+                                ecmwf_snapshot = ecmwf_adapter.forecast_from_baseline(forecast)
+                                issued_at = datetime.now(UTC)
+                                profile = ForecastV2Calibrator(
+                                    self.settings,
+                                    self.forecasts.store,
+                                ).profile(
+                                    station_id=observation_history.station_id,
+                                    as_of_utc=issued_at,
+                                )
+                                v2_result = build_v2_forecast(
+                                    snapshot=ecmwf_snapshot,
+                                    observations=observation_history,
+                                    brackets=brackets,
+                                    profile=profile,
+                                    issued_at_utc=issued_at,
+                                )
+                            except Exception as error:
+                                errors.append(f"event {event.id}: ECMWF/v2 shadow failed: {error}")
             except Exception as error:
                 # Once a station-local day has passed, an ensemble endpoint
                 # may no longer serve that date. Reuse the last immutable model
@@ -775,6 +1044,35 @@ class Scanner:
                 event_decisions.append(decision)
             except Exception as error:
                 errors.append(f"event {event.id}, market {market.id}: snapshot failed: {error}")
+
+        # Queue ECMWF/v2 only after every market snapshot for this run exists;
+        # ForecastStore.record() links each probability to that immutable
+        # snapshot set.  A partial market read therefore remains diagnostic and
+        # cannot produce a misleading shadow prediction.
+        if (
+            deferred_shadow_payload is not None
+            and shadow_jobs is not None
+            and len(event_decisions) == len(event.markets)
+            and event.markets
+        ):
+            deferred_audit, deferred_brackets, deferred_observations, deferred_forecast = (
+                deferred_shadow_payload
+            )
+            shadow_jobs.append(
+                _EcmwfShadowJob(
+                    scan_run_id=run_id,
+                    event_id=event.id,
+                    audit=deferred_audit.model_copy(deep=True),
+                    brackets={
+                        market_id: bracket.model_copy(deep=True)
+                        for market_id, bracket in deferred_brackets.items()
+                    },
+                    observation_history=deferred_observations.model_copy(deep=True),
+                    baseline_forecast=deferred_forecast.model_copy(deep=True),
+                )
+            )
+        elif deferred_shadow_payload is not None:
+            deferred_shadow_versions.clear()
 
         # Shadow forecasts are persisted only after every same-run market
         # snapshot exists. Failures are diagnostic and never alter v1 actions.
@@ -888,6 +1186,7 @@ class Scanner:
             baseline_model=("open-meteo-ensemble" if forecast is None else forecast.provider),
             prediction_ids=prediction_ids,
             persist_failures=persist_failures,
+            deferred_shadow_versions=deferred_shadow_versions,
             errors=errors,
         )
         return event_decisions, errors
@@ -909,6 +1208,7 @@ class Scanner:
         prediction_ids: dict[str, int],
         persist_failures: set[str],
         errors: list[str],
+        deferred_shadow_versions: set[str] | None = None,
     ) -> None:
         forecast_engine = getattr(self, "forecasts", None)
         if forecast_engine is None:
@@ -926,6 +1226,7 @@ class Scanner:
             cohort_blockers.append("FORECAST_RULE_FORMAT_UNSUPPORTED")
         blockers = list(dict.fromkeys(cohort_blockers + readiness_blockers))
         warnings = list(dict.fromkeys(rule_warnings + observation_warnings))
+        deferred_shadow_versions = deferred_shadow_versions or set()
         eligible = not cohort_blockers
         if not eligible:
             stage = ForecastEligibilityStage.INELIGIBLE
@@ -955,6 +1256,8 @@ class Scanner:
                 return blockers
             if version in persist_failures:
                 return ["FORECAST_ARCHIVE_FAILED"]
+            if version in deferred_shadow_versions:
+                return ["SHADOW_DEFERRED"]
             if readiness_blockers:
                 return readiness_blockers
             if version not in prediction_ids:
