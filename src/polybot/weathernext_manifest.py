@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import re
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, time, timedelta
@@ -867,6 +868,28 @@ def build_full_ensemble_read_manifest(
             )
             for _, item in target_items
         ),
+        # The existing selected_chunk_logical_bytes field is intentionally a
+        # per-target sum and may count a shared object more than once.  Keep an
+        # explicit unique logical total next to it so operators can distinguish
+        # provenance accounting from the deduplicated compressed transfer.
+        "selected_chunk_logical_bytes_per_target_sum": sum(
+            _integer(
+                _mapping(_mapping(item, field="estimate").get("array"), field="array").get(
+                    "selected_chunk_logical_bytes", 0
+                ),
+                field="selected_chunk_logical_bytes",
+            )
+            for _, item in target_items
+        ),
+        "unique_selected_chunk_logical_bytes": (
+            _integer(first_array_signature.get("dtype_size_bytes", 0), field="dtype_size_bytes")
+            * math.prod(
+                _integer(value, field="chunk_shape")
+                for value in cast(Sequence[object], first_array_signature.get("chunk_shape", []))
+            )
+            * object_count
+        ),
+        "selected_chunk_logical_bytes_basis": "per_target_sum_shared_objects_may_repeat",
         "unique_compressed_object_count": object_count,
         "compressed_object_count_with_size": sum(
             1 for item in sorted_objects if item.compressed_bytes is not None

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -108,6 +109,15 @@ def test_batch_manifest_deduplicates_shared_chunks_and_stays_closed(tmp_path: Pa
     assert manifest.approval_gate.object_count == 3
     assert manifest.approval_gate.expected_network_bytes == 700
     assert manifest.array["global_array_is_not_mandatory_transfer"] is True
+    assert (
+        manifest.array["selected_chunk_logical_bytes_per_target_sum"]
+        == manifest.array["selected_chunk_logical_bytes"]
+    )
+    assert cast(int, manifest.array["unique_selected_chunk_logical_bytes"]) > 0
+    assert (
+        manifest.array["selected_chunk_logical_bytes_basis"]
+        == "per_target_sum_shared_objects_may_repeat"
+    )
     assert len(manifest.targets) == 2
     shared = [item for item in manifest.compressed_objects if len(item.target_ids) == 2]
     assert len(shared) == 1
