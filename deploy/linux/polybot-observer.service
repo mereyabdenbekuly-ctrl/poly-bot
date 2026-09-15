@@ -1,0 +1,32 @@
+[Unit]
+Description=Polybot autonomous paper observer
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=polybot
+Group=polybot
+WorkingDirectory=/opt/polybot
+EnvironmentFile=/etc/polybot/polybot.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/env POLYBOT_DATABASE_PATH=/var/lib/polybot/polybot.sqlite3 POLYBOT_ECMWF_JSON_ARCHIVE_ROOT=/var/lib/polybot/forecasts/ecmwf-ifs025-json POLYBOT_WEATHERNEXT_STATISTICS_SNAPSHOT_PATH=/var/lib/polybot/weathernext-statistics-snapshot.json /opt/polybot/.venv/bin/polybot run --interval 300 --paper
+Restart=always
+RestartSec=30
+TimeoutStopSec=120
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/polybot
+
+[Install]
+WantedBy=multi-user.target

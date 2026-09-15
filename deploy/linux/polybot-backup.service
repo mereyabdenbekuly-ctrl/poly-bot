@@ -1,0 +1,22 @@
+[Unit]
+Description=Back up Polybot SQLite state
+
+[Service]
+Type=oneshot
+User=polybot
+Group=polybot
+WorkingDirectory=/opt/polybot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/polybot/.venv/bin/python /opt/polybot/scripts/backup-state.py --database /var/lib/polybot/polybot.sqlite3 --root /var/lib/polybot/backups --keep 12
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+ReadWritePaths=/var/lib/polybot

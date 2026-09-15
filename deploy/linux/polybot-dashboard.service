@@ -1,0 +1,30 @@
+[Unit]
+Description=Polybot read-only dashboard
+After=network.target polybot-observer.service
+
+[Service]
+Type=simple
+User=polybot
+Group=polybot
+WorkingDirectory=/opt/polybot
+Environment=PYTHONUNBUFFERED=1
+Environment=POLYBOT_DATABASE_PATH=/var/lib/polybot/polybot.sqlite3
+ExecStart=/opt/polybot/.venv/bin/polybot dashboard --host 127.0.0.1 --port 8787
+Restart=always
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/var/lib/polybot
+
+[Install]
+WantedBy=multi-user.target

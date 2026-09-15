@@ -1,3 +1,4 @@
+import sqlite3
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
@@ -36,6 +37,25 @@ def decision(*, event_id: str = "event-1", market_id: str = "market-1") -> Marke
         book_hash="hash",
         created_at=datetime.now(UTC),
     )
+
+
+def test_read_only_storage_skips_initialization_and_rejects_writes(tmp_path) -> None:
+    path = tmp_path / "read-only.sqlite3"
+    Storage(path)
+    read_only = Storage(path, read_only=True)
+
+    with read_only.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM scan_runs").fetchone()[0] == 0
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            connection.execute("CREATE TABLE forbidden (id INTEGER)")
+
+    with pytest.raises(RuntimeError, match="read-only storage"), read_only.transaction():
+        pass
+
+
+def test_read_only_storage_requires_existing_database(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        Storage(tmp_path / "missing.sqlite3", read_only=True)
 
 
 def test_api_budget_reserves_atomically(tmp_path) -> None:

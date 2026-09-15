@@ -1,0 +1,25 @@
+[Unit]
+Description=Archive official ECMWF IFS ENS byte ranges for Polybot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=polybot
+Group=polybot
+WorkingDirectory=/opt/polybot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/polybot/.venv/bin/python /opt/polybot/scripts/collect-ecmwf-open-data.py --database /var/lib/polybot/polybot.sqlite3 --archive-root /var/lib/polybot/forecasts/ecmwf-open-data --hours 24
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/polybot

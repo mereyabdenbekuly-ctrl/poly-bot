@@ -42,20 +42,33 @@ class PaperRiskRejectedError(RuntimeError):
 
 
 class Storage:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, read_only: bool = False) -> None:
         self.path = path.expanduser().resolve()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._initialize()
+        self.read_only = read_only
+        if self.read_only:
+            if not self.path.is_file():
+                raise FileNotFoundError(f"Polybot database does not exist: {self.path}")
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._initialize()
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30)
+        if self.read_only:
+            connection = sqlite3.connect(f"{self.path.as_uri()}?mode=ro", uri=True, timeout=30)
+        else:
+            connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
+        if self.read_only:
+            connection.execute("PRAGMA query_only = ON")
+        else:
+            connection.execute("PRAGMA journal_mode = WAL")
         return connection
 
     @contextmanager
     def transaction(self, *, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+        if self.read_only:
+            raise RuntimeError("read-only storage cannot start a transaction")
         connection = self.connect()
         try:
             connection.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")

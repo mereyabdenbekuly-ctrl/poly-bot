@@ -206,7 +206,16 @@ def test_explicit_store_prefix_is_normalized_without_listing(tmp_path) -> None:
     assert fake.list_calls == []
 
 
-def test_dynamic_store_discovery_uses_latest_run_not_full_object_listing(tmp_path) -> None:
+def test_dynamic_store_discovery_uses_latest_run_not_full_object_listing(
+    tmp_path, monkeypatch
+) -> None:
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # noqa: ANN001, ANN206
+            value = cls(2026, 9, 14, 23, 59, tzinfo=UTC)
+            return value if tz is None else value.astimezone(tz)
+
+    monkeypatch.setattr("polybot.weathernext.datetime", FrozenDateTime)
     fake = _FakeStorageClient(
         prefix_map={
             "weathernext_3_0_0/zarr/2026_to_present/20260914_": (

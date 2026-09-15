@@ -294,6 +294,50 @@ docker compose logs -f observer
 Не размещайте контейнер в другой стране без повторной проверки `doctor`:
 географическая проверка относится к фактическому IP процесса.
 
+### Linux VPS (systemd)
+
+Production-like paper deployment uses the checked-in units under `deploy/linux`.
+They keep the observer in explicit `--paper` mode, bind the dashboard only to
+`127.0.0.1:8787`, and retain twelve SQLite backups. The official raw ECMWF
+archive timer is installed but must remain disabled until the operator has set
+a storage-retention/free-space policy. The repository contains no live-order
+executor.
+
+Expected paths:
+
+```text
+/opt/polybot                    checkout and locked virtual environment
+/etc/polybot/polybot.env        secrets/config, root:polybot mode 0640
+/var/lib/polybot                SQLite, snapshots, forecasts, backups
+```
+
+The VPS environment file must use absolute state paths (the observer unit also
+pins these at execution time):
+
+```env
+POLYBOT_DATABASE_PATH=/var/lib/polybot/polybot.sqlite3
+POLYBOT_ECMWF_JSON_ARCHIVE_ROOT=/var/lib/polybot/forecasts/ecmwf-ifs025-json
+POLYBOT_WEATHERNEXT_STATISTICS_SNAPSHOT_PATH=/var/lib/polybot/weathernext-statistics-snapshot.json
+```
+
+After installing the locked environment, run `deploy/linux/install-systemd.sh`
+as root, restore a consistent SQLite backup, and only then enable the units:
+
+```bash
+install -o polybot -g polybot -m 0600 BACKUP.sqlite3 /var/lib/polybot/polybot.sqlite3
+systemctl enable --now polybot-observer.service polybot-dashboard.service
+systemctl enable --now polybot-backup.timer
+```
+
+Do not enable `polybot-ecmwf-archive.timer` merely as part of deployment: its
+raw archive is intentionally immutable and currently has no automatic pruning.
+
+Do not expose port 8787 publicly. Use a local SSH tunnel instead:
+
+```bash
+ssh -N -L 8787:127.0.0.1:8787 root@SERVER_IP
+```
+
 ## Команды
 
 ```text

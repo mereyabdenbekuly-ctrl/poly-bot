@@ -255,8 +255,11 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "comparison":
         _comparison(settings, as_json=args.as_json)
         return
-    settings.ensure_runtime_directories()
-    storage = Storage(settings.database_path)
+    if args.command == "dashboard":
+        storage = Storage(settings.database_path, read_only=True)
+    else:
+        settings.ensure_runtime_directories()
+        storage = Storage(settings.database_path)
 
     try:
         if args.command == "doctor":

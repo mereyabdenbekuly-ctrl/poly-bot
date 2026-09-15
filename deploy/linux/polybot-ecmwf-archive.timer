@@ -1,0 +1,10 @@
+[Unit]
+Description=Archive ECMWF IFS ENS every 6 hours
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:15:00 UTC
+AccuracySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
