@@ -24,7 +24,9 @@ RestrictSUIDSGID=true
 LockPersonality=true
 CapabilityBoundingSet=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadOnlyPaths=/var/lib/polybot
+# SQLite WAL readers may create/update the shared-memory sidecar even though
+# every application connection is opened with mode=ro and PRAGMA query_only.
+ReadWritePaths=/var/lib/polybot
 
 [Install]
 WantedBy=multi-user.target
