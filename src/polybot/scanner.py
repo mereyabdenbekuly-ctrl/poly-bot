@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
@@ -49,8 +52,22 @@ from polybot.weather import OpenMeteoEnsemble
 from polybot.weathernext import WeatherNextProvider
 
 
+@dataclass(frozen=True, slots=True)
+class _ShadowResearchResult:
+    outcome_completed: int
+    outcome_pending: int
+    extra_registered: int
+    status: str
+
+
 class Scanner:
-    def __init__(self, *, settings: Settings, storage: Storage) -> None:
+    def __init__(
+        self,
+        *,
+        settings: Settings,
+        storage: Storage,
+        background_research: bool = False,
+    ) -> None:
         self.settings = settings
         self.storage = storage
         self.weather = OpenMeteoEnsemble(settings)
@@ -58,6 +75,25 @@ class Scanner:
         self.weathernext = WeatherNextProvider(settings)
         self.forecasts = ForecastEngineV2(storage.path, settings=settings)
         self.ecmwf = OpenMeteoEcmwfIfsEns(settings)
+        self._background_research_enabled = bool(
+            background_research and settings.shadow_research_enabled
+        )
+        self._research_executor = (
+            ThreadPoolExecutor(
+                max_workers=settings.shadow_research_workers,
+                thread_name_prefix="polybot-shadow-research",
+            )
+            if self._background_research_enabled
+            else None
+        )
+        self._research_future: Future[_ShadowResearchResult] | None = None
+
+    def close(self, *, wait: bool = True) -> None:
+        executor = self._research_executor
+        if executor is None:
+            return
+        executor.shutdown(wait=wait, cancel_futures=not wait)
+        self._research_executor = None
 
     def scan(
         self,
@@ -77,6 +113,8 @@ class Scanner:
         paper_orders_settled = 0
         events_scanned = 0
         markets_scanned = 0
+        active_event_ids: set[str] = set()
+        candidate_event_ids: set[str] = set()
         weather_next_status = self.weathernext.status().model_dump(mode="json")
 
         try:
@@ -124,6 +162,7 @@ class Scanner:
                     max_events=max_events,
                     excluded_event_ids=active_event_ids,
                 )
+                candidate_event_ids = {event.id for event in candidate_events}
                 for event in candidate_events:
                     events_scanned += 1
                     event_decisions, opened, event_errors = self._process_event(
@@ -139,17 +178,18 @@ class Scanner:
                     paper_orders_opened += opened
                     decisions.extend(event_decisions)
 
-                forecast_store = getattr(self, "forecasts", None)
-                if forecast_store is not None:
-                    for event_id in forecast_store.store.outcome_refresh_event_ids(
-                        correction_window_hours=self.settings.forecast_outcome_monitor_hours
-                    ):
-                        try:
-                            self._record_forecast_outcome(
-                                gateway, event_id, datetime.now(UTC), run_id=run_id
-                            )
-                        except Exception as error:
-                            errors.append(f"event {event_id}: forecast outcome pending: {error}")
+                if not getattr(self, "_background_research_enabled", False):
+                    self._run_inline_outcome_refresh(
+                        gateway=gateway,
+                        run_id=run_id,
+                        errors=errors,
+                    )
+
+            self._schedule_shadow_research(
+                parent_scan_run_id=run_id,
+                query=query,
+                excluded_event_ids=active_event_ids | candidate_event_ids,
+            )
 
             self.storage.finish_scan(
                 run_id,
@@ -174,6 +214,179 @@ class Scanner:
                 error=str(error),
             )
             raise
+
+    def _run_inline_outcome_refresh(
+        self,
+        *,
+        gateway: PolymarketGateway,
+        run_id: int,
+        errors: list[str],
+    ) -> None:
+        """Compatibility path when the optional background lane is disabled."""
+
+        forecast_store = getattr(self, "forecasts", None)
+        if forecast_store is None:
+            return
+        for event_id in forecast_store.store.outcome_refresh_event_ids(
+            correction_window_hours=self.settings.forecast_outcome_monitor_hours
+        ):
+            try:
+                self._record_forecast_outcome(
+                    gateway,
+                    event_id,
+                    datetime.now(UTC),
+                    run_id=run_id,
+                )
+            except Exception as error:
+                errors.append(f"event {event_id}: forecast outcome pending: {error}")
+
+    def _schedule_shadow_research(
+        self,
+        *,
+        parent_scan_run_id: int,
+        query: str,
+        excluded_event_ids: set[str],
+    ) -> None:
+        """Launch at most one no-queue research batch beside the v1 lane."""
+
+        if not getattr(self, "_background_research_enabled", False):
+            return
+        future = getattr(self, "_research_future", None)
+        if future is not None:
+            if not future.done():
+                self.storage.record_shadow_research_skip(
+                    parent_scan_run_id=parent_scan_run_id,
+                    reason="previous bounded research batch is still running; no work queued",
+                )
+                return
+            # The worker persists its own terminal state. Reaping only releases
+            # the single scheduler slot; research failures never fail a v1 scan.
+            with suppress(Exception):
+                future.result()
+            self._research_future = None
+
+        forecast_engine = getattr(self, "forecasts", None)
+        outcome_event_ids = (
+            []
+            if forecast_engine is None
+            else forecast_engine.store.outcome_refresh_event_ids(
+                correction_window_hours=self.settings.forecast_outcome_monitor_hours,
+                cohort_version="weather-evaluation-v1",
+                limit=self.settings.shadow_outcome_batch_size,
+            )
+        )
+        extra_requested = self.settings.shadow_extra_max_events
+        if not outcome_event_ids and extra_requested == 0:
+            return
+        research_run_id = self.storage.start_shadow_research(
+            parent_scan_run_id=parent_scan_run_id,
+            outcome_requested=len(outcome_event_ids),
+            extra_requested=extra_requested,
+        )
+        executor = self._research_executor
+        if executor is None:
+            self.storage.finish_shadow_research(
+                research_run_id,
+                status="failed",
+                outcome_completed=0,
+                outcome_pending=len(outcome_event_ids),
+                extra_registered=0,
+                error="shadow research executor is unavailable",
+            )
+            return
+        try:
+            self._research_future = executor.submit(
+                self._run_shadow_research,
+                research_run_id=research_run_id,
+                query=query,
+                excluded_event_ids=frozenset(excluded_event_ids),
+                outcome_event_ids=tuple(outcome_event_ids),
+                extra_requested=extra_requested,
+            )
+        except Exception as error:
+            self.storage.finish_shadow_research(
+                research_run_id,
+                status="failed",
+                outcome_completed=0,
+                outcome_pending=len(outcome_event_ids),
+                extra_registered=0,
+                error=str(error),
+            )
+
+    def _run_shadow_research(
+        self,
+        *,
+        research_run_id: int,
+        query: str,
+        excluded_event_ids: frozenset[str],
+        outcome_event_ids: tuple[str, ...],
+        extra_requested: int,
+    ) -> _ShadowResearchResult:
+        """Refresh outcomes and register extra metadata with independent clients."""
+
+        outcome_completed = 0
+        outcome_pending = 0
+        extra_registered = 0
+        status = "completed"
+        terminal_error: str | None = None
+        observations = StationObservationCollector(self.settings)
+        forecasts = ForecastEngineV2(self.storage.path, settings=self.settings)
+        try:
+            with PolymarketGateway() as gateway:
+                for event_id in outcome_event_ids:
+                    attempted_at = datetime.now(UTC)
+                    try:
+                        self._record_forecast_outcome(
+                            gateway,
+                            event_id,
+                            attempted_at,
+                            observation_collector=observations,
+                            forecast_engine=forecasts,
+                        )
+                    except Exception as error:
+                        outcome_pending += 1
+                        forecasts.store.record_outcome_refresh_attempt(
+                            event_id,
+                            status="pending",
+                            error=str(error),
+                            attempted_at_utc=attempted_at,
+                        )
+                    else:
+                        outcome_completed += 1
+                        forecasts.store.record_outcome_refresh_attempt(
+                            event_id,
+                            status="recorded",
+                            attempted_at_utc=attempted_at,
+                        )
+
+                if extra_requested:
+                    extra_events = gateway.discover_weather_events(
+                        query=query,
+                        max_events=extra_requested,
+                        excluded_event_ids=set(excluded_event_ids),
+                    )
+                    extra_registered = self.storage.record_shadow_events(
+                        research_run_id,
+                        extra_events,
+                    )
+        except Exception as error:
+            status = "partial" if outcome_completed or outcome_pending else "failed"
+            terminal_error = str(error)
+
+        self.storage.finish_shadow_research(
+            research_run_id,
+            status=status,
+            outcome_completed=outcome_completed,
+            outcome_pending=outcome_pending,
+            extra_registered=extra_registered,
+            error=terminal_error,
+        )
+        return _ShadowResearchResult(
+            outcome_completed=outcome_completed,
+            outcome_pending=outcome_pending,
+            extra_registered=extra_registered,
+            status=status,
+        )
 
     def _process_event(
         self,
@@ -257,6 +470,8 @@ class Scanner:
         recorded_at: datetime,
         *,
         run_id: int | None = None,
+        observation_collector: StationObservationCollector | None = None,
+        forecast_engine: ForecastEngineV2 | None = None,
     ) -> None:
         """Pair official resolution with the final saved station observations."""
 
@@ -271,7 +486,8 @@ class Scanner:
         audit = deterministic_rule_audit(event)
         if not audit.interpretation.tradeable:
             raise ValueError(f"event {event_id} rules are not analyzable")
-        history = self.observations.fetch(audit.interpretation)
+        collector = observation_collector or self.observations
+        history = collector.fetch(audit.interpretation)
         if run_id is not None:
             self.storage.record_observation_history(run_id, event_id, history)
         if (
@@ -288,7 +504,8 @@ class Scanner:
         source_revision = hashlib.sha256(
             (winner.market_id + ":" + ":".join(revisions)).encode()
         ).hexdigest()
-        self.forecasts.record_outcome(
+        engine = forecast_engine or self.forecasts
+        engine.record_outcome(
             RealizedForecastOutcome(
                 event_id=event_id,
                 station_id=history.station_id,

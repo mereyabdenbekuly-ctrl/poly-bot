@@ -8,6 +8,11 @@ Group=polybot
 WorkingDirectory=/opt/polybot
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/polybot/.venv/bin/python /opt/polybot/scripts/backup-state.py --database /var/lib/polybot/polybot.sqlite3 --root /var/lib/polybot/backups --keep 12
+Nice=10
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+CPUWeight=20
+IOWeight=20
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

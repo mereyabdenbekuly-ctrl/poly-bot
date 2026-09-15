@@ -18,6 +18,15 @@ if ! getent passwd polybot >/dev/null 2>&1; then
   useradd --system --gid polybot --home-dir "$state" --shell /usr/sbin/nologin polybot
 fi
 
+if ! getent group polybot-tunnel >/dev/null 2>&1; then
+  groupadd --system polybot-tunnel
+fi
+
+if ! getent passwd polybot-tunnel >/dev/null 2>&1; then
+  useradd --system --gid polybot-tunnel --home-dir /var/lib/polybot-tunnel \
+    --shell /usr/sbin/nologin polybot-tunnel
+fi
+
 if [ -e "$project/.env" ] || [ -L "$project/.env" ]; then
   echo "Refusing deployment while $project/.env exists; use $config/polybot.env only." >&2
   exit 1
@@ -39,6 +48,8 @@ install -d -o polybot -g polybot -m 0750 \
   "$state/backups" \
   "$state/forecasts/ecmwf-ifs025-json" \
   "$state/forecasts/ecmwf-open-data"
+install -d -o polybot-tunnel -g polybot-tunnel -m 0700 \
+  /var/lib/polybot-tunnel/.ssh
 install -d -o root -g polybot -m 0750 "$config"
 
 for unit in \
@@ -46,11 +57,22 @@ for unit in \
   polybot-dashboard.service \
   polybot-backup.service \
   polybot-backup.timer \
+  polybot-operational-report.service \
+  polybot-operational-report.timer \
+  polybot-astra-primary-tunnel.service \
+  polybot-astra-fallback-tunnel.service \
   polybot-ecmwf-archive.service \
   polybot-ecmwf-archive.timer
 do
   install -o root -g root -m 0644 "$project/deploy/linux/$unit" "/etc/systemd/system/$unit"
 done
+
+install -d -o root -g root -m 0755 /etc/systemd/system/polybot-observer.service.d
+install -o root -g root -m 0644 \
+  "$project/deploy/linux/polybot-observer.service.d/20-astra-tunnels.conf" \
+  /etc/systemd/system/polybot-observer.service.d/20-astra-tunnels.conf
+
+install -d -o polybot -g polybot -m 0750 "$state/reports"
 
 systemctl daemon-reload
 echo "Units installed. Verify the restored state in $state, then enable/start"

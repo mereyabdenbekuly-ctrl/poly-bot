@@ -6,7 +6,7 @@ from typing import Any
 
 from openai import OpenAI
 
-from polybot.config import Settings
+from polybot.config import Settings, is_protected_model_endpoint
 from polybot.models import EventDefinition, RuleAudit, RuleInterpretation
 from polybot.rules import rules_hash
 from polybot.storage import Storage
@@ -110,6 +110,9 @@ class AstraRuleAuditor:
         failures: list[str] = []
         for name, base_url, secret in endpoints:
             if secret is None:
+                continue
+            if not is_protected_model_endpoint(base_url):
+                failures.append(f"{name}: endpoint transport is not protected")
                 continue
             try:
                 client = OpenAI(

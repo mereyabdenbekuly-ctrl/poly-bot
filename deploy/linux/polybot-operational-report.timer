@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the Polybot 24-hour operational report daily
+
+[Timer]
+OnCalendar=*-*-* 00:15:00 UTC
+AccuracySec=2m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

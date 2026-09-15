@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ipaddress
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlparse
 
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -70,6 +72,13 @@ class Settings(BaseSettings):
     forecast_snapshot_min_interval_seconds: int = Field(default=3600, ge=300, le=21600)
     forecast_snapshot_probability_delta: Decimal = Decimal("0.02")
     forecast_outcome_monitor_hours: int = Field(default=336, ge=24, le=2160)
+    # Research work runs beside, never inside, the ordered v1 decision lane.
+    # One worker means one bounded batch can overlap the next primary cycle,
+    # while the no-queue scheduler skips a launch if that batch is still busy.
+    shadow_research_enabled: bool = False
+    shadow_research_workers: int = Field(default=1, ge=1, le=2)
+    shadow_outcome_batch_size: int = Field(default=8, ge=1, le=20)
+    shadow_extra_max_events: int = Field(default=8, ge=0, le=20)
     weather_wrh_token_url: str = "https://www.weather.gov/source/wrh/apiKey.js"
     weather_synoptic_url: str = "https://api.synopticdata.com/v2/stations/timeseries"
     weather_awc_metar_url: str = "https://aviationweather.gov/api/data/metar"
@@ -130,5 +139,34 @@ class Settings(BaseSettings):
             raise ValueError("must be non-negative")
         return value
 
+    @field_validator("openai_base_url", "openai_fallback_base_url")
+    @classmethod
+    def _protected_model_transport(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not is_protected_model_endpoint(value):
+            raise ValueError(
+                "model endpoint must use HTTPS or numeric loopback HTTP through a protected tunnel"
+            )
+        return value
+
     def ensure_runtime_directories(self) -> None:
         self.database_path.expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
+
+
+def is_protected_model_endpoint(value: str | None) -> bool:
+    """Accept TLS endpoints and explicit loopback HTTP, never public plain HTTP."""
+
+    if not value:
+        return False
+    parsed = urlparse(value)
+    if parsed.scheme.casefold() == "https":
+        return bool(parsed.hostname)
+    if parsed.scheme.casefold() != "http" or parsed.hostname is None:
+        return False
+    try:
+        return ipaddress.ip_address(parsed.hostname).is_loopback
+    except ValueError:
+        # A hostname such as ``localhost`` can be remapped; requiring a numeric
+        # loopback address makes the fail-closed boundary explicit.
+        return False

@@ -10,9 +10,10 @@ from rich.console import Console
 from rich.table import Table
 
 from polybot.autonomy import AutonomousRunner
-from polybot.config import Settings
+from polybot.config import Settings, is_protected_model_endpoint
 from polybot.dashboard import serve_dashboard
 from polybot.geoblock import fetch_geoblock_status
+from polybot.operational_report import build_operational_report
 from polybot.polymarket_gateway import PolymarketGateway
 from polybot.scanner import Scanner
 from polybot.storage import Storage
@@ -55,6 +56,13 @@ def build_parser() -> argparse.ArgumentParser:
         "comparison", help="Read-only v1/ECMWF/v2 forecast comparison report"
     )
     comparison.add_argument("--json", action="store_true", dest="as_json")
+
+    operational = subparsers.add_parser(
+        "operational-report", help="Read-only rolling CPU/RAM/disk and cycle report"
+    )
+    operational.add_argument("--hours", type=float, default=24.0)
+    operational.add_argument("--output", default=None)
+    operational.add_argument("--json", action="store_true", dest="as_json")
 
     wn = subparsers.add_parser("weathernext", help="WeatherNext3 GCS comparison source")
     wn_sub = wn.add_subparsers(dest="weathernext_command", required=True)
@@ -255,6 +263,41 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "comparison":
         _comparison(settings, as_json=args.as_json)
         return
+    if args.command == "operational-report":
+        from pathlib import Path
+
+        report = build_operational_report(
+            settings.database_path,
+            state_root=settings.database_path.parent,
+            ecmwf_json_root=settings.ecmwf_json_archive_root,
+            weathernext_full_snapshot_path=(
+                None
+                if settings.weathernext_snapshot_path is None
+                else Path(settings.weathernext_snapshot_path)
+            ),
+            weathernext_statistics_snapshot_path=(
+                None
+                if settings.weathernext_statistics_snapshot_path is None
+                else Path(settings.weathernext_statistics_snapshot_path)
+            ),
+            period_hours=args.hours,
+        )
+        if args.output:
+            output = Path(args.output).expanduser()
+            output.parent.mkdir(parents=True, exist_ok=True)
+            temporary = output.with_name(output.name + ".tmp")
+            temporary.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+            temporary.replace(output)
+        if args.as_json:
+            print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+        else:
+            from polybot.operational_report import _human_report
+
+            print(_human_report(report))
+        return
     if args.command == "dashboard":
         storage = Storage(settings.database_path, read_only=True)
     else:
@@ -292,13 +335,12 @@ def _doctor(settings: Settings, storage: Storage, *, as_json: bool) -> None:
         "observe_max_events": settings.max_events,
         "paper_max_events": settings.paper_max_events,
         "openai_base_url": settings.openai_base_url,
-        "openai_transport_secure": settings.openai_base_url.lower().startswith("https://"),
+        "openai_transport_secure": is_protected_model_endpoint(settings.openai_base_url),
         "openai_fallback_configured": bool(
             settings.openai_fallback_base_url and settings.openai_fallback_api_key
         ),
         "openai_fallback_transport_secure": bool(
-            settings.openai_fallback_base_url
-            and settings.openai_fallback_base_url.lower().startswith("https://")
+            is_protected_model_endpoint(settings.openai_fallback_base_url)
         ),
         "openai_key_present": settings.openai_api_key is not None,
         "live_executor_present": False,

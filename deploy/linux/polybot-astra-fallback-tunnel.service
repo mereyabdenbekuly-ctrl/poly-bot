@@ -1,0 +1,30 @@
+[Unit]
+Description=Polybot encrypted tunnel to fallback Astra gateway
+Wants=network-online.target
+After=network-online.target
+Before=polybot-observer.service
+
+[Service]
+Type=simple
+User=polybot-tunnel
+Group=polybot-tunnel
+ExecStart=/usr/bin/ssh -NT -i /var/lib/polybot-tunnel/.ssh/astra-fallback -o IdentitiesOnly=yes -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=20 -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/var/lib/polybot-tunnel/.ssh/known_hosts -o ConnectTimeout=15 -L 127.0.0.1:12456:127.0.0.1:2455 polybot-tunnel@176.98.191.222
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

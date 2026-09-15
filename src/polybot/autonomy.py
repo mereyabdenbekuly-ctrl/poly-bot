@@ -45,6 +45,7 @@ class AutonomousRunner:
         # No scan can belong to this brand-new runner yet. Any persisted
         # ``running`` row was abandoned by a previous process.
         self.storage.recover_stale_scans(older_than_seconds=0)
+        self.storage.recover_stale_shadow_research()
         window = self.storage.start_runtime_window(
             query=query,
             interval_seconds=interval,
@@ -53,44 +54,52 @@ class AutonomousRunner:
         )
         self._ensure_startup_report(window.id, paper=paper, astra=use_astra)
 
-        while True:
-            window, rolled = self.process_reporting_boundaries(
-                window,
-                query=query,
-                interval=interval,
-                paper=paper,
-                astra=use_astra,
-                scan_report=None,
-            )
-            if rolled:
-                continue
-
-            cycle_started = time.monotonic()
-            scan_report = None
-            try:
-                scan_report = Scanner(settings=self.settings, storage=self.storage).scan(
+        scanner = Scanner(
+            settings=self.settings,
+            storage=self.storage,
+            background_research=True,
+        )
+        try:
+            while True:
+                window, rolled = self.process_reporting_boundaries(
+                    window,
                     query=query,
-                    max_events=max_events,
-                    use_astra=use_astra,
+                    interval=interval,
                     paper=paper,
-                    window_id=window.id,
+                    astra=use_astra,
+                    scan_report=None,
                 )
-                elapsed = self._elapsed(window)
-                self._record_report(window.id, "CYCLE", elapsed, scan_report, None)
-            except Exception as error:
-                elapsed = self._elapsed(window)
-                self._record_report(window.id, "CYCLE", elapsed, None, str(error))
+                if rolled:
+                    continue
 
-            window, _ = self.process_reporting_boundaries(
-                window,
-                query=query,
-                interval=interval,
-                paper=paper,
-                astra=use_astra,
-                scan_report=scan_report,
-            )
+                cycle_started = time.monotonic()
+                scan_report = None
+                try:
+                    scan_report = scanner.scan(
+                        query=query,
+                        max_events=max_events,
+                        use_astra=use_astra,
+                        paper=paper,
+                        window_id=window.id,
+                    )
+                    elapsed = self._elapsed(window)
+                    self._record_report(window.id, "CYCLE", elapsed, scan_report, None)
+                except Exception as error:
+                    elapsed = self._elapsed(window)
+                    self._record_report(window.id, "CYCLE", elapsed, None, str(error))
 
-            time.sleep(max(1, interval - (time.monotonic() - cycle_started)))
+                window, _ = self.process_reporting_boundaries(
+                    window,
+                    query=query,
+                    interval=interval,
+                    paper=paper,
+                    astra=use_astra,
+                    scan_report=scan_report,
+                )
+
+                time.sleep(max(1, interval - (time.monotonic() - cycle_started)))
+        finally:
+            scanner.close(wait=False)
 
     def process_reporting_boundaries(
         self,

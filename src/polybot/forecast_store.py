@@ -190,6 +190,14 @@ class ForecastStore:
                     payload_json TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS forecast_outcome_refresh_attempts_v2 (
+                    event_id TEXT PRIMARY KEY,
+                    last_attempted_at_utc TEXT NOT NULL,
+                    last_status TEXT NOT NULL,
+                    last_error TEXT,
+                    attempt_count INTEGER NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS forecast_evaluation_events_v2 (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     cohort_version TEXT NOT NULL,
@@ -243,6 +251,8 @@ class ForecastStore:
                     ON forecast_outcome_versions_v2(event_id, recorded_at_utc, id);
                 CREATE INDEX IF NOT EXISTS forecast_source_status_idx
                     ON forecast_source_status_v2(source, checked_at_utc, id);
+                CREATE INDEX IF NOT EXISTS forecast_outcome_refresh_attempt_idx
+                    ON forecast_outcome_refresh_attempts_v2(last_attempted_at_utc, event_id);
                 CREATE INDEX IF NOT EXISTS forecast_evaluation_event_idx
                     ON forecast_evaluation_events_v2(
                         cohort_version, event_id, phase, considered_at_utc
@@ -1081,28 +1091,73 @@ class ForecastStore:
         return [str(row["event_id"]) for row in rows]
 
     def outcome_refresh_event_ids(
-        self, *, as_of_utc: datetime | None = None, correction_window_hours: int = 336
+        self,
+        *,
+        as_of_utc: datetime | None = None,
+        correction_window_hours: int = 336,
+        cohort_version: str = "weather-evaluation-v1",
+        limit: int | None = None,
     ) -> list[str]:
-        """Events whose final source can still publish a correction revision."""
+        """Return a fair, bounded production-cohort outcome refresh batch."""
 
         as_of = as_of_utc or datetime.now(UTC)
         lower = as_of.timestamp() - max(1, correction_window_hours) * 3600
         with self.connect() as connection:
             rows = connection.execute(
                 "SELECT e.event_id, MAX(e.rule_day_end_utc) AS rule_day_end_utc, "
-                "COUNT(o.id) AS outcome_count "
+                "COUNT(DISTINCT o.id) AS outcome_count, "
+                "MAX(a.last_attempted_at_utc) AS last_attempted_at_utc "
                 "FROM forecast_evaluation_events_v2 e "
                 "LEFT JOIN forecast_outcome_versions_v2 o ON o.event_id=e.event_id "
-                "WHERE e.eligible=1 AND e.rule_day_end_utc <= ? "
-                "GROUP BY e.event_id ORDER BY e.event_id",
-                (as_of.isoformat(),),
+                "LEFT JOIN forecast_outcome_refresh_attempts_v2 a ON a.event_id=e.event_id "
+                "WHERE e.cohort_version=? AND e.eligible=1 AND e.rule_day_end_utc <= ? "
+                "GROUP BY e.event_id "
+                "ORDER BY CASE WHEN last_attempted_at_utc IS NULL THEN 0 ELSE 1 END, "
+                "last_attempted_at_utc, e.event_id",
+                (cohort_version, as_of.isoformat()),
             ).fetchall()
-        return [
+        eligible = [
             str(row["event_id"])
             for row in rows
             if int(row["outcome_count"]) == 0
             or datetime.fromisoformat(str(row["rule_day_end_utc"])).timestamp() >= lower
         ]
+        if limit is None:
+            return eligible
+        return eligible[: max(0, limit)]
+
+    def record_outcome_refresh_attempt(
+        self,
+        event_id: str,
+        *,
+        status: str,
+        error: str | None = None,
+        attempted_at_utc: datetime | None = None,
+    ) -> None:
+        """Persist research scheduling state without touching evaluation cohorts."""
+
+        if status not in {"recorded", "pending", "failed"}:
+            raise ValueError(f"unsupported outcome refresh status: {status}")
+        attempted = (attempted_at_utc or datetime.now(UTC)).astimezone(UTC).isoformat()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO forecast_outcome_refresh_attempts_v2(
+                    event_id, last_attempted_at_utc, last_status, last_error, attempt_count
+                ) VALUES (?, ?, ?, ?, 1)
+                ON CONFLICT(event_id) DO UPDATE SET
+                    last_attempted_at_utc=excluded.last_attempted_at_utc,
+                    last_status=excluded.last_status,
+                    last_error=excluded.last_error,
+                    attempt_count=forecast_outcome_refresh_attempts_v2.attempt_count + 1
+                """,
+                (
+                    event_id,
+                    attempted,
+                    status,
+                    None if error is None else error[:2000],
+                ),
+            )
 
     def dashboard_summary(self, *, event_limit: int = 20) -> dict[str, object]:
         """Return a compact, read-only comparison view for the local dashboard."""

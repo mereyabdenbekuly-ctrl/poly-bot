@@ -10,6 +10,11 @@ Group=polybot
 WorkingDirectory=/opt/polybot
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/polybot/.venv/bin/python /opt/polybot/scripts/collect-ecmwf-open-data.py --database /var/lib/polybot/polybot.sqlite3 --archive-root /var/lib/polybot/forecasts/ecmwf-open-data --hours 24
+Nice=15
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+CPUWeight=15
+IOWeight=15
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import UTC, date, datetime
 from decimal import Decimal
@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from polybot.models import (
+    EventDefinition,
     MarketDecision,
     MarketSnapshot,
     OutcomeSide,
@@ -115,6 +116,38 @@ class Storage:
                     elapsed_seconds INTEGER NOT NULL,
                     payload_json TEXT NOT NULL,
                     UNIQUE(window_id, kind)
+                );
+
+                CREATE TABLE IF NOT EXISTS shadow_research_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    parent_scan_run_id INTEGER NOT NULL REFERENCES scan_runs(id),
+                    cohort_version TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    status TEXT NOT NULL,
+                    outcome_requested INTEGER NOT NULL,
+                    outcome_completed INTEGER NOT NULL DEFAULT 0,
+                    outcome_pending INTEGER NOT NULL DEFAULT 0,
+                    extra_requested INTEGER NOT NULL,
+                    extra_registered INTEGER NOT NULL DEFAULT 0,
+                    error TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS shadow_event_registry (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    research_run_id INTEGER NOT NULL REFERENCES shadow_research_runs(id),
+                    cohort_version TEXT NOT NULL,
+                    discovered_at TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    event_slug TEXT,
+                    event_title TEXT NOT NULL,
+                    observation_date TEXT,
+                    market_count INTEGER NOT NULL,
+                    accepting_market_count INTEGER NOT NULL,
+                    earliest_end_at TEXT,
+                    latest_end_at TEXT,
+                    metadata_json TEXT NOT NULL,
+                    UNIQUE(cohort_version, research_run_id, event_id)
                 );
 
                 CREATE TABLE IF NOT EXISTS rule_cache (
@@ -272,6 +305,10 @@ class Storage:
                 CREATE INDEX IF NOT EXISTS decisions_run_idx ON decisions(run_id);
                 CREATE INDEX IF NOT EXISTS runtime_reports_window_idx
                     ON runtime_reports(window_id, id);
+                CREATE INDEX IF NOT EXISTS shadow_research_parent_idx
+                    ON shadow_research_runs(parent_scan_run_id, id);
+                CREATE INDEX IF NOT EXISTS shadow_event_registry_idx
+                    ON shadow_event_registry(cohort_version, event_id, discovered_at, id);
                 CREATE INDEX IF NOT EXISTS snapshots_run_idx ON market_snapshots(run_id);
                 CREATE INDEX IF NOT EXISTS weathernext_snapshots_run_idx
                     ON weathernext_snapshots(run_id, event_id);
@@ -813,6 +850,160 @@ class Storage:
                     run_id,
                 ),
             )
+
+    def start_shadow_research(
+        self,
+        *,
+        parent_scan_run_id: int,
+        outcome_requested: int,
+        extra_requested: int,
+        cohort_version: str = "shadow-extra-v1",
+    ) -> int:
+        """Open a research-only batch that cannot contain trading records."""
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO shadow_research_runs(
+                    parent_scan_run_id, cohort_version, started_at, status,
+                    outcome_requested, extra_requested
+                ) VALUES (?, ?, ?, 'running', ?, ?)
+                """,
+                (
+                    parent_scan_run_id,
+                    cohort_version,
+                    utc_now().isoformat(),
+                    max(0, outcome_requested),
+                    max(0, extra_requested),
+                ),
+            )
+            return _lastrowid(cursor)
+
+    def record_shadow_events(
+        self,
+        research_run_id: int,
+        events: Sequence[EventDefinition],
+        *,
+        cohort_version: str = "shadow-extra-v1",
+    ) -> int:
+        """Persist discovery metadata only in the explicit shadow registry."""
+
+        discovered_at = utc_now().isoformat()
+        inserted = 0
+        with self.connect() as connection:
+            for event in events:
+                end_dates = sorted(
+                    market.end_date.astimezone(UTC)
+                    for market in event.markets
+                    if market.end_date is not None
+                )
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO shadow_event_registry(
+                        research_run_id, cohort_version, discovered_at, event_id,
+                        event_slug, event_title, observation_date, market_count,
+                        accepting_market_count, earliest_end_at, latest_end_at,
+                        metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        research_run_id,
+                        cohort_version,
+                        discovered_at,
+                        event.id,
+                        event.slug,
+                        event.title,
+                        None
+                        if event.observation_date is None
+                        else event.observation_date.isoformat(),
+                        len(event.markets),
+                        sum(1 for market in event.markets if market.accepting_orders),
+                        None if not end_dates else end_dates[0].isoformat(),
+                        None if not end_dates else end_dates[-1].isoformat(),
+                        json.dumps(
+                            {
+                                "registry_role": "metadata_only",
+                                "decision_eligible": False,
+                                "paper_order_eligible": False,
+                                "forecast_cohort_registered": False,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
+                inserted += int(cursor.rowcount > 0)
+        return inserted
+
+    def finish_shadow_research(
+        self,
+        research_run_id: int,
+        *,
+        status: str,
+        outcome_completed: int,
+        outcome_pending: int,
+        extra_registered: int,
+        error: str | None = None,
+    ) -> None:
+        if status not in {"completed", "partial", "failed", "skipped_busy"}:
+            raise ValueError(f"unsupported shadow research status: {status}")
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE shadow_research_runs
+                SET completed_at=?, status=?, outcome_completed=?, outcome_pending=?,
+                    extra_registered=?, error=?
+                WHERE id=?
+                """,
+                (
+                    utc_now().isoformat(),
+                    status,
+                    max(0, outcome_completed),
+                    max(0, outcome_pending),
+                    max(0, extra_registered),
+                    None if error is None else error[:2000],
+                    research_run_id,
+                ),
+            )
+
+    def recover_stale_shadow_research(self) -> int:
+        """Close batches abandoned by an observer process restart."""
+
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE shadow_research_runs
+                SET completed_at=?, status='failed',
+                    error='shadow research abandoned after observer restart'
+                WHERE status='running'
+                """,
+                (utc_now().isoformat(),),
+            )
+            return max(0, int(cursor.rowcount))
+
+    def record_shadow_research_skip(
+        self,
+        *,
+        parent_scan_run_id: int,
+        reason: str,
+        cohort_version: str = "shadow-extra-v1",
+    ) -> int:
+        run_id = self.start_shadow_research(
+            parent_scan_run_id=parent_scan_run_id,
+            outcome_requested=0,
+            extra_requested=0,
+            cohort_version=cohort_version,
+        )
+        self.finish_shadow_research(
+            run_id,
+            status="skipped_busy",
+            outcome_completed=0,
+            outcome_pending=0,
+            extra_registered=0,
+            error=reason,
+        )
+        return run_id
 
     def get_rule_cache(self, rules_hash: str) -> RuleAudit | None:
         with self.connect() as connection:

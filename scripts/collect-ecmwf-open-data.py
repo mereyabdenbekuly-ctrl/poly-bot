@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from polybot.ecmwf import EcmwfIfsEnsAdapter, EcmwfProduct
+from polybot.ecmwf import EcmwfArchiveRetentionPolicy, EcmwfIfsEnsAdapter, EcmwfProduct
 from polybot.forecast_store import ForecastStore
 
 
@@ -30,7 +31,10 @@ def main() -> None:
     now = datetime.now(UTC)
     init = _latest_main_cycle(now)
     store = ForecastStore(Path(args.database))
-    adapter = EcmwfIfsEnsAdapter(archive_root=Path(args.archive_root))
+    adapter = EcmwfIfsEnsAdapter(
+        archive_root=Path(args.archive_root),
+        retention_policy=EcmwfArchiveRetentionPolicy(),
+    )
     result = adapter.fetch_archive(
         init_time_utc=init,
         steps=steps,
@@ -55,6 +59,7 @@ def main() -> None:
         "artifact_count": 0 if result.archive is None else len(result.archive.artifacts),
         "decoded": False,
         "scope": "raw official index/GRIB ranges; station decoding is separate",
+        "retention": None if result.retention is None else asdict(result.retention),
     }
     store.record_source_status(
         source="ecmwf-open-data-ifs-ens",

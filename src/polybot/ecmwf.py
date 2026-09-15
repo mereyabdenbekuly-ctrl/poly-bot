@@ -7,6 +7,7 @@ are never used as an ensemble substitute; AIFS is not supported here.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import importlib
 import importlib.util
@@ -15,8 +16,10 @@ import math
 import os
 import re
 import shutil
+import stat
 import tempfile
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -30,6 +33,9 @@ ECMWF_OPEN_DATA_URL = "https://data.ecmwf.int/forecasts"
 IFS_ENS_MEMBER_NUMBERS = tuple(range(1, 51))
 _RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+|\*)$")
 _ARCHIVE_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+_GIB = 1024**3
+_RETENTION_MANIFEST_MAX_BYTES = 4 * 1024 * 1024
+_RETENTION_PROTECTED_MARKERS = (".retention-protected", "PROTECTED")
 
 
 class EcmwfState(StrEnum):
@@ -106,6 +112,56 @@ class EcmwfRawArchive:
 class EcmwfArchiveResult:
     status: EcmwfStatus
     archive: EcmwfRawArchive | None
+    retention: EcmwfArchiveRetentionReport | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EcmwfArchiveRetentionPolicy:
+    """Bounds for the official raw archive collector.
+
+    The policy is opt-in at adapter construction so read-only/library callers
+    are not coupled to the capacity of the machine running their tests.  The
+    checked-in collector enables these production-safe defaults explicitly.
+    Unrecognised/partial directories are never candidates for deletion.  A
+    completed release can be protected with ``<archive-id>.protected`` beside
+    it, an in-directory marker, or ``protected_archive_ids``.
+    """
+
+    max_completed_releases: int = 28
+    max_completed_bytes: int = 8 * _GIB
+    min_free_bytes: int = 50 * _GIB
+    min_free_fraction: float = 0.25
+
+    def __post_init__(self) -> None:
+        if self.max_completed_releases < 1:
+            raise ValueError("ECMWF retention must keep at least one completed release")
+        if self.max_completed_bytes < 1:
+            raise ValueError("ECMWF retention byte limit must be positive")
+        if self.min_free_bytes < 0:
+            raise ValueError("ECMWF minimum free bytes cannot be negative")
+        if not 0 <= self.min_free_fraction < 1:
+            raise ValueError("ECMWF minimum free fraction must be in [0, 1)")
+
+
+@dataclass(frozen=True, slots=True)
+class EcmwfArchiveRetentionReport:
+    max_completed_releases: int
+    max_completed_bytes: int
+    min_free_bytes: int
+    min_free_fraction: float
+    completed_releases: int
+    completed_bytes: int
+    protected_releases: int
+    protected_bytes: int
+    preserved_diagnostics: int
+    preserved_diagnostic_bytes: int
+    pruned_releases: int
+    pruned_bytes: int
+    disk_total_bytes: int
+    disk_free_bytes: int
+    disk_free_fraction: float
+    within_limits: bool
+    reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -207,6 +263,29 @@ class EcmwfUnavailableError(EcmwfError):
 
 class EcmwfValidationError(EcmwfUnavailableError):
     pass
+
+
+class EcmwfRetentionError(EcmwfUnavailableError):
+    def __init__(self, message: str, report: EcmwfArchiveRetentionReport) -> None:
+        super().__init__(message)
+        self.report = report
+
+
+@dataclass(frozen=True, slots=True)
+class _RetainedArchive:
+    archive_id: str
+    path: Path
+    init_time_utc: datetime
+    fetched_at_utc: datetime
+    byte_size: int
+    protected: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _RetentionInventory:
+    archives: tuple[_RetainedArchive, ...]
+    diagnostic_count: int
+    diagnostic_bytes: int
 
 
 class HttpxEcmwfTransport:
@@ -349,6 +428,9 @@ class EcmwfIfsEnsAdapter:
         publication_deadline_hours: int = 10,
         max_index_bytes: int = 8 * 1024 * 1024,
         max_grib_message_bytes: int = 4 * 1024 * 1024,
+        retention_policy: EcmwfArchiveRetentionPolicy | None = None,
+        protected_archive_ids: Sequence[str] = (),
+        disk_usage: Callable[[Path], tuple[int, int, int]] | None = None,
     ) -> None:
         source = source_base_url.rstrip("/")
         if not source.startswith("https://"):
@@ -363,6 +445,14 @@ class EcmwfIfsEnsAdapter:
         self.publication_deadline = timedelta(hours=publication_deadline_hours)
         self.max_index_bytes = max_index_bytes
         self.max_grib_message_bytes = max_grib_message_bytes
+        self.retention_policy = retention_policy
+        normalized_protected = tuple(
+            str(value).strip().lower() for value in protected_archive_ids
+        )
+        if any(_ARCHIVE_ID_RE.fullmatch(archive_id) is None for archive_id in normalized_protected):
+            raise ValueError("protected ECMWF archive IDs must be 64 lowercase hex characters")
+        self.protected_archive_ids = frozenset(normalized_protected)
+        self._disk_usage = disk_usage or (lambda path: tuple(shutil.disk_usage(path)))
 
     @staticmethod
     def latest_conservative_init(now: datetime | None = None) -> datetime:
@@ -397,20 +487,72 @@ class EcmwfIfsEnsAdapter:
     ) -> EcmwfArchiveResult:
         init_time, normalized_steps = _validate_request(init_time_utc, steps, product)
         checked = _as_utc(self._clock(), field="clock")
+        with self._retention_lock():
+            return self._fetch_archive_locked(
+                init_time=init_time,
+                steps=normalized_steps,
+                product=product,
+                checked=checked,
+            )
+
+    def _fetch_archive_locked(
+        self,
+        *,
+        init_time: datetime,
+        steps: tuple[int, ...],
+        product: EcmwfProduct,
+        checked: datetime,
+    ) -> EcmwfArchiveResult:
         try:
-            indexes = self._inspect_indexes(init_time, normalized_steps, product)
-            status = self._available_status(indexes, init_time, normalized_steps, product, checked)
+            indexes = self._inspect_indexes(init_time, steps, product)
+            status = self._available_status(indexes, init_time, steps, product, checked)
             existing = self._find_existing_archive(init_time, indexes, product)
             if existing is not None:
-                return EcmwfArchiveResult(status, existing)
-            return EcmwfArchiveResult(status, self._download_archive(init_time, indexes, product))
+                retention = self.retention_status()
+                if retention is not None and not retention.within_limits:
+                    status = self._retention_failure_status(status, retention)
+                return EcmwfArchiveResult(status, existing, retention)
+            if self.retention_policy is not None:
+                projected_bytes = self._projected_archive_bytes(init_time, indexes, product)
+                self._retention_preflight(projected_bytes)
+            archive = self._download_archive(init_time, indexes, product)
+            retention = self._prune_archives(keep_archive_ids={archive.archive_id})
+            if retention is not None and not retention.within_limits:
+                status = self._retention_failure_status(status, retention)
+            return EcmwfArchiveResult(status, archive, retention)
+        except EcmwfRetentionError as error:
+            return EcmwfArchiveResult(
+                self._failure_status(
+                    init_time, steps, product, checked, error, "archive"
+                ),
+                None,
+                error.report,
+            )
         except (EcmwfPendingError, EcmwfUnavailableError, httpx.HTTPError, OSError) as error:
             return EcmwfArchiveResult(
                 self._failure_status(
-                    init_time, normalized_steps, product, checked, error, "archive"
+                    init_time, steps, product, checked, error, "archive"
                 ),
                 None,
             )
+
+    @staticmethod
+    def _retention_failure_status(
+        status: EcmwfStatus, retention: EcmwfArchiveRetentionReport
+    ) -> EcmwfStatus:
+        return EcmwfStatus(
+            EcmwfState.UNAVAILABLE,
+            status.product,
+            status.parameter,
+            status.init_time_utc,
+            status.checked_at_utc,
+            status.steps,
+            status.published_at_utc,
+            status.member_count,
+            "IFS ENS retention policy is not satisfied: "
+            f"{retention.reason or 'unknown retention failure'}",
+            status.index_urls,
+        )
 
     def extract_points(
         self,
@@ -503,7 +645,7 @@ class EcmwfIfsEnsAdapter:
         archived = self.fetch_archive(
             init_time_utc=init_time, steps=normalized_steps, product=product
         )
-        if archived.archive is None:
+        if archived.archive is None or archived.status.state != EcmwfState.AVAILABLE:
             return EcmwfBatchFetchResult(archived.status, None, None)
         return self.extract_points(archived.archive, points=points)
 
@@ -708,10 +850,433 @@ class EcmwfIfsEnsAdapter:
                 **stable,
             }
             _write_new_file(staging / "manifest.json", _canonical_json(manifest) + b"\n")
+            # The download can take several minutes.  Recheck the hard free-space
+            # floor after all bytes are staged but before publishing the immutable
+            # directory.  A failed check leaves only the temporary directory, which
+            # the ``finally`` block removes.
+            self._retention_free_space_check(additional_bytes=0, context="commit")
             final = self._commit_archive(staging, archive_id)
             return self._load_raw_archive(final)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
+
+    @contextmanager
+    def _retention_lock(self) -> Iterator[None]:
+        """Serialize retention-aware collectors across processes.
+
+        The lock lives beside (not inside) the archive root so lock metadata is
+        never mistaken for a partial release.  It is held across inventory,
+        download, immutable commit, and pruning; callers without a retention
+        policy retain the original lock-free library behaviour.
+        """
+
+        if self.retention_policy is None:
+            yield
+            return
+        parent = self.archive_root.parent
+        parent.mkdir(parents=True, exist_ok=True)
+        lock_path = parent / f".{self.archive_root.name}.retention.lock"
+        with lock_path.open("a+") as handle:
+            os.chmod(lock_path, 0o600)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def retention_status(self) -> EcmwfArchiveRetentionReport | None:
+        """Return a metadata/stat-only retention snapshot without deleting data."""
+
+        if self.retention_policy is None:
+            return None
+        inventory = self._retention_inventory()
+        reason = self._retention_limit_reason(inventory)
+        return self._retention_report(inventory, reason=reason)
+
+    def _retention_preflight(self, projected_archive_bytes: int) -> None:
+        policy = self.retention_policy
+        if policy is None:
+            return
+        inventory = self._retention_inventory()
+        protected = tuple(item for item in inventory.archives if item.protected)
+        protected_bytes = sum(item.byte_size for item in protected)
+        reason: str | None = None
+        if len(protected) + 1 > policy.max_completed_releases:
+            reason = (
+                "protected completed releases leave no retention slot for a new archive "
+                f"({len(protected)} protected, max {policy.max_completed_releases})"
+            )
+        elif protected_bytes + projected_archive_bytes > policy.max_completed_bytes:
+            reason = (
+                "protected completed releases plus the projected archive exceed the "
+                f"{policy.max_completed_bytes}-byte retention limit"
+            )
+        if reason is not None:
+            report = self._retention_report(inventory, reason=reason, force_within_limits=False)
+            raise EcmwfRetentionError(reason, report)
+        self._retention_free_space_check(
+            additional_bytes=projected_archive_bytes,
+            context="download",
+            inventory=inventory,
+        )
+        completed = len(inventory.archives) + 1
+        completed_bytes = sum(item.byte_size for item in inventory.archives)
+        completed_bytes += projected_archive_bytes
+        if (
+            completed <= policy.max_completed_releases
+            and completed_bytes <= policy.max_completed_bytes
+        ):
+            return
+        candidates = sorted(
+            (
+                item
+                for item in inventory.archives
+                if not item.protected
+                and not self._archive_is_protected(item.path, item.archive_id, frozenset())
+            ),
+            key=lambda item: (item.init_time_utc, item.fetched_at_utc, item.archive_id),
+        )
+        for item in candidates:
+            if (
+                completed <= policy.max_completed_releases
+                and completed_bytes <= policy.max_completed_bytes
+            ):
+                return
+            try:
+                # Validate every release that would have to be pruned before
+                # any new network bytes are fetched.  This is fail-closed for
+                # same-size digest corruption and forged/partial manifests.
+                self._load_raw_archive(item.path)
+            except (EcmwfError, OSError) as error:
+                reason = (
+                    f"cannot enforce ECMWF retention; candidate {item.archive_id} "
+                    f"failed immutable validation: {error}"
+                )
+                report = self._retention_report(
+                    inventory, reason=reason, force_within_limits=False
+                )
+                raise EcmwfRetentionError(reason, report) from error
+            completed -= 1
+            completed_bytes -= item.byte_size
+        if (
+            completed > policy.max_completed_releases
+            or completed_bytes > policy.max_completed_bytes
+        ):
+            reason = (
+                "ECMWF retention limits cannot be met without deleting protected or "
+                "unverified diagnostics"
+            )
+            report = self._retention_report(inventory, reason=reason, force_within_limits=False)
+            raise EcmwfRetentionError(reason, report)
+
+    def _retention_free_space_check(
+        self,
+        *,
+        additional_bytes: int,
+        context: str,
+        inventory: _RetentionInventory | None = None,
+    ) -> None:
+        policy = self.retention_policy
+        if policy is None:
+            return
+        total, _, free = self._archive_disk_usage()
+        projected_free = max(0, free - max(0, additional_bytes))
+        projected_fraction = projected_free / total if total else 0.0
+        reasons: list[str] = []
+        if projected_free < policy.min_free_bytes:
+            reasons.append(
+                f"projected free space {projected_free} bytes is below "
+                f"{policy.min_free_bytes} bytes"
+            )
+        if projected_fraction < policy.min_free_fraction:
+            reasons.append(
+                f"projected free space {projected_fraction:.2%} is below "
+                f"{policy.min_free_fraction:.2%}"
+            )
+        if reasons:
+            reason = f"refusing ECMWF archive {context}: " + "; ".join(reasons)
+            current = inventory or self._retention_inventory()
+            report = self._retention_report(
+                current,
+                reason=reason,
+                force_within_limits=False,
+            )
+            raise EcmwfRetentionError(reason, report)
+
+    def _projected_archive_bytes(
+        self,
+        init_time: datetime,
+        indexes: tuple[_StepIndex, ...],
+        product: EcmwfProduct,
+    ) -> int:
+        artifacts = tuple(
+            EcmwfArchiveArtifact(
+                relative_path=f"step-{index.step_hours:03d}-{index.parameter}.grib2",
+                index_relative_path=f"step-{index.step_hours:03d}-{index.parameter}.index",
+                step_hours=index.step_hours,
+                parameter=index.parameter,
+                interval_hours=index.interval_hours,
+                byte_size=sum(entry.length for entry in index.entries),
+                sha256="0" * 64,
+                index_byte_size=len(index.payload),
+                index_sha256=hashlib.sha256(index.payload).hexdigest(),
+                source_url=index.data_url,
+                index_source_url=index.index_url,
+                published_at_utc=index.published_at_utc,
+            )
+            for index in indexes
+        )
+        stable = _raw_manifest_body(self.source_base_url, init_time, product, artifacts)
+        manifest = {
+            "schema_version": 1,
+            "archive_id": "0" * 64,
+            "fetched_at_utc": _as_utc(self._clock(), field="clock").isoformat(),
+            **stable,
+        }
+        return (
+            sum(item.byte_size + item.index_byte_size for item in artifacts)
+            + len(_canonical_json(manifest))
+            + 1
+        )
+
+    def _prune_archives(
+        self, *, keep_archive_ids: set[str]
+    ) -> EcmwfArchiveRetentionReport | None:
+        policy = self.retention_policy
+        if policy is None:
+            return None
+        inventory = self._retention_inventory()
+        completed = len(inventory.archives)
+        completed_bytes = sum(item.byte_size for item in inventory.archives)
+        candidates = sorted(
+            (
+                item
+                for item in inventory.archives
+                if not item.protected and item.archive_id not in keep_archive_ids
+            ),
+            key=lambda item: (item.init_time_utc, item.fetched_at_utc, item.archive_id),
+        )
+        pruned_releases = 0
+        pruned_bytes = 0
+        errors: list[str] = []
+        for item in candidates:
+            if (
+                completed <= policy.max_completed_releases
+                and completed_bytes <= policy.max_completed_bytes
+            ):
+                break
+            if self._archive_is_protected(item.path, item.archive_id, keep_archive_ids):
+                continue
+            try:
+                # Inventory is intentionally metadata-only.  Immediately before
+                # deletion, perform the full digest validation so a corrupt or
+                # partially modified diagnostic is preserved fail-closed.
+                self._load_raw_archive(item.path)
+                if self._archive_is_protected(item.path, item.archive_id, keep_archive_ids):
+                    continue
+                _remove_archive_tree(item.path, archive_root=self.archive_root)
+            except (EcmwfError, OSError) as error:
+                errors.append(f"preserved unverified {item.archive_id}: {error}")
+                continue
+            completed -= 1
+            completed_bytes -= item.byte_size
+            pruned_releases += 1
+            pruned_bytes += item.byte_size
+
+        current = self._retention_inventory()
+        reason = self._retention_limit_reason(current)
+        if errors:
+            detail = "; ".join(errors)
+            reason = detail if reason is None else f"{reason}; {detail}"
+        return self._retention_report(
+            current,
+            pruned_releases=pruned_releases,
+            pruned_bytes=pruned_bytes,
+            reason=reason,
+        )
+
+    def _retention_inventory(self) -> _RetentionInventory:
+        if not self.archive_root.exists():
+            return _RetentionInventory((), 0, 0)
+        archives: list[_RetainedArchive] = []
+        diagnostic_count = 0
+        diagnostic_bytes = 0
+        for path in self.archive_root.iterdir():
+            entry = self._retained_archive(path)
+            if entry is not None:
+                archives.append(entry)
+                continue
+            diagnostic_count += 1
+            diagnostic_bytes += _tree_size(path)
+        return _RetentionInventory(tuple(archives), diagnostic_count, diagnostic_bytes)
+
+    def _retained_archive(self, path: Path) -> _RetainedArchive | None:
+        try:
+            path_stat = path.lstat()
+        except OSError:
+            return None
+        if (
+            not stat.S_ISDIR(path_stat.st_mode)
+            or stat.S_ISLNK(path_stat.st_mode)
+            or _ARCHIVE_ID_RE.fullmatch(path.name) is None
+            or path_stat.st_mode & 0o222
+        ):
+            return None
+        manifest_path = path / "manifest.json"
+        try:
+            manifest_stat = manifest_path.lstat()
+            if (
+                not stat.S_ISREG(manifest_stat.st_mode)
+                or stat.S_ISLNK(manifest_stat.st_mode)
+                or manifest_stat.st_size > _RETENTION_MANIFEST_MAX_BYTES
+                or manifest_stat.st_mode & 0o222
+            ):
+                return None
+            manifest = json.loads(manifest_path.read_text())
+            archive_id = str(manifest["archive_id"])
+            if (
+                manifest.get("schema_version") != 1
+                or archive_id != path.name
+                or _ARCHIVE_ID_RE.fullmatch(archive_id) is None
+            ):
+                return None
+            stable = {
+                key: value
+                for key, value in manifest.items()
+                if key not in {"schema_version", "archive_id", "fetched_at_utc"}
+            }
+            if hashlib.sha256(_canonical_json(stable)).hexdigest() != archive_id:
+                return None
+            artifacts = tuple(_artifact_from_json(item) for item in manifest["artifacts"])
+            _validate_archive_shape(manifest, artifacts)
+            expected = {"manifest.json"}
+            for artifact in artifacts:
+                for relative, expected_size in (
+                    (artifact.relative_path, artifact.byte_size),
+                    (artifact.index_relative_path, artifact.index_byte_size),
+                ):
+                    artifact_path = _safe_archive_child(path, relative)
+                    artifact_stat = artifact_path.lstat()
+                    if (
+                        not stat.S_ISREG(artifact_stat.st_mode)
+                        or stat.S_ISLNK(artifact_stat.st_mode)
+                        or artifact_stat.st_size != expected_size
+                        or artifact_stat.st_mode & 0o222
+                    ):
+                        return None
+                    expected.add(relative)
+                    relative_path = Path(relative)
+                    expected.update(
+                        str(parent)
+                        for parent in relative_path.parents
+                        if str(parent) != "."
+                    )
+            actual = _tree_relative_entries(path)
+            has_extra_files = bool(actual.difference(expected))
+            return _RetainedArchive(
+                archive_id=archive_id,
+                path=path,
+                init_time_utc=_parse_iso(manifest["init_time_utc"]),
+                fetched_at_utc=_parse_iso(manifest["fetched_at_utc"]),
+                byte_size=_tree_size(path),
+                protected=has_extra_files
+                or self._archive_is_protected(path, archive_id, frozenset()),
+            )
+        except (
+            EcmwfError,
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            return None
+
+    def _archive_is_protected(
+        self, path: Path, archive_id: str, keep_archive_ids: set[str] | frozenset[str]
+    ) -> bool:
+        if archive_id in keep_archive_ids or archive_id in self.protected_archive_ids:
+            return True
+        if (self.archive_root / f"{archive_id}.protected").exists():
+            return True
+        return any((path / marker).exists() for marker in _RETENTION_PROTECTED_MARKERS)
+
+    def _retention_limit_reason(self, inventory: _RetentionInventory) -> str | None:
+        policy = self.retention_policy
+        if policy is None:
+            return None
+        completed_bytes = sum(item.byte_size for item in inventory.archives)
+        reasons: list[str] = []
+        if len(inventory.archives) > policy.max_completed_releases:
+            reasons.append(
+                f"{len(inventory.archives)} completed releases exceed max "
+                f"{policy.max_completed_releases}"
+            )
+        if completed_bytes > policy.max_completed_bytes:
+            reasons.append(
+                f"{completed_bytes} completed bytes exceed max {policy.max_completed_bytes}"
+            )
+        total, _, free = self._archive_disk_usage()
+        free_fraction = free / total if total else 0.0
+        if free < policy.min_free_bytes:
+            reasons.append(f"free space {free} bytes is below {policy.min_free_bytes} bytes")
+        if free_fraction < policy.min_free_fraction:
+            reasons.append(
+                f"free space {free_fraction:.2%} is below {policy.min_free_fraction:.2%}"
+            )
+        return "; ".join(reasons) or None
+
+    def _retention_report(
+        self,
+        inventory: _RetentionInventory,
+        *,
+        pruned_releases: int = 0,
+        pruned_bytes: int = 0,
+        reason: str | None = None,
+        force_within_limits: bool | None = None,
+    ) -> EcmwfArchiveRetentionReport:
+        policy = self.retention_policy
+        if policy is None:
+            raise RuntimeError("retention report requested without a policy")
+        completed_bytes = sum(item.byte_size for item in inventory.archives)
+        protected = tuple(item for item in inventory.archives if item.protected)
+        total, _, free = self._archive_disk_usage()
+        free_fraction = free / total if total else 0.0
+        within_limits = (
+            len(inventory.archives) <= policy.max_completed_releases
+            and completed_bytes <= policy.max_completed_bytes
+            and free >= policy.min_free_bytes
+            and free_fraction >= policy.min_free_fraction
+            and reason is None
+        )
+        if force_within_limits is not None:
+            within_limits = force_within_limits
+        return EcmwfArchiveRetentionReport(
+            max_completed_releases=policy.max_completed_releases,
+            max_completed_bytes=policy.max_completed_bytes,
+            min_free_bytes=policy.min_free_bytes,
+            min_free_fraction=policy.min_free_fraction,
+            completed_releases=len(inventory.archives),
+            completed_bytes=completed_bytes,
+            protected_releases=len(protected),
+            protected_bytes=sum(item.byte_size for item in protected),
+            preserved_diagnostics=inventory.diagnostic_count,
+            preserved_diagnostic_bytes=inventory.diagnostic_bytes,
+            pruned_releases=pruned_releases,
+            pruned_bytes=pruned_bytes,
+            disk_total_bytes=total,
+            disk_free_bytes=free,
+            disk_free_fraction=free_fraction,
+            within_limits=within_limits,
+            reason=reason,
+        )
+
+    def _archive_disk_usage(self) -> tuple[int, int, int]:
+        candidate = self.archive_root
+        while not candidate.exists() and candidate != candidate.parent:
+            candidate = candidate.parent
+        total, used, free = self._disk_usage(candidate)
+        return int(total), int(used), int(free)
 
     def _fetch_range(self, index: _StepIndex, entry: _IndexEntry) -> bytes:
         end = entry.offset + entry.length - 1
@@ -755,15 +1320,22 @@ class EcmwfIfsEnsAdapter:
             self._load_raw_archive(destination)
             shutil.rmtree(staging)
             return destination
+        _seal_archive_tree(staging)
+        # Some filesystems require the staging directory itself to remain
+        # writable while it is renamed.  Its children are already sealed; the
+        # destination root is made read-only immediately after the atomic move.
+        staging.chmod(0o700)
         try:
             staging.rename(destination)
         except FileExistsError:
             self._load_raw_archive(destination)
             shutil.rmtree(staging)
             return destination
-        for path in destination.iterdir():
-            path.chmod(0o444)
         destination.chmod(0o555)
+        # Validate the sealed tree after the atomic rename.  A chmod or rename
+        # failure therefore cannot publish a writable/partial archive that a
+        # later collector might mistake for immutable state.
+        self._load_raw_archive(destination)
         return destination
 
     def _load_raw_archive(self, path: Path) -> EcmwfRawArchive:
@@ -780,6 +1352,15 @@ class EcmwfIfsEnsAdapter:
             if hashlib.sha256(_canonical_json(stable)).hexdigest() != archive_id:
                 raise EcmwfValidationError("archive manifest digest mismatch")
             artifacts = tuple(_artifact_from_json(item) for item in manifest["artifacts"])
+            _validate_archive_shape(manifest, artifacts)
+            _assert_archive_immutable(
+                path,
+                tuple(
+                    relative
+                    for artifact in artifacts
+                    for relative in (artifact.relative_path, artifact.index_relative_path)
+                ),
+            )
             for artifact in artifacts:
                 _verify_file(path, artifact.relative_path, artifact.byte_size, artifact.sha256)
                 _verify_file(
@@ -1201,11 +1782,199 @@ def _verify_file(root: Path, relative: str, size: int, digest: str) -> Path:
     return path
 
 
+def _validate_archive_shape(
+    manifest: Mapping[str, object], artifacts: Sequence[EcmwfArchiveArtifact]
+) -> None:
+    """Validate immutable archive structure before it can be reused or pruned."""
+
+    try:
+        product = EcmwfProduct(str(manifest["product"]))
+        raw_steps = manifest["steps"]
+        if not isinstance(raw_steps, (list, tuple)):
+            raise TypeError("steps must be a list")
+        steps = tuple(int(value) for value in raw_steps)
+        init_time = _parse_iso(manifest["init_time_utc"])
+        ensemble = manifest["ensemble"]
+    except (KeyError, TypeError, ValueError) as error:
+        raise EcmwfValidationError("archive manifest shape is malformed") from error
+    if not steps or tuple(sorted(set(steps))) != steps:
+        raise EcmwfValidationError("archive manifest steps are empty or not strictly ordered")
+    try:
+        _validate_request(init_time, steps, product)
+    except (TypeError, ValueError) as error:
+        raise EcmwfValidationError("archive manifest steps violate the product contract") from error
+    if len(artifacts) != len(steps):
+        raise EcmwfValidationError("archive manifest artifact/step coverage is incomplete")
+    expected_parameter = _parameter_for_product(product)
+    expected_metadata = {
+        "provider": "ecmwf-open-data",
+        "model": "ifs",
+        "resolution": "0p25",
+        "class": "od",
+        "stream": "enfo",
+        "data_type": "pf",
+        "parameter": expected_parameter,
+        "source_units": "K",
+    }
+    if any(manifest.get(key) != value for key, value in expected_metadata.items()):
+        raise EcmwfValidationError("archive manifest provenance metadata is invalid")
+    source_base = str(manifest.get("source_base_url", "")).rstrip("/")
+    if not source_base.startswith("https://"):
+        raise EcmwfValidationError("archive manifest source must use HTTPS")
+    if not isinstance(ensemble, Mapping):
+        raise EcmwfValidationError("archive manifest ensemble metadata is malformed")
+    if (
+        ensemble.get("member_count") != len(IFS_ENS_MEMBER_NUMBERS)
+        or ensemble.get("member_numbers") != list(IFS_ENS_MEMBER_NUMBERS)
+        or ensemble.get("control_member_included") is not False
+        or ensemble.get("single_run_substitution") is not False
+    ):
+        raise EcmwfValidationError("archive manifest ensemble coverage is incomplete")
+    seen_steps: set[int] = set()
+    seen_paths: set[str] = set()
+    expected_interval = _interval_for_product(product)
+    for artifact in artifacts:
+        if artifact.step_hours in seen_steps or artifact.step_hours not in steps:
+            raise EcmwfValidationError("archive manifest contains duplicate/unexpected steps")
+        seen_steps.add(artifact.step_hours)
+        expected_relative = f"step-{artifact.step_hours:03d}-{artifact.parameter}.grib2"
+        expected_index_relative = f"step-{artifact.step_hours:03d}-{artifact.parameter}.index"
+        stamp = init_time.strftime("%Y%m%d%H%M%S")
+        expected_index_url = (
+            f"{source_base}/{init_time:%Y%m%d}/{init_time:%H}z/ifs/0p25/enfo/"
+            f"{stamp}-{artifact.step_hours}h-enfo-ef.index"
+        )
+        expected_data_url = expected_index_url.removesuffix(".index") + ".grib2"
+        if (
+            artifact.parameter != expected_parameter
+            or artifact.interval_hours != expected_interval
+            or artifact.relative_path != expected_relative
+            or artifact.index_relative_path != expected_index_relative
+            or artifact.index_source_url != expected_index_url
+            or artifact.source_url != expected_data_url
+            or artifact.byte_size <= 0
+            or artifact.index_byte_size <= 0
+        ):
+            raise EcmwfValidationError("archive artifact metadata does not match the product")
+        for relative in (artifact.relative_path, artifact.index_relative_path):
+            if relative in seen_paths:
+                raise EcmwfValidationError("archive manifest contains duplicate artifact paths")
+            seen_paths.add(relative)
+    if seen_steps != set(steps):
+        raise EcmwfValidationError("archive manifest does not cover every requested step")
+
+
+def _assert_archive_immutable(path: Path, artifact_paths: Sequence[str]) -> None:
+    try:
+        root_stat = path.lstat()
+    except OSError as error:
+        raise EcmwfValidationError("archive root is not readable") from error
+    if (
+        not stat.S_ISDIR(root_stat.st_mode)
+        or stat.S_ISLNK(root_stat.st_mode)
+        or root_stat.st_mode & 0o222
+    ):
+        raise EcmwfValidationError("archive root is not immutable")
+    for relative in ("manifest.json", *artifact_paths):
+        candidate = _safe_archive_child(path, relative)
+        try:
+            item_stat = candidate.lstat()
+        except OSError as error:
+            raise EcmwfValidationError("archive immutable file is missing") from error
+        if (
+            not stat.S_ISREG(item_stat.st_mode)
+            or stat.S_ISLNK(item_stat.st_mode)
+            or item_stat.st_mode & 0o222
+        ):
+            raise EcmwfValidationError("archive contains a writable or linked artifact")
+
+
+def _seal_archive_tree(path: Path) -> None:
+    """Make every published archive file/dir read-only before rename."""
+
+    for current, directories, files in os.walk(path, topdown=False, followlinks=False):
+        current_path = Path(current)
+        for name in files:
+            candidate = current_path / name
+            item_stat = candidate.lstat()
+            if stat.S_ISLNK(item_stat.st_mode) or not stat.S_ISREG(item_stat.st_mode):
+                raise EcmwfValidationError("archive staging tree contains a non-regular file")
+            candidate.chmod(0o444)
+        for name in directories:
+            candidate = current_path / name
+            item_stat = candidate.lstat()
+            if stat.S_ISLNK(item_stat.st_mode) or not stat.S_ISDIR(item_stat.st_mode):
+                raise EcmwfValidationError("archive staging tree contains a linked directory")
+            candidate.chmod(0o555)
+    path.chmod(0o555)
+
+
+def _safe_archive_child(root: Path, relative: str) -> Path:
+    candidate = Path(relative)
+    if candidate.is_absolute() or not candidate.parts or ".." in candidate.parts:
+        raise EcmwfValidationError("archive artifact path is unsafe")
+    path = root.joinpath(*candidate.parts)
+    if not path.resolve().is_relative_to(root.resolve()):
+        raise EcmwfValidationError("archive artifact path escapes root")
+    return path
+
+
+def _tree_size(path: Path) -> int:
+    """Return apparent bytes without following links or reading file bodies."""
+
+    try:
+        if path.is_symlink() or not path.is_dir():
+            return path.lstat().st_size
+        total = 0
+        for root, directories, files in os.walk(path, followlinks=False):
+            root_path = Path(root)
+            for name in (*directories, *files):
+                candidate = root_path / name
+                try:
+                    total += candidate.lstat().st_size
+                except FileNotFoundError:
+                    continue
+        return total
+    except FileNotFoundError:
+        return 0
+
+
+def _tree_relative_entries(path: Path) -> set[str]:
+    entries: set[str] = set()
+    for root, directories, files in os.walk(path, followlinks=False):
+        root_path = Path(root)
+        for name in (*directories, *files):
+            entries.add(str((root_path / name).relative_to(path)))
+    return entries
+
+
+def _remove_archive_tree(path: Path, *, archive_root: Path) -> None:
+    """Delete one verified archive without following links outside its root."""
+
+    root = archive_root.resolve()
+    candidate = path.resolve()
+    if (
+        candidate.parent != root
+        or _ARCHIVE_ID_RE.fullmatch(candidate.name) is None
+        or path.is_symlink()
+    ):
+        raise OSError("refusing to delete an unsafe archive path")
+    for current, directories, _ in os.walk(candidate, topdown=False, followlinks=False):
+        for directory in directories:
+            child = Path(current) / directory
+            if not child.is_symlink():
+                child.chmod(0o700)
+    candidate.chmod(0o700)
+    shutil.rmtree(candidate)
+
+
 __all__ = [
     "ECMWF_OPEN_DATA_URL",
     "IFS_ENS_MEMBER_NUMBERS",
     "EcCodesPointDecoder",
     "EcmwfArchiveResult",
+    "EcmwfArchiveRetentionPolicy",
+    "EcmwfArchiveRetentionReport",
     "EcmwfBatchFetchResult",
     "EcmwfBatchSnapshot",
     "EcmwfDailyMaximum",
