@@ -308,6 +308,22 @@ surface ниже.
 переводятся из Kelvin в Celsius. WeatherNext остаётся shadow/read-only и не
 включает реальные сделки.
 
+Если самый новый выпуск уже потерял начало текущего station-local дня, preflight
+не подменяет часы: он ищет ближайший более ранний выпуск, который покрывает все
+цели полностью, и только затем строит точный compressed-size manifest. Если
+такого выпуска нет, манифест остаётся `blocked_incomplete_coverage`.
+После отдельного согласования лимитов можно сначала измерить один блок, не
+публикуя snapshot:
+
+```bash
+uv run polybot weathernext autonomous-refresh \
+  --read-approved --probe-one-block --json
+```
+
+Проба возвращает compressed bytes, decoded shape/bytes и длительность; полный
+проход запускается отдельным timer-run и публикует snapshot только после
+проверки 64 участников и полного набора UTC-часов.
+
 ## Docker Compose
 
 По умолчанию контейнер запускается только как observer:

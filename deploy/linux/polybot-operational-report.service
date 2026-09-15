@@ -9,7 +9,7 @@ Group=polybot
 WorkingDirectory=/opt/polybot
 EnvironmentFile=/etc/polybot/polybot.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/polybot/.venv/bin/python /opt/polybot/scripts/operational-report.py --database /var/lib/polybot/polybot.sqlite3 --state-root /var/lib/polybot --ecmwf-json-root /var/lib/polybot/forecasts/ecmwf-ifs025-json --weathernext-statistics-snapshot /var/lib/polybot/weathernext-statistics-snapshot.json --hours 24 --output /var/lib/polybot/reports/operational-24h.json --json
+ExecStart=/opt/polybot/.venv/bin/python /opt/polybot/scripts/operational-report.py --database /var/lib/polybot/polybot.sqlite3 --state-root /var/lib/polybot --ecmwf-json-root /var/lib/polybot/forecasts/ecmwf-ifs025-json --weathernext-full-root /var/lib/polybot/weathernext/full --weathernext-statistics-snapshot /var/lib/polybot/weathernext-statistics-snapshot.json --hours 24 --output /var/lib/polybot/reports/operational-24h.json --json
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true

@@ -11,9 +11,9 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import asdict
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from polybot.ecmwf import EcmwfArchiveRetentionPolicy, EcmwfIfsEnsAdapter
 from polybot.forecast_models import (
@@ -59,6 +59,9 @@ _SAFE_SOURCE_PAYLOAD_KEYS = frozenset(
     }
 )
 _SNAPSHOT_READ_LIMIT_BYTES = 8 * 1024 * 1024
+_FULL_STATUS_READ_LIMIT_BYTES = 1 * 1024 * 1024
+_FULL_INDEX_READ_LIMIT_BYTES = 8 * 1024 * 1024
+_FULL_MAX_TARGET_REPORT = 256
 
 
 def _utc(value: datetime) -> datetime:
@@ -547,12 +550,555 @@ def _local_snapshot(path: Path | None, *, summary_only: bool) -> dict[str, objec
     return base
 
 
+def _read_bounded_json(path: Path, *, limit_bytes: int) -> tuple[str, object | None, int | None]:
+    """Read one small local JSON artifact without following unbounded payloads.
+
+    Operational reporting is deliberately a metadata/read-evidence operation.  A
+    malformed or oversized artifact is represented by a stable state rather than
+    exposing parser errors (which could contain arbitrary file contents).
+    """
+
+    candidate = path.expanduser().resolve()
+    if not candidate.is_file():
+        return "missing", None, None
+    try:
+        size = candidate.stat().st_size
+    except OSError:
+        return "error", None, None
+    if size > limit_bytes:
+        return "too_large", None, size
+    try:
+        return "available", json.loads(candidate.read_text(encoding="utf-8")), size
+    except (OSError, UnicodeError, ValueError, TypeError):
+        return "invalid", None, size
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.expanduser().resolve().relative_to(root.expanduser().resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _full_refresh_base(root: Path | None) -> dict[str, object]:
+    if root is None:
+        return {
+            "configured": False,
+            "root": None,
+            "manifest_path": None,
+            "approval_path": None,
+            "refresh_status_path": None,
+            "index_path": None,
+            "snapshot_root": None,
+            "access_state": "not_configured",
+            "load_state": "not_configured",
+            "mode": "FULL_ENSEMBLE",
+            "network_access_performed": False,
+            "manifest_state": "not_checked",
+            "approval_state": "not_checked",
+            "approval_valid": False,
+            "approval_expires_at_utc": None,
+            "payload_read": False,
+            "read_evidence": False,
+            "refresh_status_state": "not_checked",
+            "index_state": "not_checked",
+            "index_manifest_binding": "not_bound",
+            "coverage_state": "not_checked",
+            "expected_target_count": 0,
+            "actual_target_count": 0,
+            "complete_target_count": 0,
+            "partial_target_count": 0,
+            "missing_target_count": 0,
+            "complete_targets": [],
+            "partial_targets": [],
+            "missing_targets": [],
+            "targets": [],
+            "manifest_sha256": None,
+            "release_id": None,
+            "init_time_utc": None,
+            "expected_network_bytes": None,
+            "expected_object_count": None,
+        }
+    resolved = root.expanduser().resolve()
+    return {
+        **_full_refresh_base(None),
+        "configured": True,
+        "root": str(resolved),
+        "manifest_path": str(resolved / "read-manifest.json"),
+        "approval_path": str(resolved / "read-approval.json"),
+        "refresh_status_path": str(resolved / "refresh-status.json"),
+        "index_path": str(resolved / "latest-index.json"),
+        "snapshot_root": str(resolved / "snapshots"),
+        "access_state": "not_checked",
+        "load_state": "missing",
+    }
+
+
+def _target_times(target: Mapping[str, object]) -> list[str]:
+    raw = target.get("valid_times_utc")
+    if not isinstance(raw, list):
+        return []
+    result: list[str] = []
+    for value in raw:
+        parsed = _parse_datetime(value)
+        if parsed is None:
+            return []
+        result.append(parsed.isoformat())
+    return result
+
+
+def _full_target_snapshot_report(
+    target: Mapping[str, object],
+    *,
+    snapshot_root: Path,
+    release_id: str,
+    init_time_utc: datetime,
+) -> dict[str, object]:
+    """Validate one immutable trajectory file using only bounded local reads."""
+
+    target_id = str(target.get("target_id") or target.get("station_id") or "").strip()
+    expected_times = _target_times(target)
+    expected_members = [f"member-{index:03d}" for index in range(64)]
+    raw_path = target.get("snapshot_path")
+    record: dict[str, object] = {
+        "target_id": target_id or None,
+        "path": raw_path if isinstance(raw_path, str) else None,
+        "status": "missing",
+        "error_code": None,
+        "expected_member_count": len(expected_members),
+        "actual_member_count": 0,
+        "expected_hour_count": len(expected_times),
+        "actual_hour_count": 0,
+        "member_coverage": "missing",
+        "hour_coverage": "missing",
+        "release_id": None,
+        "init_time_utc": None,
+        "observation_date": target.get("observation_date"),
+        "station_id": target_id or None,
+    }
+    if not target_id:
+        record.update({"status": "partial", "error_code": "missing_target_id"})
+        return record
+    coverage_complete = False
+    if target.get("complete_station_local_day") is True and expected_times:
+        try:
+            from polybot.weathernext_manifest import assess_station_local_day_coverage
+
+            coverage_complete, _ = assess_station_local_day_coverage(
+                date.fromisoformat(str(target.get("observation_date", ""))),
+                str(target.get("observation_timezone", "UTC")),
+                expected_times,
+            )
+        except (TypeError, ValueError):
+            coverage_complete = False
+    if not coverage_complete:
+        record.update({"status": "partial", "error_code": "incomplete_expected_hours"})
+        return record
+    if not isinstance(raw_path, str) or not raw_path:
+        record.update({"status": "partial", "error_code": "missing_snapshot_path"})
+        return record
+    path = Path(raw_path).expanduser().resolve()
+    record["path"] = str(path)
+    if not _path_is_within(path, snapshot_root):
+        record.update({"status": "partial", "error_code": "snapshot_path_outside_root"})
+        return record
+    state, payload, size = _read_bounded_json(path, limit_bytes=_SNAPSHOT_READ_LIMIT_BYTES)
+    if size is not None:
+        record["size_bytes"] = size
+    if state == "missing":
+        return record
+    if state == "too_large":
+        record.update({"status": "partial", "error_code": "snapshot_too_large"})
+        return record
+    if state != "available" or not isinstance(payload, Mapping):
+        record.update({"status": "partial", "error_code": "snapshot_invalid_json"})
+        return record
+
+    # Pydantic performs the finite-value/provenance checks shared by the reader
+    # and report.  Import lazily to keep the operational report import-light.
+    try:
+        from polybot.weathernext import WeatherNextSnapshot
+
+        snapshot = WeatherNextSnapshot.model_validate(payload)
+    except Exception:
+        record.update({"status": "partial", "error_code": "snapshot_schema_invalid"})
+        return record
+
+    actual_members = list(snapshot.member_ids)
+    if not actual_members and snapshot.trajectories:
+        actual_members = [str(item.get("member_id", "")) for item in snapshot.trajectories]
+    member_ids_field_complete = list(snapshot.member_ids) == expected_members
+    actual_times = [value.isoformat() for value in snapshot.valid_times_utc]
+    record.update(
+        {
+            "actual_member_count": len(actual_members),
+            "actual_hour_count": len(actual_times),
+            "member_coverage": (
+                "complete" if actual_members == expected_members else "partial"
+            ),
+            "hour_coverage": "complete" if actual_times == expected_times else "partial",
+            "release_id": snapshot.release_id,
+            "init_time_utc": _iso(snapshot.init_time_utc),
+            "units": snapshot.units,
+            "observation_date": snapshot.observation_date.isoformat(),
+            "station_id": snapshot.station_id,
+        }
+    )
+    if (
+        snapshot.release_id != release_id
+        or snapshot.init_time_utc != init_time_utc
+        or snapshot.station_id != target_id
+        or snapshot.observation_date.isoformat() != str(target.get("observation_date"))
+        or not member_ids_field_complete
+        or actual_members != expected_members
+        or actual_times != expected_times
+        or len(snapshot.trajectories) != len(expected_members)
+        or any(
+            not isinstance(item.get("values_c"), list)
+            or len(cast(list[object], item["values_c"])) != len(expected_times)
+            for item in snapshot.trajectories
+        )
+    ):
+        record.update({"status": "partial", "error_code": "coverage_or_provenance_mismatch"})
+        return record
+    record.update({"status": "complete", "error_code": None})
+    return record
+
+
+def _weathernext_full_refresh_report(
+    root: Path | None,
+    *,
+    manifest_path: Path | None = None,
+    approval_path: Path | None = None,
+    refresh_status_path: Path | None = None,
+    index_path: Path | None = None,
+    snapshot_root: Path | None = None,
+    now: datetime,
+) -> dict[str, object]:
+    """Inspect approval/read evidence and trajectory coverage without GCS I/O."""
+
+    base = _full_refresh_base(root)
+    if root is None and manifest_path is None:
+        return base
+    effective_root = (
+        root.expanduser().resolve()
+        if root is not None
+        else manifest_path.expanduser().resolve().parent  # type: ignore[union-attr]
+    )
+    manifest = (manifest_path or effective_root / "read-manifest.json").expanduser().resolve()
+    approval = (approval_path or effective_root / "read-approval.json").expanduser().resolve()
+    status_file = (
+        refresh_status_path or effective_root / "refresh-status.json"
+    ).expanduser().resolve()
+    index_file = (index_path or effective_root / "latest-index.json").expanduser().resolve()
+    snapshot_dir = (snapshot_root or effective_root / "snapshots").expanduser().resolve()
+    report = _full_refresh_base(effective_root)
+    report.update(
+        {
+            "manifest_path": str(manifest),
+            "approval_path": str(approval),
+            "refresh_status_path": str(status_file),
+            "index_path": str(index_file),
+            "snapshot_root": str(snapshot_dir),
+        }
+    )
+
+    manifest_state, raw_manifest, manifest_size = _read_bounded_json(
+        manifest, limit_bytes=_SNAPSHOT_READ_LIMIT_BYTES
+    )
+    if manifest_size is not None:
+        report["manifest_size_bytes"] = manifest_size
+    manifest_obj: Any = None
+    if manifest_state == "missing":
+        report.update({"manifest_state": "missing", "access_state": "manifest_missing"})
+        report["load_state"] = "missing"
+        return report
+    if manifest_state == "too_large":
+        report.update(
+            {
+                "manifest_state": "too_large_for_metadata_report",
+                "access_state": "manifest_too_large",
+            }
+        )
+        report["load_state"] = "invalid"
+        return report
+    if manifest_state != "available" or not isinstance(raw_manifest, Mapping):
+        report.update({"manifest_state": "invalid", "access_state": "manifest_invalid"})
+        report["load_state"] = "invalid"
+        return report
+    try:
+        from polybot.weathernext_manifest import WeatherNextFullReadManifest, verify_manifest_sha256
+
+        manifest_obj = WeatherNextFullReadManifest.model_validate(raw_manifest)
+    except Exception:
+        report.update({"manifest_state": "invalid", "access_state": "manifest_invalid"})
+        report["load_state"] = "invalid"
+        return report
+    report["manifest_sha256"] = manifest_obj.manifest_sha256
+    if not verify_manifest_sha256(manifest_obj):
+        report.update({"manifest_state": "digest_mismatch", "access_state": "manifest_invalid"})
+        report["load_state"] = "invalid"
+        return report
+    report.update(
+        {
+            "manifest_state": "valid",
+            "release_id": manifest_obj.release_id,
+            "init_time_utc": _iso(manifest_obj.init_time_utc),
+            "expected_target_count": len(manifest_obj.targets),
+            "expected_network_bytes": manifest_obj.approval_gate.expected_network_bytes,
+            "expected_object_count": manifest_obj.approval_gate.object_count,
+            "provenance": {
+                "source_uri": manifest_obj.source_uri,
+                "release_id": manifest_obj.release_id,
+                "init_time_utc": _iso(manifest_obj.init_time_utc),
+                "variable": manifest_obj.variable,
+                "units": manifest_obj.units,
+                "metadata_only": manifest_obj.metadata_only,
+                "payload_read": manifest_obj.payload_read,
+                "expected_network_bytes": manifest_obj.approval_gate.expected_network_bytes,
+                "object_count": manifest_obj.approval_gate.object_count,
+                "max_network_bytes": manifest_obj.approval_gate.max_network_bytes,
+                "max_objects": manifest_obj.approval_gate.max_objects,
+            },
+        }
+    )
+
+    # Approval is checked through the same fail-closed local verifier used by
+    # the reader.  No GCS client is instantiated here.
+    try:
+        from polybot.weathernext_autonomy import verify_read_approval
+
+        approval_result = verify_read_approval(
+            manifest,
+            approval,
+            now_utc=now,
+        )
+    except Exception:
+        approval_result = None
+    approval_state = "invalid"
+    if approval_result is not None:
+        approval_state = str(approval_result.state)
+        report.update(
+            {
+                "expected_network_bytes": approval_result.expected_network_bytes
+                or report.get("expected_network_bytes"),
+                "expected_object_count": approval_result.object_count
+                or report.get("expected_object_count"),
+                # Do not copy verifier/parser text into a report: malformed
+                # sidecars can contain arbitrary values, including secrets.
+                "approval_message": f"local approval state: {approval_state}",
+            }
+        )
+    approval_file_state, raw_approval, approval_size = _read_bounded_json(
+        approval, limit_bytes=_FULL_STATUS_READ_LIMIT_BYTES
+    )
+    if approval_size is not None:
+        report["approval_size_bytes"] = approval_size
+    if approval_file_state == "too_large":
+        approval_state = "invalid"
+    elif approval_file_state == "available" and isinstance(raw_approval, Mapping):
+        expires = _parse_datetime(raw_approval.get("expires_at_utc"))
+        approved_at = _parse_datetime(raw_approval.get("approved_at_utc"))
+        report["approval_expires_at_utc"] = _iso(expires)
+        report["approval_approved_at_utc"] = _iso(approved_at)
+        if expires is not None and now >= expires:
+            approval_state = "expired"
+    report.update(
+        {
+            "approval_state": approval_state,
+            "approval_valid": approval_state == "approved",
+            "access_state": "approved" if approval_state == "approved" else approval_state,
+        }
+    )
+
+    # Refresh status is evidence produced by the bounded sequential reader;
+    # approval alone is never treated as a payload read.
+    status_state, raw_status, status_size = _read_bounded_json(
+        status_file, limit_bytes=_FULL_STATUS_READ_LIMIT_BYTES
+    )
+    if status_size is not None:
+        report["refresh_status_size_bytes"] = status_size
+    status_obj: Any = None
+    if status_state == "available" and isinstance(raw_status, Mapping):
+        try:
+            from polybot.weathernext_autonomy import WeatherNextRefreshStatus
+
+            status_obj = WeatherNextRefreshStatus.model_validate(raw_status)
+        except Exception:
+            status_state = "invalid"
+    elif status_state == "too_large":
+        status_state = "too_large_for_metadata_report"
+    report["refresh_status_state"] = status_state
+    status_path_matches = False
+    status_approval_matches = False
+    status_read_evidence = False
+    if status_obj is not None:
+        status_manifest_path = Path(status_obj.manifest_path).expanduser().resolve()
+        status_path_matches = status_manifest_path == manifest
+        status_approval_matches = (
+            status_obj.approval.manifest_sha256 == manifest_obj.manifest_sha256
+        )
+        report.update(
+            {
+                "refresh_generated_at_utc": _iso(status_obj.generated_at_utc),
+                "payload_read": bool(status_obj.payload_read),
+                "status_target_count": status_obj.target_count,
+                "snapshots_written": status_obj.snapshots_written,
+                "status_manifest_state": status_obj.manifest_state,
+                "status_path_matches_manifest": status_path_matches,
+                "status_approval_matches_manifest": status_approval_matches,
+            }
+        )
+        status_read_evidence = bool(
+            status_obj.payload_read and status_path_matches and status_approval_matches
+        )
+    else:
+        report.update(
+            {
+                "payload_read": False,
+                "status_path_matches_manifest": False,
+                "status_approval_matches_manifest": False,
+            }
+        )
+    report["read_evidence"] = status_read_evidence
+
+    # The index is useful for inventory, but the current writer does not bind
+    # it to a manifest digest.  Therefore it is never accepted as the sole
+    # provenance proof and is explicitly labelled not_bound.
+    index_state, raw_index, index_size = _read_bounded_json(
+        index_file, limit_bytes=_FULL_INDEX_READ_LIMIT_BYTES
+    )
+    if index_size is not None:
+        report["index_size_bytes"] = index_size
+    index_entries: list[Mapping[str, object]] = []
+    if index_state == "available" and isinstance(raw_index, Mapping):
+        raw_entries = raw_index.get("entries")
+        schema_ok = raw_index.get("schema_version") == "weathernext-full-snapshot-index/v1"
+        if not schema_ok or not isinstance(raw_entries, list):
+            index_state = "invalid"
+        else:
+            index_entries = [item for item in raw_entries if isinstance(item, Mapping)]
+            index_state = "valid"
+    elif index_state == "too_large":
+        index_state = "too_large_for_metadata_report"
+    report["index_state"] = index_state
+    digest_values = {
+        str(item.get("manifest_sha256"))
+        for item in index_entries
+        if item.get("manifest_sha256")
+    }
+    if digest_values:
+        report["index_manifest_binding"] = (
+            "bound" if digest_values == {manifest_obj.manifest_sha256} else "mismatch"
+        )
+    else:
+        report["index_manifest_binding"] = "not_bound"
+
+    # Validate every target directly from the manifest paths.  This remains
+    # bounded and local; no array, chunk, or shard is fetched.
+    target_records: list[dict[str, object]] = []
+    complete: list[str] = []
+    partial: list[str] = []
+    missing: list[str] = []
+    seen_targets: set[str] = set()
+    for raw_target in manifest_obj.targets:
+        target = raw_target if isinstance(raw_target, Mapping) else {}
+        target_id = str(target.get("target_id") or target.get("station_id") or "").strip()
+        if target_id in seen_targets:
+            record = {
+                "target_id": target_id or None,
+                "status": "partial",
+                "error_code": "duplicate_target_id",
+            }
+        else:
+            seen_targets.add(target_id)
+            record = _full_target_snapshot_report(
+                target,
+                snapshot_root=snapshot_dir,
+                release_id=manifest_obj.release_id,
+                init_time_utc=manifest_obj.init_time_utc,
+            )
+        target_records.append(record)
+        if record.get("status") == "complete":
+            complete.append(str(record.get("target_id")))
+        elif record.get("status") == "missing":
+            missing.append(str(record.get("target_id")))
+        else:
+            partial.append(str(record.get("target_id")))
+
+    expected_index_paths = {
+        str(Path(str(target.get("snapshot_path"))).expanduser().resolve())
+        for target in manifest_obj.targets
+        if isinstance(target, Mapping) and target.get("snapshot_path")
+    }
+    indexed_paths = {
+        str(Path(str(item.get("path"))).expanduser().resolve())
+        for item in index_entries
+        if item.get("path")
+    }
+    index_complete = index_state == "valid" and expected_index_paths.issubset(indexed_paths)
+    if index_state == "valid" and not index_complete:
+        index_state = "incomplete"
+    report["index_state"] = index_state
+    read_evidence = status_read_evidence and index_complete
+    report["read_evidence"] = read_evidence
+
+    # Keep the report bounded even if an operator accidentally places a huge
+    # manifest in the directory. Counts remain exact; detail rows are capped.
+    report["targets"] = target_records[:_FULL_MAX_TARGET_REPORT]
+    report.update(
+        {
+            "actual_target_count": len(
+                [item for item in target_records if item.get("status") != "missing"]
+            ),
+            "complete_target_count": len(complete),
+            "partial_target_count": len(partial),
+            "missing_target_count": len(missing),
+            "complete_targets": complete[:_FULL_MAX_TARGET_REPORT],
+            "partial_targets": partial[:_FULL_MAX_TARGET_REPORT],
+            "missing_targets": missing[:_FULL_MAX_TARGET_REPORT],
+            "member_hour_coverage": {
+                "expected_member_count": 64,
+                "complete_member_target_count": sum(
+                    item.get("member_coverage") == "complete" for item in target_records
+                ),
+                "complete_hour_target_count": sum(
+                    item.get("hour_coverage") == "complete" for item in target_records
+                ),
+            },
+        }
+    )
+    if not target_records or len(missing) == len(target_records):
+        coverage_state = "missing"
+    elif missing or partial:
+        coverage_state = "partial"
+    else:
+        coverage_state = "complete"
+    report["coverage_state"] = coverage_state
+    if coverage_state == "complete" and read_evidence and approval_state == "approved":
+        report["load_state"] = "approved_and_complete"
+    elif coverage_state == "complete" and not read_evidence:
+        report["load_state"] = "complete_without_read_evidence"
+    elif coverage_state == "partial":
+        report["load_state"] = "partial"
+    else:
+        report["load_state"] = "missing"
+    return report
+
+
 def _source_report(
     connection: sqlite3.Connection,
     tables: set[str],
     *,
     cutoff: datetime,
     now: datetime,
+    weathernext_full_root: Path | None,
+    weathernext_manifest_path: Path | None,
+    weathernext_approval_path: Path | None,
+    weathernext_refresh_status_path: Path | None,
+    weathernext_snapshot_index_path: Path | None,
+    weathernext_snapshot_root: Path | None,
     weathernext_full_snapshot_path: Path | None,
     weathernext_statistics_snapshot_path: Path | None,
 ) -> dict[str, object]:
@@ -597,7 +1143,21 @@ def _source_report(
     ecmwf_statuses = {
         key: value for key, value in source_statuses.items() if "ecmwf" in key.lower()
     }
-    full_snapshot = _local_snapshot(weathernext_full_snapshot_path, summary_only=False)
+    # ``weathernext_full_snapshot_path`` is retained as a legacy/diagnostic
+    # input.  Approval-gated trajectories are reported separately and can only
+    # become available after local manifest, approval, status, index, and target
+    # coverage checks all pass.
+    legacy_full_snapshot = _local_snapshot(weathernext_full_snapshot_path, summary_only=False)
+    full_snapshot = _weathernext_full_refresh_report(
+        weathernext_full_root,
+        manifest_path=weathernext_manifest_path,
+        approval_path=weathernext_approval_path,
+        refresh_status_path=weathernext_refresh_status_path,
+        index_path=weathernext_snapshot_index_path,
+        snapshot_root=weathernext_snapshot_root,
+        now=now,
+    )
+    full_snapshot["legacy_snapshot"] = legacy_full_snapshot
     statistics_snapshot = _local_snapshot(weathernext_statistics_snapshot_path, summary_only=True)
     return {
         "v1": {
@@ -621,6 +1181,8 @@ def _source_report(
             **algorithm(WEATHERNEXT_ALGORITHM_VERSION),
             "database_snapshots": weathernext_snapshots,
             "full_ensemble_snapshot": full_snapshot,
+            "full_refresh": full_snapshot,
+            "legacy_snapshot": legacy_full_snapshot,
             "statistics_snapshot": statistics_snapshot,
             "state": _source_state(
                 predictions.get(WEATHERNEXT_ALGORITHM_VERSION),
@@ -644,7 +1206,10 @@ def _source_state(*items: Mapping[str, object] | None) -> str:
             continue
         total += _as_int(item.get("total_count"))
         period += _as_int(item.get("period_count"))
-        locally_available = locally_available or item.get("load_state") == "available"
+        locally_available = locally_available or item.get("load_state") in {
+            "available",
+            "approved_and_complete",
+        }
     if period:
         return "active_in_period"
     if total or locally_available:
@@ -881,6 +1446,105 @@ def _directory_inventory(path: Path | None) -> dict[str, object]:
         }
     )
     return base
+
+
+def _weathernext_full_inventory(path: Path | None) -> dict[str, object]:
+    """Inventory approval-gated WeatherNext artifacts without deleting anything."""
+
+    if path is None:
+        return {
+            "configured": False,
+            "exists": False,
+            "path": None,
+            "file_count": 0,
+            "total_bytes": 0,
+            "snapshot_file_count": 0,
+            "manifest_file_count": 0,
+            "approval_file_count": 0,
+            "status_file_count": 0,
+            "index_file_count": 0,
+            "partial_directory_count": 0,
+            "stat_error_count": 0,
+            "retention_policy": {
+                "mode": "inventory_only",
+                "deletion_performed": False,
+                "within_limits": None,
+            },
+        }
+    root = path.expanduser().resolve()
+    result: dict[str, object] = {
+        "configured": True,
+        "exists": root.is_dir(),
+        "path": str(root),
+        "file_count": 0,
+        "total_bytes": 0,
+        "snapshot_file_count": 0,
+        "manifest_file_count": 0,
+        "approval_file_count": 0,
+        "status_file_count": 0,
+        "index_file_count": 0,
+        "partial_directory_count": 0,
+        "stat_error_count": 0,
+        "oldest_file_at_utc": None,
+        "newest_file_at_utc": None,
+        "retention_policy": {
+            "mode": "inventory_only",
+            "deletion_performed": False,
+            "within_limits": None,
+            "note": "No WeatherNext full snapshot is deleted or pruned by the report.",
+        },
+    }
+    if not root.is_dir():
+        return result
+    mtimes: list[float] = []
+    file_count = total_bytes = stat_errors = 0
+    snapshot_count = manifest_count = approval_count = status_count = index_count = 0
+    partial_count = 0
+    for current, directories, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        directories[:] = [name for name in directories if not (current_path / name).is_symlink()]
+        partial_count += sum(
+            name.startswith((".tmp", ".staging", "tmp-", "staging-"))
+            for name in directories
+        )
+        for name in files:
+            candidate = current_path / name
+            if candidate.is_symlink():
+                continue
+            try:
+                stat = candidate.stat()
+            except OSError:
+                stat_errors += 1
+                continue
+            file_count += 1
+            total_bytes += stat.st_size
+            mtimes.append(stat.st_mtime)
+            if current_path == root / "snapshots" or (root / "snapshots") in current_path.parents:
+                snapshot_count += 1
+            if name == "read-manifest.json":
+                manifest_count += 1
+            elif name == "read-approval.json":
+                approval_count += 1
+            elif name == "refresh-status.json":
+                status_count += 1
+            elif name == "latest-index.json":
+                index_count += 1
+    result.update(
+        {
+            "file_count": file_count,
+            "total_bytes": total_bytes,
+            "snapshot_file_count": snapshot_count,
+            "manifest_file_count": manifest_count,
+            "approval_file_count": approval_count,
+            "status_file_count": status_count,
+            "index_file_count": index_count,
+            "partial_directory_count": partial_count,
+            "stat_error_count": stat_errors,
+            "oldest_file_at_utc": _file_time(min(mtimes)) if mtimes else None,
+            "newest_file_at_utc": _file_time(max(mtimes)) if mtimes else None,
+        }
+    )
+    return result
 
 
 def _ecmwf_raw_inventory(
@@ -1287,6 +1951,12 @@ def build_operational_report(
     backup_root: Path | None = None,
     ecmwf_json_root: Path | None = None,
     ecmwf_raw_root: Path | None = None,
+    weathernext_full_root: Path | None = None,
+    weathernext_manifest_path: Path | None = None,
+    weathernext_approval_path: Path | None = None,
+    weathernext_refresh_status_path: Path | None = None,
+    weathernext_snapshot_index_path: Path | None = None,
+    weathernext_snapshot_root: Path | None = None,
     weathernext_full_snapshot_path: Path | None = None,
     weathernext_statistics_snapshot_path: Path | None = None,
     period_hours: float = 24,
@@ -1349,6 +2019,12 @@ def build_operational_report(
             tables,
             cutoff=cutoff,
             now=generated,
+            weathernext_full_root=weathernext_full_root,
+            weathernext_manifest_path=weathernext_manifest_path,
+            weathernext_approval_path=weathernext_approval_path,
+            weathernext_refresh_status_path=weathernext_refresh_status_path,
+            weathernext_snapshot_index_path=weathernext_snapshot_index_path,
+            weathernext_snapshot_root=weathernext_snapshot_root,
             weathernext_full_snapshot_path=weathernext_full_snapshot_path,
             weathernext_statistics_snapshot_path=weathernext_statistics_snapshot_path,
         )
@@ -1402,6 +2078,7 @@ def build_operational_report(
             ),
             "ecmwf_json_archive": _directory_inventory(json_ecmwf),
             "ecmwf_raw_archive": raw_inventory,
+            "weathernext_full_archive": _weathernext_full_inventory(weathernext_full_root),
         },
         "scan_modes": cycles.get("scan_modes", {}),
         "paper_live_safety": safety,
@@ -1433,6 +2110,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--ecmwf-raw-root", type=Path, default=None)
+    parser.add_argument(
+        "--weathernext-full-root",
+        type=Path,
+        default=_path_from_env("POLYBOT_WEATHERNEXT_FULL_ROOT", None),
+    )
+    parser.add_argument("--weathernext-manifest", type=Path, default=None)
+    parser.add_argument("--weathernext-approval", type=Path, default=None)
+    parser.add_argument("--weathernext-refresh-status", type=Path, default=None)
+    parser.add_argument("--weathernext-snapshot-index", type=Path, default=None)
+    parser.add_argument("--weathernext-snapshot-root", type=Path, default=None)
     parser.add_argument(
         "--weathernext-full-snapshot",
         type=Path,
@@ -1529,6 +2216,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         backup_root=args.backup_root,
         ecmwf_json_root=args.ecmwf_json_root,
         ecmwf_raw_root=args.ecmwf_raw_root,
+        weathernext_full_root=args.weathernext_full_root,
+        weathernext_manifest_path=args.weathernext_manifest,
+        weathernext_approval_path=args.weathernext_approval,
+        weathernext_refresh_status_path=args.weathernext_refresh_status,
+        weathernext_snapshot_index_path=args.weathernext_snapshot_index,
+        weathernext_snapshot_root=args.weathernext_snapshot_root,
         weathernext_full_snapshot_path=args.weathernext_full_snapshot,
         weathernext_statistics_snapshot_path=args.weathernext_statistics_snapshot,
         period_hours=args.hours,

@@ -12,6 +12,7 @@ from polybot.weathernext_manifest import (
     WeatherNextReadApproval,
     build_full_ensemble_read_manifest,
     estimate_and_build_full_ensemble_read_manifest_batch,
+    expected_station_local_day_hours,
     recompute_manifest_sha256,
     validate_read_approval,
     verify_manifest_sha256,
@@ -32,7 +33,17 @@ def _estimate(
     *,
     source: str = _SOURCE,
     sharding: bool = False,
+    observation_date: str = "2026-09-15",
+    observation_timezone: str = "Europe/Amsterdam",
+    selected_valid_times_utc: list[str] | None = None,
 ) -> dict[str, object]:
+    if selected_valid_times_utc is None:
+        selected_valid_times_utc = [
+            value.isoformat()
+            for value in expected_station_local_day_hours(
+                date.fromisoformat(observation_date), observation_timezone
+            )
+        ]
     return {
         "target_id": target_id,
         "metadata_only": True,
@@ -42,12 +53,9 @@ def _estimate(
         "location": target_id,
         "latitude": 52.3,
         "longitude": 4.8,
-        "observation_date": "2026-09-15",
-        "observation_timezone": "Europe/Amsterdam",
-        "selected_valid_times_utc": [
-            "2026-09-15T00:00:00+00:00",
-            "2026-09-15T01:00:00+00:00",
-        ],
+        "observation_date": observation_date,
+        "observation_timezone": observation_timezone,
+        "selected_valid_times_utc": selected_valid_times_utc,
         "expected_network_bytes": sum(sizes) if sizes else 1000,
         "global_uncompressed_array_bytes": 148 * 1024**3,
         "global_array_is_not_mandatory_transfer": True,
@@ -141,6 +149,82 @@ def test_manifest_blocks_per_object_limit() -> None:
     )
     assert manifest.approval_gate.state == "blocked_object_size_limit"
     assert manifest.approval_gate.largest_compressed_object_bytes == 501
+
+
+def test_manifest_blocks_incomplete_station_day_even_when_hour_count_looks_valid() -> None:
+    expected = [
+        value.isoformat()
+        for value in expected_station_local_day_hours(date(2026, 9, 15), "Europe/Amsterdam")
+    ]
+    # Keep 24 values but replace one expected instant with a duplicate-hour gap.
+    shifted = expected[:12] + ["2026-09-15T10:30:00+00:00"] + expected[13:]
+    manifest = build_full_ensemble_read_manifest(
+        _estimate(
+            "EHAM",
+            [[0, 0, 0, 0]],
+            [100],
+            selected_valid_times_utc=shifted,
+        ),
+        billing_project="weather-508105",
+        max_network_bytes=10_000,
+        max_objects=10,
+    )
+    assert manifest.approval_gate.state == "blocked_incomplete_coverage"
+    assert manifest.approval_gate.coverage_complete is False
+    assert manifest.approval_gate.incomplete_target_ids == ["EHAM"]
+    assert manifest.period["all_targets_complete_station_local_day"] is False
+    assert manifest.period["coverage_basis"] == "exact_hourly_station_local_day"
+    assert manifest.targets[0]["complete_station_local_day"] is False
+
+
+def test_manifest_accepts_dst_23_and_25_hour_station_days() -> None:
+    spring = build_full_ensemble_read_manifest(
+        _estimate(
+            "EHAM",
+            [[0, 0, 0, 0]],
+            [100],
+            observation_date="2026-03-29",
+        ),
+        billing_project="weather-508105",
+        max_network_bytes=10_000,
+        max_objects=10,
+    )
+    assert spring.approval_gate.state == "awaiting_operator_approval"
+    assert spring.targets[0]["valid_hour_count"] == 23
+
+    autumn = build_full_ensemble_read_manifest(
+        _estimate(
+            "EHAM",
+            [[0, 0, 0, 0]],
+            [100],
+            observation_date="2026-10-25",
+        ),
+        billing_project="weather-508105",
+        max_network_bytes=10_000,
+        max_objects=10,
+    )
+    assert autumn.approval_gate.state == "awaiting_operator_approval"
+    assert autumn.targets[0]["valid_hour_count"] == 25
+
+
+def test_manifest_reports_mixed_dates_but_checks_each_target_individually() -> None:
+    manifest = build_full_ensemble_read_manifest(
+        [
+            _estimate("EHAM", [[0, 0, 0, 0]], [100]),
+            _estimate(
+                "ZUCK",
+                [[0, 1, 0, 0]],
+                [200],
+                observation_date="2026-09-16",
+            ),
+        ],
+        billing_project="weather-508105",
+        max_network_bytes=10_000,
+        max_objects=10,
+    )
+    assert manifest.approval_gate.state == "awaiting_operator_approval"
+    assert manifest.period["mixed_observation_dates"] is True
+    assert manifest.period["incomplete_target_ids"] == []
 
 
 def test_manifest_rejects_mixed_release() -> None:

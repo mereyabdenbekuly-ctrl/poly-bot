@@ -5,9 +5,10 @@ import hmac
 import json
 import re
 from collections.abc import Mapping, Sequence
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Literal, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field, field_validator, model_validator
 
@@ -50,6 +51,7 @@ class WeatherNextApprovalGate(StrictModel):
 
     state: Literal[
         "awaiting_operator_approval",
+        "blocked_incomplete_coverage",
         "blocked_incomplete_metadata",
         "blocked_sharding_unsupported",
         "blocked_network_limit",
@@ -73,6 +75,11 @@ class WeatherNextApprovalGate(StrictModel):
     within_network_limit: bool
     within_object_limit: bool
     within_object_size_limit: bool
+    coverage_complete: bool
+    incomplete_target_ids: list[str] = Field(default_factory=list)
+    coverage_basis: Literal["exact_hourly_station_local_day"] = (
+        "exact_hourly_station_local_day"
+    )
     approval_binding: Literal["manifest_sha256"] = "manifest_sha256"
 
     @model_validator(mode="after")
@@ -83,8 +90,13 @@ class WeatherNextApprovalGate(StrictModel):
             and self.within_network_limit
             and self.within_object_limit
             and self.within_object_size_limit
+            and self.coverage_complete
         ):
             raise ValueError("an approval-ready manifest must satisfy every metadata limit")
+        if self.coverage_complete and self.incomplete_target_ids:
+            raise ValueError("complete coverage cannot list incomplete targets")
+        if not self.coverage_complete and not self.incomplete_target_ids:
+            raise ValueError("incomplete coverage must identify at least one target")
         return self
 
 
@@ -207,6 +219,80 @@ def _parse_utc(value: object, *, field: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError(f"WeatherNext estimate field {field!r} must be timezone-aware")
     return parsed.astimezone(UTC)
+
+
+def expected_station_local_day_hours(
+    observation_date: date,
+    timezone_name: str,
+) -> list[datetime]:
+    """Return the exact UTC hourly instants in one station-local calendar day.
+
+    The UTC span is used instead of incrementing a timezone-aware local clock so
+    DST transition days are handled correctly: a spring-forward day has 23
+    values, a normal day 24, and a fall-back day 25.  This is a coverage
+    contract, not a request to synthesize any missing values.
+    """
+
+    cleaned = timezone_name.strip()
+    try:
+        timezone = ZoneInfo(cleaned)
+    except ZoneInfoNotFoundError as error:
+        raise ValueError(f"unknown observation timezone: {cleaned}") from error
+    local_start = datetime.combine(observation_date, time.min, tzinfo=timezone)
+    local_end = datetime.combine(observation_date + timedelta(days=1), time.min, tzinfo=timezone)
+    start_utc = local_start.astimezone(UTC)
+    end_utc = local_end.astimezone(UTC)
+    if end_utc <= start_utc:
+        raise ValueError("station-local day has a non-positive UTC duration")
+    expected: list[datetime] = []
+    current = start_utc
+    while current < end_utc:
+        expected.append(current)
+        current += timedelta(hours=1)
+    if len(expected) not in {23, 24, 25}:
+        raise ValueError(
+            "station-local day must contain 23, 24, or 25 UTC hourly instants; "
+            f"got {len(expected)} for {observation_date.isoformat()} {cleaned}"
+        )
+    return expected
+
+
+def assess_station_local_day_coverage(
+    observation_date: date,
+    timezone_name: str,
+    valid_times: Sequence[object],
+) -> tuple[bool, str]:
+    """Check exact hourly coverage without filling or inferring any values.
+
+    The returned reason is intentionally suitable for an operator-facing
+    manifest/status message.  A target is complete only when its UTC timestamps
+    exactly equal the station-local day's expected hourly instants, including
+    DST 23/24/25-hour days.
+    """
+
+    try:
+        actual = [_parse_utc(value, field="valid_time_utc") for value in valid_times]
+    except ValueError as error:
+        return False, str(error)
+    expected = expected_station_local_day_hours(observation_date, timezone_name)
+    if actual != sorted(set(actual)):
+        return False, "valid times must be sorted and unique"
+    if actual == expected:
+        return True, f"complete {len(expected)}-hour station-local day"
+    expected_set = set(expected)
+    actual_set = set(actual)
+    missing = sorted(expected_set - actual_set)
+    unexpected = sorted(actual_set - expected_set)
+    missing_text = ", ".join(value.isoformat() for value in missing[:3])
+    unexpected_text = ", ".join(value.isoformat() for value in unexpected[:3])
+    details: list[str] = [
+        f"expected {len(expected)} exact hourly UTC values, got {len(actual)}",
+    ]
+    if missing:
+        details.append(f"missing={missing_text}{'…' if len(missing) > 3 else ''}")
+    if unexpected:
+        details.append(f"unexpected={unexpected_text}{'…' if len(unexpected) > 3 else ''}")
+    return False, "; ".join(details)
 
 
 def _safe_component(value: str) -> str:
@@ -466,6 +552,8 @@ def build_full_ensemble_read_manifest(
     max_observed_object = 0
     observation_dates: list[date] = []
     selected_hours: list[int] = []
+    coverage_complete_by_target: dict[str, bool] = {}
+    coverage_reason_by_target: dict[str, str] = {}
 
     for target_id, estimate in target_items:
         if estimate.get("metadata_only") is not True or estimate.get("payload_read") is not False:
@@ -583,6 +671,14 @@ def build_full_ensemble_read_manifest(
         ]
         if valid_times != sorted(set(valid_times)):
             raise ValueError(f"target {target_id} valid times must be sorted and unique")
+        observation_timezone = str(estimate.get("observation_timezone", "UTC")).strip()
+        complete_coverage, coverage_reason = assess_station_local_day_coverage(
+            observation_date,
+            observation_timezone,
+            valid_times_raw,
+        )
+        coverage_complete_by_target[target_id] = complete_coverage
+        coverage_reason_by_target[target_id] = coverage_reason
         selected_hours.append(len(valid_times))
 
         station = {
@@ -632,10 +728,12 @@ def build_full_ensemble_read_manifest(
                 ),
                 **station,
                 "observation_date": observation_date.isoformat(),
-                "observation_timezone": str(estimate.get("observation_timezone", "UTC")),
+                "observation_timezone": observation_timezone,
                 "valid_times_utc": [value.isoformat() for value in valid_times],
                 "valid_hour_count": len(valid_times),
-                "complete_station_local_day": len(valid_times) in {23, 24, 25},
+                "complete_station_local_day": complete_coverage,
+                "coverage_status": "complete" if complete_coverage else "incomplete",
+                "coverage_reason": coverage_reason,
                 "source_uri": source_uri,
                 "object_uris": object_uris,
                 "expected_network_bytes": per_target_expected[target_id],
@@ -724,7 +822,13 @@ def build_full_ensemble_read_manifest(
     within_network_limit = expected_network_bytes <= max_network_bytes
     within_object_limit = object_count <= max_objects
     within_object_size_limit = max_observed_object <= max_object_bytes
-    if not all_sharding_supported:
+    incomplete_target_ids = sorted(
+        target_id for target_id, complete in coverage_complete_by_target.items() if not complete
+    )
+    all_coverage_complete = not incomplete_target_ids
+    if not all_coverage_complete:
+        state = "blocked_incomplete_coverage"
+    elif not all_sharding_supported:
         state = "blocked_sharding_unsupported"
     elif not complete_object_sizes:
         state = "blocked_incomplete_metadata"
@@ -784,6 +888,7 @@ def build_full_ensemble_read_manifest(
         state=cast(
             Literal[
                 "awaiting_operator_approval",
+                "blocked_incomplete_coverage",
                 "blocked_incomplete_metadata",
                 "blocked_sharding_unsupported",
                 "blocked_network_limit",
@@ -803,6 +908,8 @@ def build_full_ensemble_read_manifest(
         within_network_limit=within_network_limit,
         within_object_limit=within_object_limit,
         within_object_size_limit=within_object_size_limit,
+        coverage_complete=all_coverage_complete,
+        incomplete_target_ids=incomplete_target_ids,
     )
     unsigned: dict[str, object] = {
         "schema_version": "weathernext-full-ensemble-read-manifest/v1",
@@ -824,9 +931,14 @@ def build_full_ensemble_read_manifest(
             "target_count": len(target_payloads),
             "valid_hour_count_min": min(selected_hours, default=0),
             "valid_hour_count_max": max(selected_hours, default=0),
-            "all_targets_complete_station_local_day": all(
-                item["complete_station_local_day"] for item in target_payloads
-            ),
+            "all_targets_complete_station_local_day": all_coverage_complete,
+            "coverage_basis": "exact_hourly_station_local_day",
+            "incomplete_target_ids": incomplete_target_ids,
+            "coverage_reasons": {
+                target_id: coverage_reason_by_target[target_id]
+                for target_id in incomplete_target_ids
+            },
+            "mixed_observation_dates": len(set(observation_dates)) > 1,
         },
         "array": array_provenance,
         "targets": target_payloads,
@@ -852,6 +964,8 @@ def build_full_ensemble_read_manifest(
             "stop_on_missing_object": True,
             "stop_on_size_change": True,
             "stop_before_network_limit": True,
+            "require_complete_station_local_day": True,
+            "coverage_basis": "exact_hourly_station_local_day",
         },
         "snapshot_target_path": target_paths[0],
         "snapshot_target_paths": target_paths,
@@ -922,6 +1036,7 @@ def estimate_and_build_full_ensemble_read_manifest_batch(
     *,
     targets: Sequence[Mapping[str, object]],
     init_time_utc: datetime | None = None,
+    include_chunk_sizes: bool = True,
     max_network_bytes: int | None = None,
     max_objects: int = 4096,
     max_object_bytes: int | None = None,
@@ -955,14 +1070,31 @@ def estimate_and_build_full_ensemble_read_manifest_batch(
             timezone_name = str(target["timezone"])
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"invalid WeatherNext target {target_id}") from error
-        estimate = client.estimate_point_day_read(
-            latitude=latitude,
-            longitude=longitude,
-            location=location,
-            observation_date=observation_date,
-            init_time_utc=pinned_init,
-            timezone_name=timezone_name,
-        )
+        estimate_kwargs = {
+            "latitude": latitude,
+            "longitude": longitude,
+            "location": location,
+            "observation_date": observation_date,
+            "init_time_utc": pinned_init,
+            "timezone_name": timezone_name,
+        }
+        if include_chunk_sizes:
+            # Keep the default call shape compatible with small offline test
+            # doubles and older adapters; the production client defaults to
+            # exact metadata HEADs.
+            estimate = client.estimate_point_day_read(**estimate_kwargs)
+        else:
+            try:
+                estimate = client.estimate_point_day_read(
+                    **estimate_kwargs,
+                    include_chunk_sizes=False,
+                )
+            except TypeError as error:
+                # A legacy adapter may not expose the optional probe flag.  It
+                # is still safe to fall back to its bounded metadata estimate.
+                if "include_chunk_sizes" not in str(error):
+                    raise
+                estimate = client.estimate_point_day_read(**estimate_kwargs)
         actual_init = _parse_utc(estimate.get("init_time_utc"), field="init_time_utc")
         if pinned_init is None:
             pinned_init = actual_init

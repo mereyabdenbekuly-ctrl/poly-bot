@@ -12,7 +12,8 @@ from __future__ import annotations
 import json
 import math
 import sqlite3
-from collections.abc import Iterable, Mapping
+import time as monotonic_clock
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Literal, cast
@@ -24,6 +25,8 @@ from polybot.models import StrictModel, WeatherForecast
 from polybot.weathernext_manifest import (
     WeatherNextFullReadManifest,
     WeatherNextReadApproval,
+    assess_station_local_day_coverage,
+    expected_station_local_day_hours,
     validate_read_approval,
     verify_manifest_sha256,
 )
@@ -119,6 +122,7 @@ class WeatherNextApprovalResult(StrictModel):
         "invalid",
         "manifest_mismatch",
         "limit_mismatch",
+        "coverage_blocked",
         "approved",
     ]
     payload_read_permitted: bool = False
@@ -126,6 +130,7 @@ class WeatherNextApprovalResult(StrictModel):
     message: str
     expected_network_bytes: int = 0
     object_count: int = 0
+    incomplete_target_ids: list[str] = Field(default_factory=list)
 
 
 class WeatherNextRefreshStatus(StrictModel):
@@ -140,6 +145,9 @@ class WeatherNextRefreshStatus(StrictModel):
     payload_read: bool = False
     snapshots_written: int = Field(ge=0)
     message: str
+    coverage_complete: bool = True
+    incomplete_target_ids: list[str] = Field(default_factory=list)
+    mixed_observation_dates: bool = False
 
     @field_validator("generated_at_utc")
     @classmethod
@@ -157,6 +165,10 @@ class WeatherNextSequentialReadResult(StrictModel):
     bytes_read: int = Field(ge=0)
     object_count: int = Field(ge=0)
     message: str
+    probe_only: bool = False
+    elapsed_seconds: float | None = Field(default=None, ge=0)
+    decoded_shape: list[int] = Field(default_factory=list)
+    decoded_bytes: int = Field(default=0, ge=0)
 
 
 def _atomic_write(path: Path, payload: Mapping[str, object]) -> Path:
@@ -327,6 +339,8 @@ def derive_refresh_targets(
 def verify_read_approval(
     manifest_path: Path = DEFAULT_MANIFEST_PATH,
     approval_path: Path = DEFAULT_APPROVAL_PATH,
+    *,
+    now_utc: datetime | None = None,
 ) -> WeatherNextApprovalResult:
     """Verify sidecar approval and all manifest-bound read limits.
 
@@ -379,6 +393,20 @@ def verify_read_approval(
 
     expected = int(manifest.approval_gate.expected_network_bytes)
     object_count = int(manifest.approval_gate.object_count)
+    coverage_complete, incomplete_target_ids, _mixed_dates = _manifest_coverage_summary(manifest)
+    if not coverage_complete or manifest.approval_gate.state == "blocked_incomplete_coverage":
+        targets = ", ".join(incomplete_target_ids) or "unknown target"
+        return WeatherNextApprovalResult(
+            state="coverage_blocked",
+            manifest_sha256=manifest.manifest_sha256,
+            expected_network_bytes=expected,
+            object_count=object_count,
+            incomplete_target_ids=incomplete_target_ids,
+            message=(
+                "incomplete station-local-day coverage for "
+                f"{targets}; payload read remains blocked and no hours are synthesized"
+            ),
+        )
     if approval.manifest_sha256 != manifest.manifest_sha256:
         return WeatherNextApprovalResult(
             state="manifest_mismatch", manifest_sha256=manifest.manifest_sha256,
@@ -386,7 +414,7 @@ def verify_read_approval(
             message="approval is bound to a different manifest digest",
         )
     try:
-        validate_read_approval(manifest, approval)
+        validate_read_approval(manifest, approval, now_utc=now_utc)
     except Exception as error:
         return WeatherNextApprovalResult(
             state="limit_mismatch", manifest_sha256=manifest.manifest_sha256,
@@ -414,6 +442,158 @@ def _load_approved_manifest(
     manifest = WeatherNextFullReadManifest.model_validate(payload)
     approval = WeatherNextReadApproval.model_validate(approval_payload)
     return manifest, approval, result
+
+
+def _manifest_coverage_summary(
+    manifest: WeatherNextFullReadManifest,
+) -> tuple[bool, list[str], bool]:
+    """Re-check every target's exact station-local-day coverage locally."""
+
+    incomplete: list[str] = []
+    observation_dates: set[str] = set()
+    for raw_target in manifest.targets:
+        target_id = str(raw_target.get("target_id", "?"))
+        observation_dates.add(str(raw_target.get("observation_date", "")))
+        raw_times = raw_target.get("valid_times_utc", [])
+        if not isinstance(raw_times, list):
+            incomplete.append(target_id)
+            continue
+        try:
+            observation_date = date.fromisoformat(str(raw_target.get("observation_date", "")))
+            complete, _reason = assess_station_local_day_coverage(
+                observation_date,
+                str(raw_target.get("observation_timezone", "UTC")),
+                raw_times,
+            )
+        except (TypeError, ValueError):
+            complete = False
+        if raw_target.get("complete_station_local_day") is not True or not complete:
+            incomplete.append(target_id)
+    return not incomplete, sorted(set(incomplete)), len(observation_dates) > 1
+
+
+def _find_complete_release_manifest(
+    client: object,
+    *,
+    targets: Sequence[Mapping[str, object]],
+    initial_manifest: WeatherNextFullReadManifest,
+    max_network_bytes: int,
+    max_objects: int,
+    max_object_bytes: int,
+    snapshot_root: Path,
+) -> WeatherNextFullReadManifest | None:
+    """Find the newest prior release covering every target's full station day.
+
+    A newly published run can be the newest metadata-visible object while its
+    lead window no longer contains the beginning of an in-progress station day.
+    Probe older releases using coordinates/chunk metadata only, then perform
+    exact compressed-object HEADs once for the first complete candidate.  No
+    payload body is touched by this search.
+    """
+
+    resolver = getattr(client, "_resolve_store_prefix", None)
+    estimator = getattr(client, "estimate_point_day_read", None)
+    if not callable(resolver) or not callable(estimator) or not targets:
+        return None
+    resolver = cast(Callable[..., tuple[str, datetime | None]], resolver)
+    from polybot.weathernext_manifest import estimate_and_build_full_ensemble_read_manifest_batch
+
+    first_target = targets[0]
+    try:
+        first_date = date.fromisoformat(str(first_target["observation_date"]))
+        first_timezone = str(first_target["timezone"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    # Use the initial metadata manifest to jump directly to the newest run that
+    # can span all requested station days.  The array has 48 hourly time slots
+    # in the current WeatherNext release (8 lead × 6 sub-time); the exact
+    # candidate is still verified by the normal coverage gate below.
+    valid_offsets: list[timedelta] = []
+    for target in initial_manifest.targets:
+        raw_times = target.get("valid_times_utc", [])
+        if not isinstance(raw_times, list):
+            continue
+        for raw_time in raw_times:
+            try:
+                valid_offsets.append(
+                    _parse_utc(raw_time, field="valid_time_utc") - initial_manifest.init_time_utc
+                )
+            except ValueError:
+                continue
+    raw_shape = initial_manifest.array.get("shape", [])
+    raw_dimensions = initial_manifest.array.get("dimensions", [])
+    time_slots = 48
+    if isinstance(raw_shape, list) and isinstance(raw_dimensions, list):
+        try:
+            time_slots = 1
+            for dim, size in zip(raw_dimensions, raw_shape, strict=False):
+                if str(dim) in {"lead_time", "lead_subtime"}:
+                    time_slots *= max(1, int(size))
+        except (TypeError, ValueError):
+            time_slots = 48
+    min_offset = min(valid_offsets, default=timedelta(hours=1))
+    max_offset = min_offset + timedelta(hours=max(0, time_slots - 1))
+    starts: list[datetime] = []
+    ends: list[datetime] = []
+    for target in targets:
+        try:
+            target_date = date.fromisoformat(str(target["observation_date"]))
+            expected = expected_station_local_day_hours(
+                target_date,
+                str(target["timezone"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+        starts.append(expected[0])
+        ends.append(expected[-1] + timedelta(hours=1))
+    latest_allowed_init = min(starts) - min_offset
+    earliest_allowed_init = max(ends) - max_offset
+    if earliest_allowed_init > latest_allowed_init:
+        return None
+    try:
+        _prefix, candidate_init = resolver(
+            init_time_utc=latest_allowed_init - timedelta(microseconds=1),
+            observation_date=first_date,
+            timezone_name=first_timezone,
+        )
+    except Exception:
+        return None
+    if candidate_init is None or candidate_init < earliest_allowed_init:
+        return None
+
+    # Verify the direct candidate with exact object HEADs first.  If the
+    # publication is incomplete, walk only a small bounded number of prior
+    # releases using metadata-only probes; never loop over the whole archive.
+    for _attempt in range(6):
+        try:
+            candidate = estimate_and_build_full_ensemble_read_manifest_batch(
+                client,  # type: ignore[arg-type]
+                targets=targets,
+                init_time_utc=candidate_init,
+                include_chunk_sizes=True,
+                max_network_bytes=max_network_bytes,
+                max_objects=max_objects,
+                max_object_bytes=max_object_bytes,
+                snapshot_root=snapshot_root,
+            )
+            complete, _incomplete, _mixed = _manifest_coverage_summary(candidate)
+            if complete:
+                return candidate
+        except Exception:
+            pass
+        try:
+            _prefix, previous_init = resolver(
+                init_time_utc=candidate_init - timedelta(microseconds=1),
+                observation_date=first_date,
+                timezone_name=first_timezone,
+            )
+        except Exception:
+            return None
+        if previous_init is None or previous_init >= candidate_init:
+            return None
+        candidate_init = previous_init
+    return None
 
 
 def _source_prefix(source_uri: str, bucket: str) -> str:
@@ -466,15 +646,26 @@ def _target_member_accumulators(
     ]
     # A full station-local day is required for a usable paper snapshot.  A
     # short publication remains a metadata artifact and is never promoted to
-    # the strategy as if missing hours had been filled.
-    if target.get("complete_station_local_day") is not True or len(valid_times) not in {
-        23,
-        24,
-        25,
-    }:
+    # the strategy as if missing hours had been filled.  Check the exact UTC
+    # hour set here as well as the manifest flag so a hand-edited/tampered
+    # manifest cannot bypass the coverage contract.
+    try:
+        observation_date = date.fromisoformat(str(target.get("observation_date", "")))
+        timezone_name = str(target.get("observation_timezone", "UTC"))
+        complete, reason = assess_station_local_day_coverage(
+            observation_date,
+            timezone_name,
+            valid_times,
+        )
+    except (TypeError, ValueError) as error:
         raise ValueError(
             "WeatherNext target "
-            f"{target.get('target_id', '?')} does not cover a complete station day"
+            f"{target.get('target_id', '?')} has invalid station-day coverage: {error}"
+        ) from error
+    if target.get("complete_station_local_day") is not True or not complete:
+        raise ValueError(
+            "WeatherNext target "
+            f"{target.get('target_id', '?')} does not cover a complete station day: {reason}"
         )
     # Keep stable, zero-padded participant identities across snapshots and
     # ForecastStore records.  These are source member positions, not
@@ -503,6 +694,18 @@ def _reusable_snapshot_paths(
     paths: list[str] = []
     for target in manifest.targets:
         target_id = str(target.get("target_id", ""))
+        raw_times = target.get("valid_times_utc", [])
+        try:
+            observation_date = date.fromisoformat(str(target.get("observation_date", "")))
+            coverage_complete, _reason = assess_station_local_day_coverage(
+                observation_date,
+                str(target.get("observation_timezone", "UTC")),
+                raw_times if isinstance(raw_times, list) else [],
+            )
+        except (TypeError, ValueError):
+            return None
+        if target.get("complete_station_local_day") is not True or not coverage_complete:
+            return None
         raw_path = target.get("snapshot_path")
         if not isinstance(raw_path, str) or not raw_path:
             return None
@@ -629,6 +832,7 @@ def read_approved_manifest_sequentially(
     approval_path: Path = DEFAULT_APPROVAL_PATH,
     index_path: Path = DEFAULT_ROOT / "latest-index.json",
     snapshot_root: Path = DEFAULT_ROOT / "snapshots",
+    probe_only: bool = False,
 ) -> WeatherNextSequentialReadResult:
     """Read an approved manifest one compressed object at a time.
 
@@ -648,6 +852,13 @@ def read_approved_manifest_sequentially(
     if not isinstance(settings, Settings):
         raise TypeError("settings must be a polybot.config.Settings instance")
     manifest, approval, approval_result = _load_approved_manifest(manifest_path, approval_path)
+    coverage_complete, incomplete_target_ids, _mixed_dates = _manifest_coverage_summary(manifest)
+    if not coverage_complete:
+        targets = ", ".join(incomplete_target_ids) or "unknown target"
+        raise RuntimeError(
+            "WeatherNext payload read blocked: incomplete station-local-day coverage for "
+            f"{targets}; no hours are synthesized"
+        )
     if manifest.payload_read or manifest.approval_gate.payload_read_permitted:
         raise RuntimeError("manifest must remain immutable and payload_read=false")
     if manifest.approval_gate.sharding_supported is not True:
@@ -674,6 +885,7 @@ def read_approved_manifest_sequentially(
 
     import numpy as np
 
+    started = monotonic_clock.monotonic()
     client = WeatherNextGcsClient(settings)
     store_prefix = _source_prefix(manifest.source_uri, client.bucket_name)
     group = client.open_sequential_zarr_group(store_prefix)
@@ -748,7 +960,9 @@ def read_approved_manifest_sequentially(
                 )
                 for position, coordinate in enumerate(item.chunk_coordinates)
             )
+            decode_started = monotonic_clock.monotonic()
             chunk = np.asarray(array.get_basic_selection(selection))
+            decode_elapsed = monotonic_clock.monotonic() - decode_started
             expected_chunk_shape = tuple(value.stop - value.start for value in selection)
             if tuple(int(value) for value in chunk.shape) != expected_chunk_shape:
                 raise RuntimeError(f"Unexpected decoded WeatherNext chunk shape: {chunk.shape}")
@@ -759,6 +973,27 @@ def read_approved_manifest_sequentially(
                 raise RuntimeError(
                     "Decoded WeatherNext chunk exceeded its manifest bound: "
                     f"{item.object_uri}"
+                )
+            if probe_only:
+                compressed_bytes = int(item.compressed_bytes)
+                decoded_shape = [int(value) for value in chunk.shape]
+                decoded_bytes = int(chunk.nbytes)
+                del chunk
+                return WeatherNextSequentialReadResult(
+                    payload_read=True,
+                    manifest_sha256=manifest.manifest_sha256,
+                    snapshots_written=0,
+                    snapshot_paths=[],
+                    bytes_read=compressed_bytes,
+                    object_count=1,
+                    message=(
+                        "WeatherNext one-block probe completed; no snapshot was published. "
+                        f"decode_seconds={decode_elapsed:.3f}"
+                    ),
+                    probe_only=True,
+                    elapsed_seconds=monotonic_clock.monotonic() - started,
+                    decoded_shape=decoded_shape,
+                    decoded_bytes=decoded_bytes,
                 )
             chunk_starts = [int(value.start) for value in selection]
             for target_id in item.target_ids:
@@ -908,6 +1143,8 @@ def read_approved_manifest_sequentially(
             "approved WeatherNext payload read completed sequentially with full "
             "trajectory coverage"
         ),
+        probe_only=False,
+        elapsed_seconds=monotonic_clock.monotonic() - started,
     )
 
 
@@ -985,6 +1222,27 @@ def autonomous_refresh_preflight(
                     ),
                     snapshot_root=Path(settings.weathernext_full_root) / "snapshots",
                 )
+                complete, _incomplete, _mixed = _manifest_coverage_summary(built)
+                if not complete:
+                    fallback = _find_complete_release_manifest(
+                        client,
+                        targets=targets,
+                        initial_manifest=built,
+                        max_network_bytes=(
+                            settings.weathernext_full_max_network_bytes
+                            if max_network_bytes is None
+                            else max_network_bytes
+                        ),
+                        max_objects=max_objects,
+                        max_object_bytes=(
+                            settings.weathernext_full_max_object_bytes
+                            if max_object_bytes is None
+                            else max_object_bytes
+                        ),
+                        snapshot_root=Path(settings.weathernext_full_root) / "snapshots",
+                    )
+                    if fallback is not None:
+                        built = fallback
                 raw_dates = built.period.get("observation_dates", [])
                 dates = cast(list[object], raw_dates) if isinstance(raw_dates, list) else []
                 date_batch = "-".join(str(value) for value in dates)
@@ -1035,8 +1293,26 @@ def autonomous_refresh_preflight(
         raw_gate = manifest_mapping.get("approval_gate")
         gate = cast(Mapping[str, object], raw_gate) if isinstance(raw_gate, Mapping) else {}
         manifest_state = str(gate.get("state", "missing"))
+        raw_period = manifest_mapping.get("period")
+        period = cast(Mapping[str, object], raw_period) if isinstance(raw_period, Mapping) else {}
+        raw_incomplete = period.get("incomplete_target_ids", gate.get("incomplete_target_ids", []))
+        incomplete_target_ids = (
+            sorted({str(item) for item in raw_incomplete})
+            if isinstance(raw_incomplete, list)
+            else []
+        )
+        coverage_complete = bool(
+            period.get(
+                "all_targets_complete_station_local_day",
+                gate.get("coverage_complete", not incomplete_target_ids),
+            )
+        ) and not incomplete_target_ids
+        mixed_observation_dates = bool(period.get("mixed_observation_dates", False))
     except Exception:
         manifest_state = "missing"
+        coverage_complete = False
+        incomplete_target_ids = []
+        mixed_observation_dates = False
     if metadata_error:
         approval = WeatherNextApprovalResult(
             state="invalid",
@@ -1053,9 +1329,24 @@ def autonomous_refresh_preflight(
             f"{metadata_error}"
         )
     elif approval.state != "approved":
-        message = (
-            "payload read remains blocked until an approved sequential reader consumes the manifest"
-        )
+        if approval.state == "coverage_blocked" or not coverage_complete:
+            targets = ", ".join(approval.incomplete_target_ids) or ", ".join(
+                incomplete_target_ids
+            ) or "unknown target"
+            message = (
+                "payload read remains blocked: incomplete station-local-day coverage for "
+                f"{targets}; no hours are synthesized"
+            )
+        else:
+            message = (
+                "payload read remains blocked until an approved sequential reader "
+                "consumes the manifest"
+            )
+        if mixed_observation_dates:
+            message += (
+                "; manifest contains multiple observation dates, each target is "
+                "checked separately"
+            )
     else:
         message = "approval verified; sequential payload reader may run as a separate bounded step"
     status = WeatherNextRefreshStatus(
@@ -1069,6 +1360,9 @@ def autonomous_refresh_preflight(
         payload_read=False,
         snapshots_written=0,
         message=message,
+        coverage_complete=coverage_complete,
+        incomplete_target_ids=incomplete_target_ids,
+        mixed_observation_dates=mixed_observation_dates,
     )
     write_refresh_status(status, status_path)
     return status

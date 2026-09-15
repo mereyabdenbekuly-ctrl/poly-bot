@@ -1025,6 +1025,7 @@ class WeatherNextGcsClient:
         observation_date: date,
         init_time_utc: datetime | None = None,
         timezone_name: str | None = None,
+        include_chunk_sizes: bool = True,
     ) -> dict[str, object]:
         """Return a metadata-only estimate for a raw point/day extraction.
 
@@ -1228,10 +1229,17 @@ class WeatherNextGcsClient:
                 global_bytes = selected_logical = selected_chunk_logical = 0
                 selected_time_count = 0
             self._last_raw_chunk_object_metadata = []
-            object_sizes = self._raw_chunk_object_sizes(
-                store_prefix, variable_name, chunk_coordinates, metadata
-            )
-            object_metadata = self._last_raw_chunk_object_metadata
+            if include_chunk_sizes:
+                object_sizes = self._raw_chunk_object_sizes(
+                    store_prefix, variable_name, chunk_coordinates, metadata
+                )
+                object_metadata = self._last_raw_chunk_object_metadata
+            else:
+                # Coverage probes intentionally inspect only the published
+                # coordinates/chunk layout; exact compressed sizes are fetched
+                # once, for the selected complete release, before approval.
+                object_sizes = []
+                object_metadata = []
             if len(object_metadata) != len(chunk_coordinates):
                 object_metadata = []
             if len(object_sizes) == len(chunk_coordinates) and chunk_coordinates:

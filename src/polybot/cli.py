@@ -167,6 +167,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Permit the reader step only after local manifest/sidecar verification succeeds",
     )
+    wn_auto.add_argument(
+        "--probe-one-block",
+        action="store_true",
+        help=(
+            "After approval, read and decode exactly one compressed block for a timing probe; "
+            "do not publish snapshots"
+        ),
+    )
     wn_auto.add_argument("--json", action="store_true", dest="as_json")
 
     settle = subparsers.add_parser("settle", help="Settle an open paper order manually")
@@ -285,10 +293,11 @@ def main(argv: list[str] | None = None) -> None:
                         approval_path=approval,
                         index_path=index,
                         snapshot_root=snapshot_root,
+                        probe_only=args.probe_one_block,
                     )
                     status = status.model_copy(
                         update={
-                            "payload_read": True,
+                            "payload_read": result.payload_read,
                             "snapshots_written": result.snapshots_written,
                             "message": result.message,
                         }
@@ -391,6 +400,12 @@ def main(argv: list[str] | None = None) -> None:
             settings.database_path,
             state_root=settings.database_path.parent,
             ecmwf_json_root=settings.ecmwf_json_archive_root,
+            weathernext_full_root=settings.weathernext_full_root,
+            weathernext_snapshot_index_path=(
+                None
+                if settings.weathernext_snapshot_index_path is None
+                else Path(settings.weathernext_snapshot_index_path)
+            ),
             weathernext_full_snapshot_path=(
                 None
                 if settings.weathernext_snapshot_path is None
