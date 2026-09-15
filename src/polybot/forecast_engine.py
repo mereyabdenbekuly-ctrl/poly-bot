@@ -146,7 +146,25 @@ class ForecastEngineV2:
                 fetched_at_utc=received_at,
                 source_uri=snapshot.source_uri,
                 source_payload_hash=payload_hash,
-                metadata={"location": snapshot.location},
+                metadata={
+                    "location": snapshot.location,
+                    "station_id": snapshot.station_id,
+                    "latitude": snapshot.latitude,
+                    "longitude": snapshot.longitude,
+                    "release_id": snapshot.release_id,
+                    "units": snapshot.units,
+                    "member_ids": list(snapshot.member_ids),
+                    "valid_times_utc": [
+                        value.isoformat() for value in snapshot.valid_times_utc
+                    ],
+                    "trajectory_member_count": len(snapshot.trajectories),
+                    "trajectory_hour_count": len(snapshot.valid_times_utc),
+                    "trajectory_coverage": (
+                        "complete"
+                        if len(snapshot.trajectories) == 64 and snapshot.valid_times_utc
+                        else "compact_daily_max_only"
+                    ),
+                },
             ),
             issued_at_utc=issued,
             observation_cutoff_at_utc=observation_cutoff,

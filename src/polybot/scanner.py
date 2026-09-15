@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
+from typing import cast
 from zoneinfo import ZoneInfo
 
 from polybot.astra import AstraRuleAuditor
@@ -34,10 +35,12 @@ from polybot.models import (
     DecisionAction,
     EventDefinition,
     MarketDecision,
+    MarketSnapshot,
     RuleAudit,
     RuleInterpretation,
     ScanReport,
     WeatherForecast,
+    WeatherNextPaperOrderTarget,
 )
 from polybot.observations import (
     ObservationHistory,
@@ -52,6 +55,12 @@ from polybot.rules import build_brackets, deterministic_rule_audit
 from polybot.storage import PaperRiskRejectedError, Storage
 from polybot.weather import OpenMeteoEnsemble
 from polybot.weathernext import WeatherNextProvider
+from polybot.weathernext_paper import (
+    WEATHERNEXT_PAPER_STRATEGY_VERSION,
+)
+from polybot.weathernext_paper import (
+    paper_idempotency_key as weathernext_paper_idempotency_key,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +116,9 @@ class Scanner:
             else None
         )
         self._research_future: Future[_ShadowResearchResult] | None = None
+        self._weathernext_paper_opened = 0
+        self._weathernext_paper_settled = 0
+        self._weathernext_paper_decisions = 0
 
     def close(self, *, wait: bool = True) -> None:
         executor = self._research_executor
@@ -137,6 +149,9 @@ class Scanner:
         candidate_event_ids: set[str] = set()
         shadow_jobs: list[_EcmwfShadowJob] = []
         weather_next_status = self.weathernext.status().model_dump(mode="json")
+        self._weathernext_paper_opened = 0
+        self._weathernext_paper_settled = 0
+        self._weathernext_paper_decisions = 0
 
         try:
             try:
@@ -152,6 +167,11 @@ class Scanner:
                     gateway
                 )
                 errors.extend(settlement_errors)
+                wn_settled, wn_settlement_errors = (
+                    self._settle_resolved_weathernext_paper_orders(gateway)
+                )
+                self._weathernext_paper_settled += wn_settled
+                errors.extend(wn_settlement_errors)
 
                 # Active paper events use a dedicated monitoring lane. They run
                 # through the same rule/observation/forecast/snapshot pipeline,
@@ -226,6 +246,9 @@ class Scanner:
                 markets_scanned=markets_scanned,
                 paper_orders_opened=paper_orders_opened,
                 paper_orders_settled=paper_orders_settled,
+                weathernext_paper_decisions=self._weathernext_paper_decisions,
+                weathernext_paper_orders_opened=self._weathernext_paper_opened,
+                weathernext_paper_orders_settled=self._weathernext_paper_settled,
                 decisions=decisions,
                 errors=errors,
                 weather_next_status=weather_next_status,
@@ -637,12 +660,17 @@ class Scanner:
         allow_paper_open: bool,
         shadow_jobs: list[_EcmwfShadowJob] | None = None,
     ) -> tuple[list[MarketDecision], int, list[str]]:
+        active_lookup = getattr(self.storage, "active_weathernext_paper_event_ids", None)
+        active_weathernext_events = (
+            cast(Callable[[], set[str]], active_lookup)() if callable(active_lookup) else set()
+        )
         event_decisions, errors = self._scan_event(
             run_id=run_id,
             gateway=gateway,
             event=event,
             use_astra=use_astra,
             paper=paper,
+            allow_weathernext_paper_open=event.id not in active_weathernext_events,
             shadow_jobs=shadow_jobs,
         )
         if allow_paper_open:
@@ -702,6 +730,306 @@ class Scanner:
             except Exception as error:
                 errors.append(f"paper settlement {order.market_id} failed: {error}")
         return settled, errors
+
+    def _settle_resolved_weathernext_paper_orders(
+        self, gateway: PolymarketGateway
+    ) -> tuple[int, list[str]]:
+        """Settle only the isolated WeatherNext paper ledger.
+
+        Resolution evidence is checked against the exact condition/token
+        identity.  No row in the legacy ``paper_orders`` table is read or
+        changed by this lane.
+        """
+
+        active = getattr(self.storage, "active_weathernext_paper_orders", None)
+        if not callable(active):
+            return 0, []
+        active_orders = cast(Callable[[], Sequence[WeatherNextPaperOrderTarget]], active)()
+        settled = 0
+        errors: list[str] = []
+        for order in active_orders:
+            try:
+                if order.status.value == "RESOLVED":
+                    self.storage.settle_resolved_weathernext_paper_order(order.id)
+                    settled += 1
+                    continue
+                if order.condition_id is None or not order.identity_verified:
+                    raise ValueError(
+                        f"WeatherNext paper order {order.id} has no verified condition/token"
+                    )
+                try:
+                    snapshot = gateway.get_snapshot_for_token(
+                        event_id=order.event_id,
+                        market_id=order.market_id,
+                        condition_id=order.condition_id,
+                        token_id=order.token_id,
+                        outcome=order.outcome,
+                    )
+                    self.storage.record_weathernext_paper_mark(order, snapshot)
+                except Exception as error:
+                    errors.append(f"WeatherNext paper mark {order.market_id} failed: {error}")
+                check = gateway.get_resolution(
+                    market_id=order.market_id,
+                    condition_id=order.condition_id,
+                    token_id=order.token_id,
+                    outcome=order.outcome,
+                )
+                self.storage.record_weathernext_paper_resolution_check(order.id, check)
+                if check.confirmed:
+                    self.storage.resolve_weathernext_paper_order(order.id, check)
+                    self.storage.settle_resolved_weathernext_paper_order(order.id)
+                    settled += 1
+                else:
+                    self.storage.mark_awaiting_weathernext_paper_result(order.id, check)
+            except Exception as error:
+                errors.append(f"WeatherNext paper settlement {order.market_id} failed: {error}")
+        return settled, errors
+
+    def _run_weathernext_paper_strategy(
+        self,
+        *,
+        run_id: int,
+        event: EventDefinition,
+        comparison: object | None,
+        brackets: dict[str, Bracket],
+        probabilities: dict[str, Decimal],
+        market_snapshots: dict[str, MarketSnapshot],
+        event_blockers: Sequence[str],
+        event_warnings: Sequence[str],
+        paper: bool,
+        allow_open: bool,
+    ) -> tuple[int, int, list[str]]:
+        """Evaluate and persist WeatherNext-only paper decisions.
+
+        The method is deliberately called after the v1 market snapshots are
+        immutable.  It never calls ``record_decision``/``open_paper_order``;
+        the two ledgers remain independent even when they inspect the same
+        market book.
+        """
+
+        record = getattr(self.storage, "record_weathernext_paper_decision", None)
+        open_order = getattr(self.storage, "open_weathernext_paper_order", None)
+        if not callable(record) or not callable(open_order):
+            # Lightweight test doubles and pre-migration databases simply do
+            # not expose the optional lane; v1 remains fully functional.
+            return 0, 0, []
+        record_decision = cast(Callable[..., int], record)
+        open_weathernext_order = cast(Callable[..., int], open_order)
+        if not bool(
+            getattr(
+                self.settings,
+                "weathernext_paper_enabled",
+                getattr(self.settings, "weathernext_enabled", False),
+            )
+        ):
+            return 0, 0, []
+
+        errors: list[str] = []
+        try:
+            wn_settings = self.settings.model_copy(
+                update={
+                    "min_probability_edge": getattr(
+                        self.settings,
+                        "weathernext_paper_min_probability_edge",
+                        self.settings.min_probability_edge,
+                    ),
+                    "min_expected_profit_usd": getattr(
+                        self.settings,
+                        "weathernext_paper_min_expected_profit_usd",
+                        self.settings.min_expected_profit_usd,
+                    ),
+                    "max_event_risk_usd": getattr(
+                        self.settings,
+                        "weathernext_paper_max_event_risk_usd",
+                        self.settings.max_event_risk_usd,
+                    ),
+                }
+            )
+        except AttributeError:
+            wn_settings = self.settings
+
+        raw: list[tuple[MarketDecision, object | None]] = []
+        for market in event.markets:
+            market_snapshot = market_snapshots.get(market.id)
+            if market_snapshot is None:
+                # A missing book cannot produce a valid decision row; retain an
+                # explicit event error instead of pretending a filter rejected
+                # the opportunity.
+                errors.append(
+                    f"event {event.id}, market {market.id}: WeatherNext decision "
+                    "not recorded because market snapshot is unavailable"
+                )
+                continue
+            probability = probabilities.get(market.id)
+            try:
+                decision = evaluate_market(
+                    snapshot=market_snapshot,
+                    probability=probability,
+                    settings=wn_settings,
+                    api_cost_usd=Decimal(0),
+                ).model_copy(
+                    update={
+                        "strategy_version": WEATHERNEXT_PAPER_STRATEGY_VERSION,
+                        "execution_model": "WEATHERNEXT_CROSSING_LIMIT_SHARES",
+                    }
+                )
+                reason_codes = list(decision.reason_codes)
+                reason_codes.extend(event_blockers)
+                if comparison is None:
+                    reason_codes.append("SNAPSHOT_UNAVAILABLE")
+                elif probability is None:
+                    reason_codes.append("WEATHERNEXT_PROBABILITY_UNAVAILABLE")
+                if market.id not in brackets:
+                    reason_codes.append("BRACKET_NOT_PARSED")
+                decision = decision.model_copy(
+                    update={
+                        "action": DecisionAction.SKIP if reason_codes else decision.action,
+                        "reason_codes": list(dict.fromkeys(reason_codes)),
+                        "warning_codes": list(
+                            dict.fromkeys(decision.warning_codes + list(event_warnings))
+                        ),
+                    }
+                )
+                raw.append((decision, comparison))
+            except Exception as error:
+                errors.append(
+                    f"event {event.id}, market {market.id}: WeatherNext decision failed: {error}"
+                )
+
+        qualified = [decision for decision, _ in raw if decision.action == DecisionAction.PAPER_BUY]
+        best_market_id = None
+        if qualified:
+            best_market_id = max(
+                qualified,
+                key=lambda item: (
+                    item.expected_profit_usd
+                    if item.expected_profit_usd is not None
+                    else Decimal("-Infinity")
+                ),
+            ).market_id
+
+        opened = 0
+        for decision, snapshot in raw:
+            final = decision
+            order_id: int | None = None
+            if decision.action == DecisionAction.PAPER_BUY:
+                if decision.market_id != best_market_id:
+                    final = decision.model_copy(
+                        update={
+                            "action": DecisionAction.SKIP,
+                            "reason_codes": list(
+                                dict.fromkeys(
+                                    decision.reason_codes + [
+                                        "LOWER_RANKED_WEATHERNEXT_CANDIDATE"
+                                    ]
+                                )
+                            ),
+                        }
+                    )
+                elif not paper or not allow_open:
+                    final = decision.model_copy(
+                        update={
+                            "action": DecisionAction.OBSERVE,
+                            "reason_codes": list(
+                                dict.fromkeys(
+                                    decision.reason_codes
+                                    + [
+                                        "QUALIFIED_WEATHERNEXT_PAPER_SIGNAL"
+                                        if not paper
+                                        else "ACTIVE_WEATHERNEXT_PAPER_EVENT_MONITOR_ONLY"
+                                    ]
+                                )
+                            ),
+                        }
+                    )
+                else:
+                    stop_reason = self._weathernext_paper_stop_reason()
+                    if stop_reason is not None:
+                        final = decision.model_copy(
+                            update={
+                                "action": DecisionAction.SKIP,
+                                "reason_codes": list(
+                                    dict.fromkeys(decision.reason_codes + [stop_reason])
+                                ),
+                            }
+                        )
+                    else:
+                        try:
+                            order_id = open_weathernext_order(
+                                decision,
+                                run_id=run_id,
+                                idempotency_key=weathernext_paper_idempotency_key(decision),
+                                max_event_risk=getattr(
+                                    self.settings,
+                                    "weathernext_paper_max_event_risk_usd",
+                                    self.settings.max_event_risk_usd,
+                                ),
+                                max_total_risk=getattr(
+                                    self.settings,
+                                    "weathernext_paper_max_total_risk_usd",
+                                    self.settings.max_total_risk_usd,
+                                ),
+                            )
+                            opened += 1
+                        except PaperRiskRejectedError as error:
+                            final = decision.model_copy(
+                                update={
+                                    "action": DecisionAction.SKIP,
+                                    "reason_codes": list(
+                                        dict.fromkeys(
+                                            decision.reason_codes
+                                            + [f"WEATHERNEXT_PORTFOLIO_RISK_REJECTED: {error}"]
+                                        )
+                                    ),
+                                }
+                            )
+                            order_id = None
+                        except Exception as error:
+                            errors.append(
+                                f"event {event.id}, market {decision.market_id}: "
+                                f"WeatherNext paper order failed: {error}"
+                            )
+                            final = decision.model_copy(
+                                update={
+                                    "action": DecisionAction.SKIP,
+                                    "reason_codes": list(
+                                        dict.fromkeys(
+                                            decision.reason_codes + ["WEATHERNEXT_ORDER_FAILED"]
+                                        )
+                                    ),
+                                }
+                            )
+                            order_id = None
+            else:
+                order_id = None
+            try:
+                record_decision(run_id, final, snapshot=snapshot, paper_order_id=order_id)
+            except Exception as error:
+                errors.append(
+                    f"event {event.id}, market {final.market_id}: "
+                    f"WeatherNext decision archive failed: {error}"
+                )
+        return opened, len(raw), errors
+
+    def _weathernext_paper_stop_reason(self) -> str | None:
+        today = datetime.now().astimezone().date()
+        daily_limit = getattr(
+            self.settings,
+            "weathernext_paper_daily_stop_loss_usd",
+            self.settings.daily_stop_loss_usd,
+        )
+        total_limit = getattr(
+            self.settings,
+            "weathernext_paper_total_drawdown_stop_usd",
+            self.settings.total_drawdown_stop_usd,
+        )
+        daily = self.storage.weathernext_paper_realized_pnl_for_day(today)
+        if daily <= -daily_limit:
+            return "WEATHERNEXT_DAILY_STOP_LOSS_ACTIVE"
+        total = Decimal(str(self.storage.weathernext_paper_summary()["realized_pnl_usd"]))
+        if total <= -total_limit:
+            return "WEATHERNEXT_TOTAL_DRAWDOWN_STOP_ACTIVE"
+        return None
 
     def _record_forecast_outcome(
         self,
@@ -775,6 +1103,7 @@ class Scanner:
         event: EventDefinition,
         use_astra: bool,
         paper: bool,
+        allow_weathernext_paper_open: bool = True,
         shadow_jobs: list[_EcmwfShadowJob] | None = None,
     ) -> tuple[list[MarketDecision], list[str]]:
         errors: list[str] = []
@@ -854,6 +1183,7 @@ class Scanner:
             ObservationHistory,
             WeatherForecast,
         ] | None = None
+        market_snapshots: dict[str, MarketSnapshot] = {}
         analysis_rules = deterministic.interpretation
         if analysis_rules.tradeable and brackets and not observation_blockers and not rule_blockers:
             try:
@@ -879,19 +1209,6 @@ class Scanner:
                     )
                     for market_id, bracket in brackets.items()
                 }
-                try:
-                    comparison = self.weathernext.snapshot_for(analysis_rules)
-                    if comparison is not None:
-                        self.storage.record_weathernext_snapshot(run_id, event.id, comparison)
-                        weathernext_probabilities = {
-                            market_id: Decimal(str(round(value, 10)))
-                            for market_id, value in self.weathernext.probabilities(
-                                comparison, brackets
-                            ).items()
-                        }
-                except Exception as error:
-                    errors.append(f"event {event.id}: WeatherNext comparison failed: {error}")
-
                 ecmwf_enabled = bool(getattr(self.settings, "ecmwf_enabled", False))
                 forecast_v2_enabled = bool(getattr(self.settings, "forecast_v2_enabled", False))
                 if ecmwf_enabled and forecast_v2_enabled and observation_history is not None:
@@ -979,11 +1296,29 @@ class Scanner:
                         for market_id, bracket in brackets.items()
                     }
 
+        # WeatherNext is loaded independently of Open-Meteo.  A temporary v1
+        # source failure must not suppress a valid full-ensemble snapshot or
+        # erase the separate paper strategy's decision record.
+        if analysis_rules.tradeable and brackets:
+            try:
+                comparison = self.weathernext.snapshot_for(analysis_rules)
+                if comparison is not None:
+                    self.storage.record_weathernext_snapshot(run_id, event.id, comparison)
+                    weathernext_probabilities = {
+                        market_id: Decimal(str(round(value, 10)))
+                        for market_id, value in self.weathernext.probabilities(
+                            comparison, brackets
+                        ).items()
+                    }
+            except Exception as error:
+                errors.append(f"event {event.id}: WeatherNext comparison failed: {error}")
+
         event_decisions: list[MarketDecision] = []
         for market in event.markets:
             try:
                 snapshot = gateway.get_snapshot(event=event, market=market)
                 self.storage.record_market_snapshot(run_id, snapshot)
+                market_snapshots[market.id] = snapshot
                 decision = evaluate_market(
                     snapshot=snapshot,
                     probability=probabilities.get(market.id),
@@ -1044,6 +1379,33 @@ class Scanner:
                 event_decisions.append(decision)
             except Exception as error:
                 errors.append(f"event {event.id}, market {market.id}: snapshot failed: {error}")
+
+        # WeatherNext is a completely separate paper lane.  It receives the
+        # same immutable market snapshots but never writes to ``decisions`` or
+        # ``paper_orders`` and therefore cannot alter v1 selection/exposure.
+        wn_opened, wn_decision_count, wn_errors = self._run_weathernext_paper_strategy(
+            run_id=run_id,
+            event=event,
+            comparison=comparison,
+            brackets=brackets,
+            probabilities=weathernext_probabilities,
+            market_snapshots=market_snapshots,
+            event_blockers=list(
+                dict.fromkeys(
+                    ([] if deterministic.interpretation.tradeable else ["RULES_NOT_ANALYZABLE"])
+                    + rule_blockers
+                    + observation_blockers
+                )
+            ),
+            event_warnings=list(dict.fromkeys(rule_warnings + observation_warnings)),
+            paper=paper,
+            allow_open=allow_weathernext_paper_open,
+        )
+        self._weathernext_paper_opened = getattr(self, "_weathernext_paper_opened", 0) + wn_opened
+        self._weathernext_paper_decisions = (
+            getattr(self, "_weathernext_paper_decisions", 0) + wn_decision_count
+        )
+        errors.extend(wn_errors)
 
         # Queue ECMWF/v2 only after every market snapshot for this run exists;
         # ForecastStore.record() links each probability to that immutable

@@ -13,6 +13,7 @@ Environment=POLYBOT_WEATHERNEXT_ENABLED=true
 Environment=POLYBOT_WEATHERNEXT_GCS_PROJECT=weather-508105
 Environment=POLYBOT_WEATHERNEXT_STATISTICS_SNAPSHOT_PATH=/var/lib/polybot/weathernext-statistics-snapshot.json
 Environment=POLYBOT_WEATHERNEXT_STATISTICS_VARIABLE=station_head_temperature_2m
+Environment=POLYBOT_WEATHERNEXT_SNAPSHOT_INDEX_PATH=/var/lib/polybot/weathernext/full/latest-index.json
 ExecStart=/opt/polybot/.venv/bin/polybot dashboard --host 127.0.0.1 --port 8787
 Restart=always
 RestartSec=10

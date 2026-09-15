@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh approved WeatherNext release metadata and snapshots hourly
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1h
+AccuracySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

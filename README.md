@@ -265,6 +265,36 @@ uv run polybot weathernext summary-refresh \
 скачивания, если ожидаемые network bytes превышают
 `POLYBOT_WEATHERNEXT_STATISTICS_READ_MAX_BYTES`.
 
+#### Full ensemble: отдельная WeatherNext paper-стратегия
+
+Полный 64-member путь отделён от v1 и запускается только через approval-gated
+manifest. Сначала автономный preflight строит inventory выбранных станций,
+одного выпуска и общих compressed chunks; это metadata-only операция и
+`payload_read=false`. Большой global logical array (например, оценка 148 GiB)
+не считается обязательным transfer: в манифесте отдельно указаны shape,
+chunk-shape, codecs, object sizes, число объектов и точный ожидаемый
+compressed transfer. Sharded stores блокируются, а `max_network_bytes`,
+`max_objects` и `max_object_bytes` проверяются до body GET.
+
+```bash
+uv run polybot weathernext autonomous-refresh --json
+```
+
+Эта команда не читает payload без sidecar
+`/var/lib/polybot/weathernext/full/read-approval.json`, связанного с точным
+`manifest_sha256`. После согласования лимитов и записи sidecar задаётся
+`POLYBOT_WEATHERNEXT_FULL_REFRESH_ENABLED=true`; hourly systemd timer вызывает
+тот же bounded путь. Чтение идёт ровно по одному Zarr object за раз, без
+глобального массива в памяти, и останавливается при изменении размера,
+generation/checksum, лимита или покрытия.
+
+Результат — immutable snapshots с release/init provenance, UTC valid times,
+координатами, единицами, идентификаторами всех 64 участников и настоящими
+почасовыми траекториями. Уже сохранённый выпуск переиспользуется без повторной
+загрузки. Observer на следующем цикле подхватывает index и сохраняет snapshot в
+SQLite; решения, позиции, marks и P&L WeatherNext находятся в отдельном
+ledger/dashboard и не входят в v1 exposure, σ или live executor.
+
 По умолчанию refresh блокирует потенциально очень большой raw-запрос до
 скачивания данных. В full-ensemble Zarr пространственные chunks содержат
 глобальную сетку, поэтому точечная выборка может потребовать десятки или сотни

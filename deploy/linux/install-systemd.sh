@@ -62,7 +62,9 @@ for unit in \
   polybot-astra-primary-tunnel.service \
   polybot-astra-fallback-tunnel.service \
   polybot-ecmwf-archive.service \
-  polybot-ecmwf-archive.timer
+  polybot-ecmwf-archive.timer \
+  polybot-weathernext-refresh.service \
+  polybot-weathernext-refresh.timer
 do
   install -o root -g root -m 0644 "$project/deploy/linux/$unit" "/etc/systemd/system/$unit"
 done
@@ -73,6 +75,10 @@ install -o root -g root -m 0644 \
   /etc/systemd/system/polybot-observer.service.d/20-astra-tunnels.conf
 
 install -d -o polybot -g polybot -m 0750 "$state/reports"
+install -d -o polybot -g polybot -m 0750 \
+  "$state/weathernext/full" \
+  "$state/weathernext/full/manifests" \
+  "$state/weathernext/full/snapshots"
 
 systemctl daemon-reload
 echo "Units installed. Verify the restored state in $state, then enable/start"

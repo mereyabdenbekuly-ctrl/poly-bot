@@ -206,3 +206,12 @@ def test_dashboard_renders_weathernext_statistics_as_summary_only() -> None:
     assert "Codecs" in html
     assert "Shard shape (count)" in html
     assert "Transfer unit" in html
+
+
+def test_dashboard_renders_isolated_weathernext_paper_strategy() -> None:
+    html = dashboard_module._HTML  # noqa: SLF001
+    assert 'id="weathernext-paper"' in html
+    assert "WeatherNext paper strategy" in html
+    assert "isolated ledger" in html
+    assert "SNAPSHOT_UNAVAILABLE" in html
+    assert "excluded from v1 exposure" in html

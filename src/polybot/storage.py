@@ -23,6 +23,7 @@ from polybot.models import (
     RuntimeReport,
     RuntimeWindow,
     WeatherForecast,
+    WeatherNextPaperOrderTarget,
 )
 from polybot.observations import ObservationHistory
 
@@ -277,6 +278,84 @@ class Storage:
                     realized_pnl_usd TEXT
                 );
 
+                -- Isolated WeatherNext research ledger.  It intentionally has
+                -- no foreign-key or index path into the v1 ``paper_orders``
+                -- exposure/active-event queries.
+                CREATE TABLE IF NOT EXISTS weathernext_paper_decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id INTEGER NOT NULL REFERENCES scan_runs(id),
+                    event_id TEXT NOT NULL,
+                    market_id TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    strategy_version TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    snapshot_init_time_utc TEXT,
+                    snapshot_source_uri TEXT,
+                    snapshot_member_count INTEGER,
+                    probability TEXT,
+                    executable_price TEXT,
+                    probability_edge TEXT,
+                    shares TEXT,
+                    notional_usd TEXT,
+                    fee_usd TEXT,
+                    max_loss_usd TEXT,
+                    expected_profit_usd TEXT,
+                    reason_codes_json TEXT NOT NULL,
+                    warning_codes_json TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    paper_order_id INTEGER
+                );
+
+                CREATE TABLE IF NOT EXISTS weathernext_paper_orders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    run_id INTEGER NOT NULL REFERENCES scan_runs(id),
+                    event_id TEXT NOT NULL,
+                    market_id TEXT NOT NULL,
+                    asset_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    strategy_version TEXT NOT NULL DEFAULT 'weathernext-paper-v1',
+                    execution_model TEXT NOT NULL DEFAULT 'WEATHERNEXT_CROSSING_LIMIT_SHARES',
+                    condition_id TEXT,
+                    token_id TEXT,
+                    outcome TEXT NOT NULL DEFAULT 'YES',
+                    shares TEXT NOT NULL,
+                    entry_price TEXT NOT NULL,
+                    notional_usd TEXT NOT NULL,
+                    fee_usd TEXT NOT NULL,
+                    execution_buffer_usd TEXT NOT NULL DEFAULT '0',
+                    max_loss_usd TEXT NOT NULL,
+                    expected_profit_usd TEXT,
+                    fee_rate TEXT NOT NULL DEFAULT '0',
+                    fee_exponent TEXT NOT NULL DEFAULT '0',
+                    end_date TEXT,
+                    identity_verified INTEGER NOT NULL DEFAULT 0,
+                    opened_at TEXT NOT NULL,
+                    settled_at TEXT,
+                    closed_at TEXT,
+                    won INTEGER,
+                    realized_pnl_usd TEXT,
+                    resolution_json TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS weathernext_paper_marks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paper_order_id INTEGER NOT NULL
+                        REFERENCES weathernext_paper_orders(id),
+                    captured_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS weathernext_paper_resolution_checks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    paper_order_id INTEGER NOT NULL
+                        REFERENCES weathernext_paper_orders(id),
+                    checked_at TEXT NOT NULL,
+                    confirmed INTEGER NOT NULL,
+                    won INTEGER,
+                    payload_json TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS paper_order_transitions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     paper_order_id INTEGER NOT NULL REFERENCES paper_orders(id),
@@ -322,6 +401,17 @@ class Storage:
                     ON paper_resolution_checks(paper_order_id, id);
                 CREATE INDEX IF NOT EXISTS paper_marks_order_idx
                     ON paper_marks(paper_order_id, id);
+                CREATE INDEX IF NOT EXISTS weathernext_paper_decisions_run_idx
+                    ON weathernext_paper_decisions(run_id, id);
+                CREATE INDEX IF NOT EXISTS weathernext_paper_decisions_event_idx
+                    ON weathernext_paper_decisions(event_id, created_at, id);
+                CREATE INDEX IF NOT EXISTS weathernext_paper_marks_order_idx
+                    ON weathernext_paper_marks(paper_order_id, id);
+                CREATE INDEX IF NOT EXISTS weathernext_paper_resolution_order_idx
+                    ON weathernext_paper_resolution_checks(paper_order_id, id);
+                CREATE UNIQUE INDEX IF NOT EXISTS weathernext_paper_one_active_event_idx
+                    ON weathernext_paper_orders(event_id)
+                    WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED');
                 """
             )
             self._migrate_api_usage(connection)
@@ -741,6 +831,9 @@ class Storage:
                                 "markets_scanned",
                                 "paper_orders_opened",
                                 "paper_orders_settled",
+                                "weathernext_paper_decisions",
+                                "weathernext_paper_orders_opened",
+                                "weathernext_paper_orders_settled",
                                 "errors",
                                 "weather_next_status",
                             )
@@ -771,6 +864,21 @@ class Storage:
                 },
                 "snapshot": None,
             }
+        try:
+            weathernext_paper = self.weathernext_paper_summary()
+        except Exception as error:
+            weathernext_paper = {
+                "strategy_version": "weathernext-paper-v1",
+                "open_orders": 0,
+                "open_exposure_usd": Decimal(0),
+                "settled_orders": 0,
+                "realized_pnl_usd": Decimal(0),
+                "orders_by_status": {},
+                "decisions_by_action": {},
+                "recent_orders": [],
+                "recent_decisions": [],
+                "error": str(error),
+            }
         return {
             "generated_at": utc_now().isoformat(),
             "portfolio": portfolio,
@@ -783,6 +891,7 @@ class Storage:
             "forecast_comparison": forecast_comparison,
             "forecast_diagnostics": forecast_diagnostics,
             "weathernext_statistics": weathernext_statistics,
+            "weathernext_paper": weathernext_paper,
         }
 
     def start_scan(self, *, query: str, mode: str, window_id: int | None = None) -> int:
@@ -1240,16 +1349,17 @@ class Storage:
             return None
         return ObservationHistory.model_validate_json(row["payload_json"])
 
-    def record_weathernext_snapshot(self, run_id: int, event_id: str, snapshot: object) -> None:
+    def record_weathernext_snapshot(self, run_id: int, event_id: str, snapshot: object) -> int:
         payload = snapshot.model_dump_json()  # type: ignore[union-attr]
         with self.connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 INSERT INTO weathernext_snapshots(run_id, event_id, captured_at, payload_json)
                 VALUES (?, ?, ?, ?)
                 """,
                 (run_id, event_id, utc_now().isoformat(), payload),
             )
+            return _lastrowid(cursor)
 
     def record_market_snapshot(self, run_id: int, snapshot: MarketSnapshot) -> None:
         with self.connect() as connection:
@@ -1288,6 +1398,413 @@ class Storage:
                 ),
             )
             return _lastrowid(cursor)
+
+    # ------------------------------------------------------------------
+    # Isolated WeatherNext paper strategy ledger
+    # ------------------------------------------------------------------
+    def record_weathernext_paper_decision(
+        self,
+        run_id: int,
+        decision: MarketDecision,
+        *,
+        snapshot: object | None = None,
+        paper_order_id: int | None = None,
+    ) -> int:
+        """Persist one WeatherNext decision without touching the v1 ledger.
+
+        ``snapshot`` is intentionally accepted as an opaque object so this
+        table remains compatible with future full-trajectory snapshot schema
+        revisions.  Only provenance scalars are copied into indexed columns;
+        the immutable decision payload retains the complete source reference.
+        """
+
+        snapshot_init = getattr(snapshot, "init_time_utc", None)
+        snapshot_uri = getattr(snapshot, "source_uri", None)
+        scenarios = getattr(snapshot, "scenario_max_c", None)
+        member_count = None if scenarios is None else len(scenarios)
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO weathernext_paper_decisions(
+                    run_id, event_id, market_id, action, strategy_version, created_at,
+                    snapshot_init_time_utc, snapshot_source_uri, snapshot_member_count,
+                    probability, executable_price, probability_edge, shares, notional_usd,
+                    fee_usd, max_loss_usd, expected_profit_usd, reason_codes_json,
+                    warning_codes_json, payload_json, paper_order_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    decision.event_id,
+                    decision.market_id,
+                    decision.action.value,
+                    decision.strategy_version,
+                    decision.created_at.isoformat(),
+                    None if snapshot_init is None else snapshot_init.isoformat(),
+                    None if snapshot_uri is None else str(snapshot_uri),
+                    member_count,
+                    _decimal_text(decision.probability),
+                    _decimal_text(decision.executable_price),
+                    _decimal_text(decision.probability_edge),
+                    _decimal_text(decision.shares),
+                    _decimal_text(decision.notional_usd),
+                    _decimal_text(decision.fee_usd),
+                    _decimal_text(decision.max_loss_usd),
+                    _decimal_text(decision.expected_profit_usd),
+                    json.dumps(decision.reason_codes, ensure_ascii=False),
+                    json.dumps(decision.warning_codes, ensure_ascii=False),
+                    decision.model_dump_json(),
+                    paper_order_id,
+                ),
+            )
+            return _lastrowid(cursor)
+
+    def open_weathernext_paper_order(
+        self,
+        decision: MarketDecision,
+        *,
+        run_id: int,
+        idempotency_key: str,
+        max_event_risk: Decimal,
+        max_total_risk: Decimal,
+    ) -> int:
+        """Open an isolated WeatherNext paper position.
+
+        Exposure is calculated exclusively from ``weathernext_paper_orders``;
+        v1 positions and stop-loss accounting are never consulted here.
+        """
+
+        required = {
+            "shares": decision.shares,
+            "entry_price": decision.executable_price,
+            "notional": decision.notional_usd,
+            "fee": decision.fee_usd,
+            "max_loss": decision.max_loss_usd,
+            "condition_id": decision.condition_id,
+            "token_id": decision.token_id or decision.asset_id,
+        }
+        missing = [key for key, value in required.items() if value is None]
+        if missing:
+            raise ValueError(f"WeatherNext paper order is missing: {', '.join(missing)}")
+        assert decision.shares is not None
+        assert decision.executable_price is not None
+        assert decision.notional_usd is not None
+        assert decision.fee_usd is not None
+        assert decision.max_loss_usd is not None
+
+        with self.transaction(immediate=True) as connection:
+            existing = connection.execute(
+                "SELECT id FROM weathernext_paper_orders WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is not None:
+                return int(existing["id"])
+            active_rows = connection.execute(
+                "SELECT event_id, max_loss_usd FROM weathernext_paper_orders "
+                "WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED')"
+            ).fetchall()
+            total_exposure = sum(
+                (Decimal(row["max_loss_usd"]) for row in active_rows), Decimal(0)
+            )
+            event_exposure = sum(
+                (
+                    Decimal(row["max_loss_usd"])
+                    for row in active_rows
+                    if row["event_id"] == decision.event_id
+                ),
+                Decimal(0),
+            )
+            if event_exposure + decision.max_loss_usd > max_event_risk:
+                raise PaperRiskRejectedError(
+                    f"WeatherNext event exposure ${event_exposure} + "
+                    f"${decision.max_loss_usd} exceeds ${max_event_risk}"
+                )
+            if total_exposure + decision.max_loss_usd > max_total_risk:
+                raise PaperRiskRejectedError(
+                    f"WeatherNext total exposure ${total_exposure} + "
+                    f"${decision.max_loss_usd} exceeds ${max_total_risk}"
+                )
+            try:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO weathernext_paper_orders(
+                        idempotency_key, run_id, event_id, market_id, asset_id, status,
+                        strategy_version, execution_model, condition_id, token_id, outcome,
+                        shares, entry_price, notional_usd, fee_usd, execution_buffer_usd,
+                        max_loss_usd, expected_profit_usd, fee_rate, fee_exponent, end_date,
+                        identity_verified, opened_at
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
+                    """,
+                    (
+                        idempotency_key,
+                        run_id,
+                        decision.event_id,
+                        decision.market_id,
+                        decision.asset_id,
+                        decision.strategy_version,
+                        decision.execution_model,
+                        decision.condition_id,
+                        decision.token_id or decision.asset_id,
+                        decision.outcome.value,
+                        str(decision.shares),
+                        str(decision.executable_price),
+                        str(decision.notional_usd),
+                        str(decision.fee_usd),
+                        str(decision.execution_buffer_usd),
+                        str(decision.max_loss_usd),
+                        _decimal_text(decision.expected_profit_usd),
+                        str(decision.fee_rate),
+                        str(decision.fee_exponent),
+                        None if decision.end_date is None else decision.end_date.isoformat(),
+                        int(
+                            decision.condition_id is not None
+                            and bool(decision.token_id or decision.asset_id)
+                        ),
+                        decision.created_at.isoformat(),
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise PaperRiskRejectedError(
+                    "a WeatherNext paper order already exists for this event"
+                ) from error
+            return _lastrowid(cursor)
+
+    def active_weathernext_paper_orders(self) -> list[WeatherNextPaperOrderTarget]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM weathernext_paper_orders "
+                "WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED') ORDER BY id"
+            ).fetchall()
+        return [_weathernext_order_target_from_row(row) for row in rows]
+
+    def active_weathernext_paper_event_ids(self) -> set[str]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT event_id FROM weathernext_paper_orders "
+                "WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED')"
+            ).fetchall()
+        return {str(row["event_id"]) for row in rows}
+
+    def record_weathernext_paper_resolution_check(
+        self, order_id: int, check: ResolutionCheck
+    ) -> None:
+        with self.transaction(immediate=True) as connection:
+            row = _verified_weathernext_order_row(connection, order_id, check)
+            connection.execute(
+                "INSERT INTO weathernext_paper_resolution_checks("
+                "paper_order_id, checked_at, confirmed, won, payload_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    order_id,
+                    check.checked_at.isoformat(),
+                    int(check.confirmed),
+                    None if check.won is None else int(check.won),
+                    check.model_dump_json(),
+                ),
+            )
+            connection.execute(
+                "UPDATE weathernext_paper_orders SET resolution_json = ? WHERE id = ?",
+                (check.model_dump_json(), row["id"]),
+            )
+
+    def resolve_weathernext_paper_order(self, order_id: int, check: ResolutionCheck) -> bool:
+        if not check.confirmed or check.won is None:
+            raise ValueError("WeatherNext paper order cannot resolve without confirmed result")
+        with self.transaction(immediate=True) as connection:
+            row = _verified_weathernext_order_row(connection, order_id, check)
+            if row["status"] == "RESOLVED":
+                return False
+            if row["status"] not in {"OPEN", "AWAITING_RESULT"}:
+                raise ValueError(f"WeatherNext paper order {order_id} cannot resolve")
+            connection.execute(
+                "UPDATE weathernext_paper_orders SET status='RESOLVED', won=?, "
+                "resolution_json=? WHERE id=?",
+                (int(check.won), check.model_dump_json(), order_id),
+            )
+        return True
+
+    def settle_resolved_weathernext_paper_order(self, order_id: int) -> Decimal:
+        with self.transaction(immediate=True) as connection:
+            row = connection.execute(
+                "SELECT * FROM weathernext_paper_orders WHERE id = ? AND status = 'RESOLVED'",
+                (order_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"No RESOLVED WeatherNext paper order {order_id}")
+            if row["won"] is None or row["resolution_json"] is None:
+                raise ValueError(f"WeatherNext paper order {order_id} lacks resolution evidence")
+            payout = Decimal(row["shares"]) if bool(row["won"]) else Decimal(0)
+            costs = sum(
+                (
+                    Decimal(row["notional_usd"]),
+                    Decimal(row["fee_usd"]),
+                    Decimal(row["execution_buffer_usd"]),
+                ),
+                Decimal(0),
+            )
+            pnl = payout - costs
+            now = utc_now().isoformat()
+            connection.execute(
+                "UPDATE weathernext_paper_orders SET status='PAPER_SETTLED', "
+                "settled_at=?, closed_at=?, realized_pnl_usd=? WHERE id=?",
+                (now, now, str(pnl), order_id),
+            )
+        return pnl
+
+    def mark_awaiting_weathernext_paper_result(
+        self, order_id: int, check: ResolutionCheck
+    ) -> bool:
+        if check.confirmed:
+            raise ValueError("confirmed results must resolve before awaiting")
+        ended = (
+            check.closed
+            or not check.accepting_orders
+            or (check.end_date is not None and check.end_date <= check.checked_at)
+        )
+        if not ended:
+            return False
+        with self.transaction(immediate=True) as connection:
+            row = _verified_weathernext_order_row(connection, order_id, check)
+            if row["status"] != "OPEN":
+                return False
+            connection.execute(
+                "UPDATE weathernext_paper_orders SET status='AWAITING_RESULT' WHERE id=?",
+                (order_id,),
+            )
+        return True
+
+    def record_weathernext_paper_mark(
+        self, order: WeatherNextPaperOrderTarget, snapshot: MarketSnapshot
+    ) -> PaperMark:
+        token_id = snapshot.token_id or snapshot.asset_id
+        if order.condition_id is None or not order.identity_verified:
+            raise ValueError(f"WeatherNext paper order {order.id} has unverified identity")
+        if (
+            snapshot.market_id != order.market_id
+            or snapshot.condition_id != order.condition_id
+            or token_id != order.token_id
+            or snapshot.outcome != order.outcome
+        ):
+            raise ValueError(f"WeatherNext paper mark identity mismatch for order {order.id}")
+        from polybot.fees import plan_sell_fill
+
+        plan = plan_sell_fill(
+            bids=snapshot.bids,
+            shares=order.shares,
+            fee_rate=order.fee_rate,
+            fee_exponent=order.fee_exponent,
+        )
+        best = max(snapshot.bids, key=lambda level: level.price) if snapshot.bids else None
+        mark = PaperMark(
+            order_id=order.id,
+            market_id=order.market_id,
+            condition_id=order.condition_id,
+            token_id=order.token_id,
+            outcome=order.outcome,
+            captured_at=utc_now(),
+            book_timestamp=snapshot.book_timestamp,
+            book_hash=snapshot.book_hash,
+            requested_shares=order.shares,
+            current_bid_price=None if best is None else best.price,
+            current_bid_size=Decimal(0) if best is None else best.size,
+            immediately_sellable_shares=plan.filled_shares,
+            current_bid_mark_usd=None if best is None else order.shares * best.price,
+            full_exit_value_usd=(
+                plan.total_notional - plan.total_fee if plan.fully_fillable else None
+            ),
+            full_exit_fee_usd=plan.total_fee if plan.fully_fillable else None,
+            estimated_full_exit_pnl_usd=(
+                plan.total_notional - plan.total_fee - order.entry_cost_usd
+                if plan.fully_fillable
+                else None
+            ),
+        )
+        with self.connect() as connection:
+            connection.execute(
+                "INSERT INTO weathernext_paper_marks(paper_order_id, captured_at, payload_json) "
+                "VALUES (?, ?, ?)",
+                (order.id, mark.captured_at.isoformat(), mark.model_dump_json()),
+            )
+        return mark
+
+    def weathernext_paper_summary(self) -> dict[str, Any]:
+        """Return isolated WN paper P&L/decision telemetry for the dashboard."""
+
+        with self.connect() as connection:
+            open_rows = connection.execute(
+                "SELECT * FROM weathernext_paper_orders "
+                "WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED') ORDER BY id DESC"
+            ).fetchall()
+            settled_rows = connection.execute(
+                "SELECT realized_pnl_usd FROM weathernext_paper_orders "
+                "WHERE status = 'PAPER_SETTLED'"
+            ).fetchall()
+            status_rows = connection.execute(
+                "SELECT status, COUNT(*) AS count FROM weathernext_paper_orders GROUP BY status"
+            ).fetchall()
+            decision_rows = connection.execute(
+                "SELECT action, COUNT(*) AS count FROM weathernext_paper_decisions GROUP BY action"
+            ).fetchall()
+            recent_decisions = connection.execute(
+                "SELECT id, run_id, event_id, market_id, action, strategy_version, created_at, "
+                "snapshot_member_count, probability, executable_price, expected_profit_usd, "
+                "reason_codes_json, warning_codes_json, paper_order_id "
+                "FROM weathernext_paper_decisions ORDER BY id DESC LIMIT 40"
+            ).fetchall()
+            latest_marks = connection.execute(
+                "SELECT m.paper_order_id, m.payload_json FROM weathernext_paper_marks m "
+                "JOIN (SELECT paper_order_id, MAX(id) AS id FROM weathernext_paper_marks "
+                "GROUP BY paper_order_id) latest ON latest.id = m.id"
+            ).fetchall()
+        realized = sum(
+            (Decimal(row["realized_pnl_usd"]) for row in settled_rows if row["realized_pnl_usd"]),
+            Decimal(0),
+        )
+        open_exposure = sum(
+            (Decimal(row["max_loss_usd"]) for row in open_rows), Decimal(0)
+        )
+        marks = {
+            int(row["paper_order_id"]): json.loads(row["payload_json"])
+            for row in latest_marks
+        }
+        orders = []
+        for row in open_rows:
+            order = dict(row)
+            order["mark"] = marks.get(int(row["id"]))
+            orders.append(order)
+        decisions: list[dict[str, object]] = []
+        for row in recent_decisions:
+            item = dict(row)
+            item["reason_codes"] = json.loads(item.pop("reason_codes_json") or "[]")
+            item["warning_codes"] = json.loads(item.pop("warning_codes_json") or "[]")
+            decisions.append(item)
+        return {
+            "strategy_version": "weathernext-paper-v1",
+            "open_orders": len(open_rows),
+            "open_exposure_usd": open_exposure,
+            "settled_orders": len(settled_rows),
+            "realized_pnl_usd": realized,
+            "orders_by_status": {str(row["status"]): int(row["count"]) for row in status_rows},
+            "decisions_by_action": {
+                str(row["action"]): int(row["count"]) for row in decision_rows
+            },
+            "recent_orders": orders,
+            "recent_decisions": decisions,
+        }
+
+    def weathernext_paper_realized_pnl_for_day(self, day: date) -> Decimal:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT realized_pnl_usd FROM weathernext_paper_orders "
+                "WHERE status='PAPER_SETTLED' AND substr(settled_at, 1, 10)=?",
+                (day.isoformat(),),
+            ).fetchall()
+        return sum(
+            (Decimal(row["realized_pnl_usd"]) for row in rows if row["realized_pnl_usd"]),
+            Decimal(0),
+        )
 
     def open_paper_order(
         self,
@@ -1788,6 +2305,60 @@ def _lastrowid(cursor: sqlite3.Cursor) -> int:
     if cursor.lastrowid is None:
         raise RuntimeError("SQLite did not return a row id")
     return int(cursor.lastrowid)
+
+
+def _decimal_text(value: Decimal | None) -> str | None:
+    return None if value is None else str(value)
+
+
+def _weathernext_order_target_from_row(row: sqlite3.Row) -> WeatherNextPaperOrderTarget:
+    return WeatherNextPaperOrderTarget(
+        id=int(row["id"]),
+        event_id=str(row["event_id"]),
+        market_id=str(row["market_id"]),
+        condition_id=row["condition_id"],
+        token_id=str(row["token_id"] or row["asset_id"]),
+        outcome=OutcomeSide(str(row["outcome"] or "YES").upper()),
+        status=PaperOrderStatus(str(row["status"]).upper()),
+        strategy_version=str(row["strategy_version"] or "weathernext-paper-v1"),
+        execution_model=str(row["execution_model"] or "WEATHERNEXT_CROSSING_LIMIT_SHARES"),
+        shares=Decimal(row["shares"]),
+        entry_cost_usd=sum(
+            (
+                Decimal(row["notional_usd"]),
+                Decimal(row["fee_usd"]),
+                Decimal(row["execution_buffer_usd"] or "0"),
+            ),
+            Decimal(0),
+        ),
+        fee_rate=Decimal(row["fee_rate"] or "0"),
+        fee_exponent=Decimal(row["fee_exponent"] or "0"),
+        end_date=None if row["end_date"] is None else datetime.fromisoformat(row["end_date"]),
+        identity_verified=bool(row["identity_verified"]),
+    )
+
+
+def _verified_weathernext_order_row(
+    connection: sqlite3.Connection, order_id: int, check: ResolutionCheck
+) -> sqlite3.Row:
+    row = connection.execute(
+        "SELECT * FROM weathernext_paper_orders WHERE id = ?", (order_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"Unknown WeatherNext paper order {order_id}")
+    expected = (
+        str(row["market_id"]),
+        row["condition_id"],
+        str(row["token_id"] or row["asset_id"]),
+        str(row["outcome"] or "YES").upper(),
+    )
+    actual = (check.market_id, check.condition_id, check.token_id, check.outcome.value)
+    if not bool(row["identity_verified"]) or expected != actual:
+        raise ValueError(
+            f"WeatherNext paper order {order_id} condition/token identity mismatch: "
+            f"stored={expected}, checked={actual}"
+        )
+    return row
 
 
 def _runtime_window_from_row(row: sqlite3.Row) -> RuntimeWindow:

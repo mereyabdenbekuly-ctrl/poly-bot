@@ -36,7 +36,13 @@ def _format_bytes(value: int) -> str:
 
 
 class WeatherNextSnapshot(StrictModel):
-    """An explicitly supplied WeatherNext export; never fabricated by Polybot."""
+    """An explicitly supplied WeatherNext export; never fabricated by Polybot.
+
+    ``trajectories`` is populated by the approval-gated full reader.  Keeping
+    it optional preserves compatibility with the older compact daily-max
+    snapshot while allowing the immutable archive to retain every member and
+    valid hour instead of reducing the source to only ``scenario_max_c``.
+    """
 
     source: Literal["weathernext3"] = "weathernext3"
     init_time_utc: datetime
@@ -46,6 +52,14 @@ class WeatherNextSnapshot(StrictModel):
     observation_timezone: str = "UTC"
     scenario_max_c: list[float] = Field(min_length=64, max_length=64)
     source_uri: str
+    release_id: str | None = None
+    station_id: str | None = None
+    latitude: float | None = None
+    longitude: float | None = None
+    units: Literal["C", "F"] = "C"
+    valid_times_utc: list[datetime] = Field(default_factory=list)
+    member_ids: list[str] = Field(default_factory=list)
+    trajectories: list[dict[str, object]] = Field(default_factory=list)
 
     @field_validator("init_time_utc", "received_at_utc")
     @classmethod
@@ -53,6 +67,18 @@ class WeatherNextSnapshot(StrictModel):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("WeatherNext timestamps must be timezone-aware")
         return value.astimezone(UTC)
+
+    @field_validator("valid_times_utc")
+    @classmethod
+    def _valid_times_aware(cls, values: list[datetime]) -> list[datetime]:
+        normalized = []
+        for value in values:
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError("WeatherNext valid_times_utc must be timezone-aware")
+            normalized.append(value.astimezone(UTC))
+        if normalized != sorted(set(normalized)):
+            raise ValueError("WeatherNext valid_times_utc must be sorted and unique")
+        return normalized
 
     @field_validator("scenario_max_c")
     @classmethod
@@ -72,12 +98,43 @@ class WeatherNextSnapshot(StrictModel):
             raise ValueError(f"unknown observation timezone: {value}") from error
         return value
 
+    @field_validator("latitude", "longitude")
+    @classmethod
+    def _finite_coordinates(cls, value: float | None) -> float | None:
+        if value is not None and not math.isfinite(value):
+            raise ValueError("WeatherNext coordinates must be finite")
+        return value
+
     @model_validator(mode="after")
     def _validate_provenance(self) -> WeatherNextSnapshot:
         if self.received_at_utc < self.init_time_utc:
             raise ValueError("received_at_utc must not precede init_time_utc")
         if not self.source_uri.startswith(f"gs://{_WEATHERNEXT_BUCKET}/"):
             raise ValueError("source_uri must identify the official full-ensemble GCS bucket")
+        if self.trajectories:
+            if len(self.trajectories) != 64:
+                raise ValueError("WeatherNext trajectory archives require exactly 64 members")
+            ids: list[str] = []
+            expected_hours = len(self.valid_times_utc)
+            for trajectory in self.trajectories:
+                member_id = str(trajectory.get("member_id", "")).strip()
+                values = trajectory.get("values_c")
+                if not member_id or member_id in ids:
+                    raise ValueError("WeatherNext trajectory member IDs must be unique")
+                if not isinstance(values, list) or len(values) != expected_hours:
+                    raise ValueError(
+                        "WeatherNext trajectories must contain one value for every valid hour"
+                    )
+                if not all(
+                    isinstance(value, (int, float)) and math.isfinite(float(value))
+                    for value in values
+                ):
+                    raise ValueError("WeatherNext trajectories must contain finite values")
+                ids.append(member_id)
+            if self.member_ids and self.member_ids != ids:
+                raise ValueError("WeatherNext member_ids do not match trajectory member IDs")
+            if self.valid_times_utc and len(set(self.valid_times_utc)) != len(self.valid_times_utc):
+                raise ValueError("WeatherNext trajectory valid times must be unique")
         return self
 
 
@@ -530,6 +587,7 @@ class WeatherNextGcsClient:
             )
         self.credentials = credentials
         self._dataset_factory = dataset_factory
+        self._last_raw_chunk_object_metadata: list[dict[str, object]] = []
         if storage_client is None:
             missing = _missing_modules(("google.auth", "google.cloud.storage"))
             if missing:
@@ -755,6 +813,33 @@ class WeatherNextGcsClient:
         chunks: dict[str, int] | None = {} if find_spec("dask") else None
         return xarray.open_zarr(zarr_store, chunks=chunks)
 
+    def open_sequential_zarr_group(self, store_prefix: str) -> Any:
+        """Open the raw Zarr-v3 group without xarray/dask materialization.
+
+        The autonomous approved reader uses this narrow escape hatch to call
+        ``Array.get_basic_selection`` for one exact chunk at a time.  Keeping
+        it separate from ``_open_dataset`` avoids xarray's normal indexing
+        machinery, which may gather several chunks concurrently.  Opening the
+        group itself reads metadata only; no array payload is fetched here.
+        """
+
+        _require_gcs_stack()
+        import importlib
+
+        obstore = cast(Any, importlib.import_module("obstore"))
+        zarr = cast(Any, importlib.import_module("zarr"))
+        gcs_store = obstore.store.GCSStore(
+            bucket=self.bucket_name,
+            prefix=store_prefix,
+            client_options={
+                "default_headers": {
+                    "x-goog-user-project": self.billing_project,
+                }
+            },
+        )
+        zarr_store = zarr.storage.ObjectStore(gcs_store)
+        return zarr.open_group(zarr_store, mode="r")
+
     def _open_dataset_with_fallback(
         self,
         *,
@@ -832,6 +917,26 @@ class WeatherNextGcsClient:
     ) -> int | None:
         """Return one compressed chunk object's size via metadata-only HEAD."""
 
+        metadata = self._raw_chunk_object_metadata(
+            store_prefix, name, chunk_coordinates, meta
+        )
+        return None if metadata is None else int(cast(int, metadata["size"]))
+
+    def _raw_chunk_object_metadata(
+        self,
+        store_prefix: str,
+        name: str,
+        chunk_coordinates: tuple[int, ...],
+        meta: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Return one chunk's compressed-object metadata via HEAD only.
+
+        ``reload()`` requests object metadata and never downloads the chunk
+        body.  The returned generation/checksum fields let a later approved
+        reader bind its payload GET to exactly the object described by the
+        manifest.
+        """
+
         blob_method = getattr(self._bucket, "blob", None)
         if not callable(blob_method):
             return None
@@ -854,9 +959,42 @@ class WeatherNextGcsClient:
             blob = cast(Any, blob_method(key))
             blob.reload()
             size = getattr(blob, "size", None)
-            return None if size is None else int(size)
+            if size is None:
+                return None
+            result: dict[str, object] = {
+                "object_uri": f"gs://{self.bucket_name}/{key}",
+                "size": int(size),
+            }
+            for field in ("generation", "etag", "md5_hash", "crc32c", "updated"):
+                value = getattr(blob, field, None)
+                if value is not None:
+                    result[field] = str(value)
+            return result
         except Exception:
             return None
+
+    def _raw_chunk_object_metadata_list(
+        self,
+        store_prefix: str,
+        name: str,
+        chunk_coordinates: list[tuple[int, ...]],
+        meta: Mapping[str, object],
+    ) -> list[dict[str, object]]:
+        """Resolve bounded metadata-only HEAD requests, preserving order."""
+
+        if not chunk_coordinates or bool(meta.get("sharding_detected")):
+            return []
+        from concurrent.futures import ThreadPoolExecutor
+
+        def get_metadata(coordinates: tuple[int, ...]) -> dict[str, object] | None:
+            return self._raw_chunk_object_metadata(store_prefix, name, coordinates, meta)
+
+        workers = min(16, len(chunk_coordinates))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            records = list(executor.map(get_metadata, chunk_coordinates))
+        if any(record is None for record in records):
+            return []
+        return [cast(dict[str, object], record) for record in records]
 
     def _raw_chunk_object_sizes(
         self,
@@ -867,21 +1005,14 @@ class WeatherNextGcsClient:
     ) -> list[int]:
         """Resolve bounded chunk HEAD requests concurrently, preserving order."""
 
-        if not chunk_coordinates or bool(meta.get("sharding_detected")):
+        records = self._raw_chunk_object_metadata_list(
+            store_prefix, name, chunk_coordinates, meta
+        )
+        self._last_raw_chunk_object_metadata = records
+        if len(records) != len(chunk_coordinates):
             return []
-        # A daily raw station selection currently spans hundreds of global
-        # chunks.  Serial HEAD calls make an otherwise metadata-only diagnostic
-        # take several minutes; a small bounded pool keeps it operational
-        # without downloading a single chunk body.
-        from concurrent.futures import ThreadPoolExecutor
-
-        def get_size(coordinates: tuple[int, ...]) -> int | None:
-            return self._raw_chunk_object_size(store_prefix, name, coordinates, meta)
-
-        workers = min(16, len(chunk_coordinates))
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            sizes = list(executor.map(get_size, chunk_coordinates))
-        if any(size is None or size <= 0 for size in sizes):
+        sizes = [record.get("size") for record in records]
+        if any(not isinstance(size, int) or size <= 0 for size in sizes):
             return []
         return [int(cast(int, size)) for size in sizes]
 
@@ -998,11 +1129,36 @@ class WeatherNextGcsClient:
                     day_start <= actual_init + timedelta(seconds=offset) < day_end
                     for offset in selected_offsets
                 ]
+                valid_index_tuples = [
+                    {
+                        "lead_time_index": int(index),
+                        "lead_subtime_index": int(sub_index),
+                        "valid_time_utc": (
+                            actual_init
+                            + timedelta(seconds=lead_seconds[index] + sub_seconds[sub_index])
+                        ).isoformat(),
+                    }
+                    for index in lead_indices
+                    for sub_index in sub_indices
+                    if day_start
+                    <= actual_init
+                    + timedelta(seconds=lead_seconds[index] + sub_seconds[sub_index])
+                    < day_end
+                ]
             else:
                 lead_indices = [int(index) for index, selected in enumerate(valid_mask) if selected]
                 sub_indices = []
                 selected_offsets = [lead_seconds[index] for index in lead_indices]
                 selected_mask = [True] * len(lead_indices)
+                valid_index_tuples = [
+                    {
+                        "lead_time_index": int(index),
+                        "valid_time_utc": (
+                            actual_init + timedelta(seconds=lead_seconds[index])
+                        ).isoformat(),
+                    }
+                    for index in lead_indices
+                ]
 
             lat_values = np.asarray(
                 getattr(dataset[lat_name], "values", dataset[lat_name])
@@ -1071,9 +1227,13 @@ class WeatherNextGcsClient:
             except (TypeError, ValueError):
                 global_bytes = selected_logical = selected_chunk_logical = 0
                 selected_time_count = 0
+            self._last_raw_chunk_object_metadata = []
             object_sizes = self._raw_chunk_object_sizes(
                 store_prefix, variable_name, chunk_coordinates, metadata
             )
+            object_metadata = self._last_raw_chunk_object_metadata
+            if len(object_metadata) != len(chunk_coordinates):
+                object_metadata = []
             if len(object_sizes) == len(chunk_coordinates) and chunk_coordinates:
                 expected_bytes = sum(object_sizes)
                 estimate_basis = "compressed_chunk_object_sizes"
@@ -1104,6 +1264,7 @@ class WeatherNextGcsClient:
                     "sample_indices": [0, 63],
                     "lead_indices": lead_indices,
                     "lead_subtime_indices": sub_indices,
+                    "valid_index_tuples": valid_index_tuples,
                     "latitude_index": lat_index,
                     "longitude_index": lon_index,
                     "nearest_latitude": float(lat_values[lat_index]),
@@ -1121,6 +1282,7 @@ class WeatherNextGcsClient:
                     "selected_chunk_count": len(chunk_coordinates),
                     "selected_chunk_logical_bytes": selected_chunk_logical * len(chunk_coordinates),
                     "selected_chunk_object_sizes": object_sizes,
+                    "selected_chunk_object_metadata": object_metadata,
                     "expected_network_bytes": expected_bytes,
                     "estimate_basis": estimate_basis,
                     "shard_shape": metadata.get("shard_shape"),
@@ -2419,7 +2581,19 @@ class WeatherNextProvider:
                 snapshot_path=path,
                 message="WeatherNext 3 comparison is disabled; v1 continues with current sources.",
             )
-        if not self.settings.weathernext_gcs_project:
+        indexed = self._first_indexed_snapshot()
+        if indexed is not None and (path is None or not Path(path).expanduser().is_file()):
+            indexed_path, indexed_snapshot = indexed
+            return WeatherNextStatus(
+                state="snapshot_available",
+                enabled=True,
+                surface=self.settings.weathernext_surface,
+                snapshot_path=str(indexed_path),
+                init_time_utc=indexed_snapshot.init_time_utc,
+                received_at_utc=indexed_snapshot.received_at_utc,
+                message="Authorized WeatherNext 3 trajectory snapshot index loaded.",
+            )
+        if not self.settings.weathernext_gcs_project and indexed is None:
             return WeatherNextStatus(
                 state="access_pending",
                 enabled=True,
@@ -2430,7 +2604,7 @@ class WeatherNextProvider:
                     "POLYBOT_WEATHERNEXT_GCS_PROJECT to the Requester Pays billing project."
                 ),
             )
-        if not path:
+        if not path and indexed is None:
             return WeatherNextStatus(
                 state="access_pending",
                 enabled=True,
@@ -2442,6 +2616,16 @@ class WeatherNextProvider:
                     "no snapshot is saved; "
                     "run `polybot weathernext check` and then an explicit refresh."
                 ),
+            )
+        if path is None:
+            # ``indexed`` was handled above; this is only a defensive type
+            # narrowing guard for a concurrently removed index file.
+            return WeatherNextStatus(
+                state="access_pending",
+                enabled=True,
+                surface=self.settings.weathernext_surface,
+                snapshot_path=None,
+                message="WeatherNext snapshot index no longer contains a usable artifact.",
             )
         try:
             snapshot = self._load_snapshot(Path(path).expanduser())
@@ -2464,10 +2648,19 @@ class WeatherNextProvider:
         )
 
     def snapshot_for(self, rules: RuleInterpretation) -> WeatherNextSnapshot | None:
-        if not self.settings.weathernext_enabled or not self.settings.weathernext_snapshot_path:
+        if not self.settings.weathernext_enabled:
             return None
-        snapshot = self._load_snapshot(Path(self.settings.weathernext_snapshot_path).expanduser())
         if rules.location is None or rules.observation_date is None:
+            return None
+        indexed_candidates = self._indexed_snapshots_for_rules(rules)
+        for snapshot in indexed_candidates:
+            return snapshot
+        path = self.settings.weathernext_snapshot_path
+        if not path:
+            return None
+        try:
+            snapshot = self._load_snapshot(Path(path).expanduser())
+        except Exception:
             return None
         if snapshot.observation_date != rules.observation_date:
             return None
@@ -2503,6 +2696,69 @@ class WeatherNextProvider:
     def _load_snapshot(path: Path) -> WeatherNextSnapshot:
         payload = json.loads(path.read_text(encoding="utf-8"))
         return WeatherNextSnapshot.model_validate(payload)
+
+    def _snapshot_index_path(self) -> Path | None:
+        value = getattr(self.settings, "weathernext_snapshot_index_path", None)
+        if not value:
+            return None
+        return Path(value).expanduser()
+
+    def _load_snapshot_index(self) -> list[dict[str, object]]:
+        path = self._snapshot_index_path()
+        if path is None or not path.is_file():
+            return []
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, Mapping):
+            return []
+        entries = payload.get("entries", [])
+        if not isinstance(entries, list):
+            return []
+        return [
+            {str(key): value for key, value in entry.items()}
+            for entry in entries
+            if isinstance(entry, Mapping)
+        ]
+
+    def _first_indexed_snapshot(self) -> tuple[Path, WeatherNextSnapshot] | None:
+        for entry in self._load_snapshot_index():
+            raw_path = entry.get("path")
+            if not isinstance(raw_path, str) or not raw_path:
+                continue
+            try:
+                path = Path(raw_path).expanduser()
+                return path, self._load_snapshot(path)
+            except Exception:
+                continue
+        return None
+
+    def _indexed_snapshots_for_rules(
+        self, rules: RuleInterpretation
+    ) -> list[WeatherNextSnapshot]:
+        if rules.location is None or rules.observation_date is None:
+            return []
+        location_key = rules.location.casefold().strip()
+        authority_key = (rules.station_or_authority or "").casefold().strip()
+        matches: list[WeatherNextSnapshot] = []
+        for entry in self._load_snapshot_index():
+            entry_date = entry.get("observation_date")
+            if str(entry_date) != rules.observation_date.isoformat():
+                continue
+            entry_location = str(entry.get("location") or "").casefold().strip()
+            entry_station = str(entry.get("station_id") or "").casefold().strip()
+            if location_key not in {entry_location, entry_station} and (
+                not authority_key or authority_key not in {entry_location, entry_station}
+            ):
+                continue
+            raw_path = entry.get("path")
+            if not isinstance(raw_path, str) or not raw_path:
+                continue
+            try:
+                snapshot = self._load_snapshot(Path(raw_path).expanduser())
+            except Exception:
+                continue
+            if snapshot.observation_date == rules.observation_date:
+                matches.append(snapshot)
+        return matches
 
     @staticmethod
     def _load_statistics_snapshot(path: Path) -> WeatherNextStatisticsSnapshot:

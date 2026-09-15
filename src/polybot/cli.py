@@ -145,6 +145,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     wn_stats_refresh.add_argument("--output", default=None)
 
+    wn_auto = wn_sub.add_parser(
+        "autonomous-refresh",
+        aliases=["refresh-auto", "preflight"],
+        help=(
+            "Derive bounded targets, refresh a metadata-only manifest, and—only "
+            "when explicitly enabled plus sidecar-approved—read it sequentially"
+        ),
+    )
+    wn_auto.add_argument("--database", default=None)
+    wn_auto.add_argument("--root", default=None)
+    wn_auto.add_argument("--targets", default=None)
+    wn_auto.add_argument("--manifest", default=None)
+    wn_auto.add_argument("--approval", default=None)
+    wn_auto.add_argument("--status", default=None)
+    wn_auto.add_argument("--index", default=None)
+    wn_auto.add_argument("--snapshot-root", default=None)
+    wn_auto.add_argument("--max-targets", type=int, default=None)
+    wn_auto.add_argument(
+        "--read-approved",
+        action="store_true",
+        help="Permit the reader step only after local manifest/sidecar verification succeeds",
+    )
+    wn_auto.add_argument("--json", action="store_true", dest="as_json")
+
     settle = subparsers.add_parser("settle", help="Settle an open paper order manually")
     settle.add_argument("market_id")
     outcome = settle.add_mutually_exclusive_group(required=True)
@@ -179,6 +203,103 @@ def main(argv: list[str] | None = None) -> None:
             )
 
             provider = WeatherNextProvider(settings)
+            if args.weathernext_command in {
+                "autonomous-refresh",
+                "refresh-auto",
+                "preflight",
+            }:
+                from pathlib import Path
+
+                from polybot.weathernext_autonomy import (
+                    DEFAULT_APPROVAL_PATH,
+                    DEFAULT_MANIFEST_PATH,
+                    DEFAULT_ROOT,
+                    DEFAULT_STATUS_PATH,
+                    DEFAULT_TARGETS_PATH,
+                    autonomous_refresh_preflight,
+                    read_approved_manifest_sequentially,
+                    write_refresh_status,
+                )
+
+                root = Path(args.root).expanduser() if args.root else settings.weathernext_full_root
+                database = (
+                    Path(args.database).expanduser()
+                    if args.database
+                    else settings.database_path
+                )
+                targets = (
+                    Path(args.targets).expanduser()
+                    if args.targets
+                    else root / DEFAULT_TARGETS_PATH.relative_to(DEFAULT_ROOT)
+                )
+                manifest = (
+                    Path(args.manifest).expanduser()
+                    if args.manifest
+                    else root / DEFAULT_MANIFEST_PATH.relative_to(DEFAULT_ROOT)
+                )
+                approval = (
+                    Path(args.approval).expanduser()
+                    if args.approval
+                    else root / DEFAULT_APPROVAL_PATH.relative_to(DEFAULT_ROOT)
+                )
+                status_path = (
+                    Path(args.status).expanduser()
+                    if args.status
+                    else root / DEFAULT_STATUS_PATH.relative_to(DEFAULT_ROOT)
+                )
+                index = (
+                    Path(args.index).expanduser()
+                    if args.index
+                    else Path(
+                        settings.weathernext_snapshot_index_path
+                        or root / "latest-index.json"
+                    ).expanduser()
+                )
+                snapshot_root = (
+                    Path(args.snapshot_root).expanduser()
+                    if args.snapshot_root
+                    else root / "snapshots"
+                )
+                status = autonomous_refresh_preflight(
+                    database,
+                    settings=settings,
+                    targets_path=targets,
+                    manifest_path=manifest,
+                    approval_path=approval,
+                    status_path=status_path,
+                    max_targets=args.max_targets or settings.weathernext_full_max_targets,
+                    max_network_bytes=settings.weathernext_full_max_network_bytes,
+                    max_objects=settings.weathernext_full_max_objects,
+                    max_object_bytes=settings.weathernext_full_max_object_bytes,
+                )
+                response: dict[str, object] = {"status": status.model_dump(mode="json")}
+                if (
+                    args.read_approved
+                    and settings.weathernext_full_refresh_enabled
+                    and status.target_count > 0
+                    and status.approval.state == "approved"
+                ):
+                    result = read_approved_manifest_sequentially(
+                        settings,
+                        manifest_path=manifest,
+                        approval_path=approval,
+                        index_path=index,
+                        snapshot_root=snapshot_root,
+                    )
+                    status = status.model_copy(
+                        update={
+                            "payload_read": True,
+                            "snapshots_written": result.snapshots_written,
+                            "message": result.message,
+                        }
+                    )
+                    write_refresh_status(status, status_path)
+                    response["read"] = result.model_dump(mode="json")
+                if args.as_json:
+                    print(json.dumps(response, ensure_ascii=False, indent=2, default=str))
+                else:
+                    print(json.dumps(response, ensure_ascii=False, indent=2, default=str))
+                return
             if args.weathernext_command in {"raw-estimate", "estimate"}:
                 from pathlib import Path
 

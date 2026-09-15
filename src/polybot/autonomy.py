@@ -164,6 +164,7 @@ class AutonomousRunner:
             return
         payload: dict[str, object] = {
             "weathernext": self.weathernext.status().model_dump(mode="json"),
+            "weathernext_paper": self.storage.weathernext_paper_summary(),
             "portfolio": self.storage.portfolio_summary(),
             "window": self.storage.runtime_window_summary(window_id),
             "forecast_engine": self._forecast_report(kind),

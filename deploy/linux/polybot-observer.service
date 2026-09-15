@@ -10,7 +10,7 @@ Group=polybot
 WorkingDirectory=/opt/polybot
 EnvironmentFile=/etc/polybot/polybot.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/env POLYBOT_DATABASE_PATH=/var/lib/polybot/polybot.sqlite3 POLYBOT_ECMWF_JSON_ARCHIVE_ROOT=/var/lib/polybot/forecasts/ecmwf-ifs025-json POLYBOT_WEATHERNEXT_STATISTICS_SNAPSHOT_PATH=/var/lib/polybot/weathernext-statistics-snapshot.json /opt/polybot/.venv/bin/polybot run --interval 300 --paper
+ExecStart=/usr/bin/env POLYBOT_DATABASE_PATH=/var/lib/polybot/polybot.sqlite3 POLYBOT_ECMWF_JSON_ARCHIVE_ROOT=/var/lib/polybot/forecasts/ecmwf-ifs025-json POLYBOT_WEATHERNEXT_STATISTICS_SNAPSHOT_PATH=/var/lib/polybot/weathernext-statistics-snapshot.json POLYBOT_WEATHERNEXT_SNAPSHOT_INDEX_PATH=/var/lib/polybot/weathernext/full/latest-index.json /opt/polybot/.venv/bin/polybot run --interval 300 --paper
 Restart=always
 RestartSec=30
 TimeoutStopSec=120

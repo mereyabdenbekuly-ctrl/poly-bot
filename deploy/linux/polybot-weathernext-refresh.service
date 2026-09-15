@@ -1,0 +1,43 @@
+[Unit]
+Description=Polybot approval-gated WeatherNext full-ensemble refresh
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/var/lib/polybot/polybot.sqlite3
+ConditionPathExists=/etc/polybot/polybot.env
+
+[Service]
+Type=oneshot
+User=polybot
+Group=polybot
+WorkingDirectory=/opt/polybot
+EnvironmentFile=/etc/polybot/polybot.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/polybot/.venv/bin/polybot weathernext autonomous-refresh \
+  --database /var/lib/polybot/polybot.sqlite3 \
+  --root /var/lib/polybot/weathernext/full \
+  --targets /var/lib/polybot/weathernext/full/targets.json \
+  --manifest /var/lib/polybot/weathernext/full/read-manifest.json \
+  --approval /var/lib/polybot/weathernext/full/read-approval.json \
+  --status /var/lib/polybot/weathernext/full/refresh-status.json \
+  --index /var/lib/polybot/weathernext/full/latest-index.json \
+  --snapshot-root /var/lib/polybot/weathernext/full/snapshots \
+  --read-approved --json
+Nice=15
+IOSchedulingClass=idle
+IOSchedulingPriority=7
+CPUWeight=15
+IOWeight=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/polybot
+

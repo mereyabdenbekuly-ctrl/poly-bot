@@ -117,6 +117,35 @@ class Settings(BaseSettings):
     # opt-in and bounded unless an operator explicitly overrides the guard.
     weathernext_raw_read_max_bytes: int = Field(default=2_000_000_000, ge=1_000_000)
 
+    # The WeatherNext paper strategy has its own ledger and exposure budget.
+    # These defaults mirror the legacy paper guardrails but are intentionally
+    # separate: a research position can never consume v1 event/portfolio
+    # exposure or alter v1 stop-loss accounting.
+    weathernext_paper_enabled: bool = False
+    weathernext_paper_max_event_risk_usd: Decimal = Decimal("2.00")
+    weathernext_paper_max_total_risk_usd: Decimal = Decimal("6.00")
+    weathernext_paper_daily_stop_loss_usd: Decimal = Decimal("2.00")
+    weathernext_paper_total_drawdown_stop_usd: Decimal = Decimal("5.00")
+    weathernext_paper_min_probability_edge: Decimal = Decimal("0.08")
+    weathernext_paper_min_expected_profit_usd: Decimal = Decimal("0.25")
+
+    # Approval-gated full-ensemble refresh.  The timer may derive targets and
+    # produce metadata-only manifests while this remains false; payload GETs
+    # additionally require the external read-approval sidecar bound to the
+    # exact manifest digest.
+    weathernext_full_refresh_enabled: bool = False
+    weathernext_full_root: Path = Path("/var/lib/polybot/weathernext/full")
+    weathernext_snapshot_index_path: str | None = None
+    weathernext_full_max_targets: int = Field(default=32, ge=1, le=256)
+    weathernext_full_max_network_bytes: int = Field(default=2_000_000_000, ge=1_000_000)
+    weathernext_full_max_objects: int = Field(default=4096, ge=1, le=100_000)
+    weathernext_full_max_object_bytes: int = Field(
+        default=512_000_000, ge=1_000_000, le=2_000_000_000
+    )
+    weathernext_full_refresh_interval_seconds: int = Field(
+        default=3600, ge=300, le=86400
+    )
+
     http_timeout_seconds: float = Field(default=20.0, ge=1, le=120)
 
     @field_validator(
@@ -132,6 +161,12 @@ class Settings(BaseSettings):
         "min_expected_profit_usd",
         "execution_buffer_usd",
         "forecast_snapshot_probability_delta",
+        "weathernext_paper_max_event_risk_usd",
+        "weathernext_paper_max_total_risk_usd",
+        "weathernext_paper_daily_stop_loss_usd",
+        "weathernext_paper_total_drawdown_stop_usd",
+        "weathernext_paper_min_probability_edge",
+        "weathernext_paper_min_expected_profit_usd",
     )
     @classmethod
     def _nonnegative_decimal(cls, value: Decimal) -> Decimal:

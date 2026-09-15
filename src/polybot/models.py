@@ -214,6 +214,31 @@ class PaperOrderTarget(StrictModel):
     identity_verified: bool
 
 
+class WeatherNextPaperOrderTarget(StrictModel):
+    """Identity/accounting fields for the isolated WeatherNext paper ledger.
+
+    WeatherNext paper positions deliberately do not share the legacy
+    ``paper_orders`` table.  Keeping a separate target type prevents the
+    research strategy from consuming v1 event locks, exposure, or P&L.
+    """
+
+    id: int
+    event_id: str
+    market_id: str
+    condition_id: str | None
+    token_id: str
+    outcome: OutcomeSide
+    status: PaperOrderStatus
+    strategy_version: str
+    execution_model: str
+    shares: Decimal
+    entry_cost_usd: Decimal
+    fee_rate: Decimal
+    fee_exponent: Decimal
+    end_date: datetime | None
+    identity_verified: bool
+
+
 class ResolutionCheck(StrictModel):
     """Resolution evidence read for one exact condition/outcome token."""
 
@@ -274,6 +299,9 @@ class ScanReport(StrictModel):
     markets_scanned: int
     paper_orders_opened: int
     paper_orders_settled: int = 0
+    weathernext_paper_decisions: int = 0
+    weathernext_paper_orders_opened: int = 0
+    weathernext_paper_orders_settled: int = 0
     weather_next_status: dict[str, object] = Field(default_factory=dict)
     decisions: list[MarketDecision]
     errors: list[str]
