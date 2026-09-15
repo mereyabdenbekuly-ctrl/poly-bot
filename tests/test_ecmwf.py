@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,6 +24,24 @@ INIT = datetime(2026, 9, 8, 18, tzinfo=UTC)
 FETCHED = datetime(2026, 9, 9, 4, 30, tzinfo=UTC)
 PUBLISHED_HEADER = "Wed, 09 Sep 2026 01:04:00 GMT"
 PUBLISHED = datetime(2026, 9, 9, 1, 4, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def _restore_tmp_permissions(tmp_path: Path):
+    """Let pytest remove immutable archive fixtures after each test."""
+
+    yield
+    for current, directories, files in os.walk(tmp_path, topdown=False, followlinks=False):
+        current_path = Path(current)
+        for name in files:
+            candidate = current_path / name
+            if not candidate.is_symlink():
+                candidate.chmod(0o600)
+        for name in directories:
+            candidate = current_path / name
+            if not candidate.is_symlink():
+                candidate.chmod(0o700)
+    tmp_path.chmod(0o700)
 
 
 class FakeTransport:
@@ -694,3 +713,37 @@ def test_existing_archive_retention_failure_blocks_point_extraction(tmp_path: Pa
     assert result.snapshot is None
     assert result.archive is None
     assert "below 200 bytes" in result.status.message
+
+
+def test_existing_archive_fast_path_enforces_retention(tmp_path: Path) -> None:
+    oldest = _seed_archive(tmp_path, INIT - timedelta(hours=12))
+    middle = _seed_archive(tmp_path, INIT - timedelta(hours=6))
+    newest = _seed_archive(tmp_path, INIT)
+    transport = FakeTransport(_responses_for_step(3))
+    adapter = EcmwfIfsEnsAdapter(
+        archive_root=tmp_path,
+        transport=transport,
+        decoder=FakeDecoder(),
+        clock=lambda: FETCHED,
+        retention_policy=EcmwfArchiveRetentionPolicy(
+            max_completed_releases=2,
+            max_completed_bytes=1024**4,
+            min_free_bytes=0,
+            min_free_fraction=0,
+        ),
+        disk_usage=lambda _: (1024**4, 0, 1024**4),
+    )
+
+    result = adapter.fetch_archive(init_time_utc=INIT, steps=[3])
+
+    assert result.status.state == EcmwfState.AVAILABLE
+    assert result.archive is not None
+    assert result.archive.archive_id == newest.archive_id
+    assert result.retention is not None
+    assert result.retention.within_limits
+    assert result.retention.completed_releases == 2
+    assert result.retention.pruned_releases == 1
+    assert not oldest.archive_path.exists()
+    assert middle.archive_path.exists()
+    assert newest.archive_path.exists()
+    assert [call for call in transport.calls if call[2] is not None] == []

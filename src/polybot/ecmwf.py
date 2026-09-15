@@ -508,7 +508,11 @@ class EcmwfIfsEnsAdapter:
             status = self._available_status(indexes, init_time, steps, product, checked)
             existing = self._find_existing_archive(init_time, indexes, product)
             if existing is not None:
-                retention = self.retention_status()
+                # A previously committed archive is already fully validated by
+                # ``_find_existing_archive``.  Enforce newly enabled/stricter
+                # retention here as well; otherwise the fast path could remain
+                # permanently over count/byte limits without deleting anything.
+                retention = self._prune_archives(keep_archive_ids={existing.archive_id})
                 if retention is not None and not retention.within_limits:
                     status = self._retention_failure_status(status, retention)
                 return EcmwfArchiveResult(status, existing, retention)
@@ -1830,6 +1834,15 @@ def _validate_archive_shape(
         or ensemble.get("single_run_substitution") is not False
     ):
         raise EcmwfValidationError("archive manifest ensemble coverage is incomplete")
+    expected_published = max(artifact.published_at_utc for artifact in artifacts).isoformat()
+    expected_fingerprint = _request_fingerprint_from_artifacts(
+        source_base, init_time, product, tuple(artifacts)
+    )
+    if (
+        manifest.get("published_at_utc") != expected_published
+        or manifest.get("request_fingerprint") != expected_fingerprint
+    ):
+        raise EcmwfValidationError("archive manifest publication/fingerprint is inconsistent")
     seen_steps: set[int] = set()
     seen_paths: set[str] = set()
     expected_interval = _interval_for_product(product)
