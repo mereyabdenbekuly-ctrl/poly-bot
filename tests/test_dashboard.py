@@ -40,6 +40,9 @@ def test_dashboard_is_read_only_snapshot(tmp_path) -> None:
     assert before == after
     assert schema_rows_after == schema_rows_before
     assert payload["active_window"] is None
+    full_refresh = cast(dict[str, object], payload["weathernext_full_refresh"])
+    assert full_refresh["payload_read"] is False
+    assert full_refresh["load_state"] in {"missing", "not_configured", "error"}
     comparison = cast(dict[str, object], payload["forecast_comparison"])
     assert comparison["events"] == []
     assert comparison["metrics"] == []
@@ -215,3 +218,5 @@ def test_dashboard_renders_isolated_weathernext_paper_strategy() -> None:
     assert "isolated ledger" in html
     assert "SNAPSHOT_UNAVAILABLE" in html
     assert "excluded from v1 exposure" in html
+    assert "Full-ensemble refresh" in html
+    assert "expected_network_bytes" in html or "read plan" in html

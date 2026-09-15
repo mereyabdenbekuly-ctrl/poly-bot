@@ -1087,6 +1087,70 @@ def _weathernext_full_refresh_report(
     return report
 
 
+def build_weathernext_full_dashboard_summary(
+    root: Path | None,
+    *,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Return a bounded, local-only WeatherNext full-lane dashboard view.
+
+    The detailed operational report remains available on disk.  The dashboard
+    receives only status, provenance, counts, and per-target coverage codes so
+    a large manifest or trajectory payload can never inflate an HTTP response.
+    No GCS client is constructed.
+    """
+
+    report = _weathernext_full_refresh_report(root, now=now or datetime.now(UTC))
+    keys = (
+        "configured",
+        "root",
+        "access_state",
+        "load_state",
+        "manifest_state",
+        "approval_state",
+        "approval_valid",
+        "payload_read",
+        "read_evidence",
+        "refresh_status_state",
+        "index_state",
+        "index_manifest_binding",
+        "coverage_state",
+        "expected_target_count",
+        "actual_target_count",
+        "complete_target_count",
+        "partial_target_count",
+        "missing_target_count",
+        "manifest_sha256",
+        "release_id",
+        "init_time_utc",
+        "expected_network_bytes",
+        "expected_object_count",
+        "member_hour_coverage",
+    )
+    summary = {key: report.get(key) for key in keys}
+    raw_targets = report.get("targets", [])
+    target_rows = raw_targets if isinstance(raw_targets, list) else []
+    summary["target_statuses"] = [
+        {
+            key: target.get(key)
+            for key in (
+                "target_id",
+                "status",
+                "error_code",
+                "expected_member_count",
+                "actual_member_count",
+                "expected_hour_count",
+                "actual_hour_count",
+                "member_coverage",
+                "hour_coverage",
+            )
+        }
+        for target in target_rows
+        if isinstance(target, Mapping)
+    ]
+    return summary
+
+
 def _source_report(
     connection: sqlite3.Connection,
     tables: set[str],

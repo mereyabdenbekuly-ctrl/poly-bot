@@ -271,6 +271,7 @@ function renderWeatherNextSummary(d){
 }
 function renderWeatherNextPaper(d){
  const p=d.weathernext_paper||{}, orders=p.recent_orders||[], decisions=p.recent_decisions||[];
+ const full=d.weathernext_full_refresh||{}, fullState=String(full.load_state||full.manifest_state||'not checked'), fullClass=fullState==='approved_and_complete'?'green':fullState==='complete_without_read_evidence'?'amber':'gray';
  const pnl=Number(p.realized_pnl_usd||0), state=p.error?'ERROR':(p.open_orders?'ACTIVE':'READY');
  $('weathernext-paper-state').textContent=state;
  $('weathernext-paper-state').className='pill '+(state==='ERROR'?'amber':state==='ACTIVE'?'blue':'gray');
@@ -278,7 +279,9 @@ function renderWeatherNextPaper(d){
  const cardHtml=cards.map(x=>`<div class="card metric"><div class="eyebrow">${esc(x[0])}</div><div class="value ${x[2]}" style="font-size:20px">${esc(x[1])}</div></div>`).join('');
  const decisionHtml=decisions.length?`<div style="overflow-x:auto"><table class="weathernext-table"><thead><tr><th>Market</th><th>Action</th><th class="num">Probability</th><th class="num">EV</th><th>Filter / provenance</th></tr></thead><tbody>${decisions.slice(0,12).map(x=>`<tr><td><b>${esc(x.market_id)}</b><div class="sub">${esc(x.event_id)}</div></td><td><span class="pill ${x.action==='PAPER_BUY'?'green':x.action==='OBSERVE'?'blue':'gray'}">${esc(x.action)}</span></td><td class="num">${x.probability==null?'—':(Number(x.probability)*100).toFixed(1)+'%'}</td><td class="num">${money(x.expected_profit_usd)}</td><td>${esc([...(x.reason_codes||[]),...(x.warning_codes||[])].join(' · ')||'qualified')}<div class="sub">${x.snapshot_member_count==null?'snapshot unavailable':esc(x.snapshot_member_count+' members')}</div></td></tr>`).join('')}</tbody></table></div>`:'<div class="forecast-empty">No WeatherNext decisions recorded yet. A missing snapshot is reported explicitly as SNAPSHOT_UNAVAILABLE.</div>';
  const orderNote=orders.length?`<div class="weathernext-note">${orders.length} isolated WeatherNext position(s); these are excluded from v1 exposure and P&amp;L.</div>`:'';
- $('weathernext-paper').innerHTML=`<div class="grid" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:12px">${cardHtml}</div>${decisionHtml}${orderNote}${p.error?`<div class="error">${esc(p.error)}</div>`:''}`;
+ const fullMeta=[full.release_id?`release ${full.release_id}`:'release —',full.init_time_utc?`init ${esc(summaryDateTime(full.init_time_utc,'UTC'))}`:'init —',full.expected_network_bytes!=null?`read plan ${formatBytes(full.expected_network_bytes)}`:'read plan —',full.expected_object_count!=null?`${full.expected_object_count} objects`:'objects —'].join(' · ');
+ const fullNote=`<div class="weathernext-status-card" style="margin-bottom:12px"><div class="weathernext-status-head"><span class="weathernext-status-name">Full-ensemble refresh</span><span class="pill ${fullClass}">${esc(fullState)}</span></div><div class="weathernext-status-detail">coverage ${esc(full.coverage_state||'—')} · approval ${esc(full.approval_state||'—')} · payload ${full.payload_read?'read':'blocked'} · ${full.complete_target_count||0}/${full.expected_target_count||0} targets complete</div><div class="sub">${fullMeta}</div></div>`;
+ $('weathernext-paper').innerHTML=`<div class="grid" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:12px">${cardHtml}</div>${fullNote}${decisionHtml}${orderNote}${p.error?`<div class="error">${esc(p.error)}</div>`:''}`;
 }
 function renderQuality(d){
  const reports=d.forecast_comparison?.quality||[];

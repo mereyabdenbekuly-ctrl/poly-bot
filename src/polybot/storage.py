@@ -865,6 +865,28 @@ class Storage:
                 "snapshot": None,
             }
         try:
+            from polybot.config import Settings
+            from polybot.operational_report import build_weathernext_full_dashboard_summary
+
+            weathernext_full_refresh = build_weathernext_full_dashboard_summary(
+                Settings().weathernext_full_root,
+                now=utc_now(),
+            )
+        except Exception as error:
+            # Full-ensemble status is diagnostic-only; a malformed local
+            # artifact must not make the read-only dashboard unavailable.
+            weathernext_full_refresh = {
+                "configured": False,
+                "access_state": "error",
+                "load_state": "error",
+                "manifest_state": "error",
+                "approval_state": "error",
+                "payload_read": False,
+                "read_evidence": False,
+                "coverage_state": "error",
+                "message": str(error),
+            }
+        try:
             weathernext_paper = self.weathernext_paper_summary()
         except Exception as error:
             weathernext_paper = {
@@ -891,6 +913,7 @@ class Storage:
             "forecast_comparison": forecast_comparison,
             "forecast_diagnostics": forecast_diagnostics,
             "weathernext_statistics": weathernext_statistics,
+            "weathernext_full_refresh": weathernext_full_refresh,
             "weathernext_paper": weathernext_paper,
         }
 
