@@ -69,6 +69,8 @@ class LiveBuyIntent:
             raise LivePilotError("max_spend_usd cannot be below amount_usd")
         if self.max_spend_usd > PILOT_MAX_BUY_USD:
             raise LivePilotError("pilot BUY cap is $2.00 including the signed spend")
+        _usd_base_units_exact(self.amount_usd, field="amount_usd")
+        _usd_base_units_exact(self.max_spend_usd, field="max_spend_usd")
         if not Decimal("0") < self.max_price < Decimal("1"):
             raise LivePilotError("max_price must be strictly between 0 and 1")
         if _as_utc(self.decision_created_at_utc) >= _as_utc(self.expires_at_utc):
@@ -262,23 +264,30 @@ class LivePilotJournal:
         terminal = (
             LiveIntentState.REJECTED.value,
             LiveIntentState.RECONCILED_FILLED.value,
-            LiveIntentState.MANUAL_REVIEW.value,
         )
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM live_order_intents WHERE state NOT IN (?, ?, ?) ORDER BY id",
+                "SELECT * FROM live_order_intents WHERE state NOT IN (?, ?) ORDER BY id",
                 terminal,
             ).fetchall()
         return [_record(row) for row in rows]
 
     def save_signed(self, intent_sha256: str, signed_payload: Mapping[str, Any]) -> None:
-        payload = _canonical_json(signed_payload)
-        fingerprint = hashlib.sha256(payload.encode()).hexdigest()
+        full_payload = _canonical_json(signed_payload)
+        fingerprint = hashlib.sha256(full_payload.encode()).hexdigest()
+        stored_payload = dict(signed_payload)
+        signature = str(stored_payload.pop("signature", ""))
+        if not signature:
+            raise LivePilotError("signed order is missing its signature")
+        stored_payload["signature_sha256"] = hashlib.sha256(signature.encode()).hexdigest()
         self._move(
             intent_sha256,
             expected={LiveIntentState.PREPARED},
             target=LiveIntentState.SIGNED,
-            updates={"signed_fingerprint": fingerprint, "signed_order_json": payload},
+            updates={
+                "signed_fingerprint": fingerprint,
+                "signed_order_json": _canonical_json(stored_payload),
+            },
             detail={"signed_fingerprint": fingerprint},
         )
 
@@ -346,6 +355,7 @@ class LivePilotJournal:
                 LiveIntentState.AMBIGUOUS,
                 LiveIntentState.ACCEPTED,
                 LiveIntentState.RECONCILED_OPEN,
+                LiveIntentState.MANUAL_REVIEW,
             }:
                 raise LivePilotError(f"cannot reconcile live intent in state {current}")
             now = _now().isoformat()
@@ -725,6 +735,9 @@ def _verify_signed_order(
     maker_amount = int(signed.maker_amount)
     if maker_amount <= 0:
         raise LivePilotError("signed maker amount is not positive")
+    intent_max_units = _usd_base_units_exact(intent.max_spend_usd, field="max_spend_usd")
+    if maker_amount > intent_max_units:
+        raise LivePilotError("signed maker amount exceeds the approved intent maximum")
     if maker_amount > int(PILOT_MAX_BUY_USD * COLLATERAL_BASE_UNITS):
         raise LivePilotError("signed maker amount exceeds the exact $2 cap")
     if maker_amount > balance_units:
@@ -733,6 +746,12 @@ def _verify_signed_order(
         raise LivePilotError(
             "collateral allowance is insufficient; executor refuses automatic unlimited approval"
         )
+    taker_amount = int(getattr(signed, "taker_amount", 0))
+    if taker_amount <= 0:
+        raise LivePilotError("signed taker amount is not positive")
+    signed_price = Decimal(maker_amount) / Decimal(taker_amount)
+    if signed_price > intent.max_price:
+        raise LivePilotError("signed effective price exceeds the approved intent maximum")
 
 
 def _position_is_open(position: Any) -> bool:
@@ -859,6 +878,14 @@ def _as_utc(value: datetime) -> datetime:
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+def _usd_base_units_exact(value: Decimal, *, field: str) -> int:
+    units = value * COLLATERAL_BASE_UNITS
+    integral = units.to_integral_value()
+    if units != integral:
+        raise LivePilotError(f"{field} must use at most six decimal places")
+    return int(integral)
 
 
 def _safe_error(error: BaseException) -> str:

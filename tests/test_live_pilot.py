@@ -43,7 +43,7 @@ class FakeSignedOrder:
     signature: str = "0xsignature"
     signature_type: int = 0
     signer: str = "0x1111111111111111111111111111111111111111"
-    taker_amount: int = 2_000_000
+    taker_amount: int = 3_800_000
     timestamp: int = 1
     token_id: str = "token-1"
     post_only: bool = False
@@ -87,6 +87,7 @@ class FakeClient:
         self.post_error: BaseException | None = None
         self.response = FakeResponse()
         self.signed = FakeSignedOrder()
+        self.last_create_kwargs: dict[str, Any] | None = None
 
     def get_balance_allowance(self, *, asset_type: str) -> Any:
         assert asset_type == "COLLATERAL"
@@ -121,14 +122,11 @@ class FakeClient:
 
     def create_market_order(self, **kwargs: Any) -> FakeSignedOrder:
         self.create_calls += 1
-        assert kwargs == {
-            "token_id": "token-1",
-            "side": "BUY",
-            "amount": Decimal("1.90"),
-            "max_spend": Decimal("2.00"),
-            "max_price": Decimal("0.55"),
-            "order_type": "FOK",
-        }
+        self.last_create_kwargs = kwargs
+        assert kwargs["token_id"] == "token-1"
+        assert kwargs["side"] == "BUY"
+        assert kwargs["amount"] == Decimal("1.90")
+        assert kwargs["order_type"] == "FOK"
         return self.signed
 
     def post_order(self, signed_order: Any) -> FakeResponse:
@@ -202,6 +200,10 @@ def test_success_is_one_shot_and_approval_is_burned(tmp_path: Path) -> None:
     assert result.state is LiveIntentState.ACCEPTED
     assert result.remote_order_id == "order-1"
     assert result.signed_fingerprint is not None
+    assert result.signed_order_json is not None
+    stored_signed = json.loads(result.signed_order_json)
+    assert "signature" not in stored_signed
+    assert len(stored_signed["signature_sha256"]) == 64
     assert client.create_calls == 1
     assert client.post_calls == 1
     assert not approval_path.exists()
@@ -359,3 +361,43 @@ def test_changed_book_requires_a_new_decision_and_approval(tmp_path: Path) -> No
             now=NOW + timedelta(minutes=1),
         )
     assert client.post_calls == 0
+
+
+@pytest.mark.parametrize(
+    ("value", "signed", "message"),
+    [
+        (
+            intent(max_spend_usd=Decimal("1.95")),
+            FakeSignedOrder(maker_amount=1_960_000),
+            "approved intent maximum",
+        ),
+        (
+            intent(max_price=Decimal("0.49")),
+            FakeSignedOrder(maker_amount=1_900_000, taker_amount=3_800_000),
+            "effective price",
+        ),
+    ],
+)
+def test_signed_payload_cannot_exceed_exact_intent(
+    tmp_path: Path,
+    value: LiveBuyIntent,
+    signed: FakeSignedOrder,
+    message: str,
+) -> None:
+    path = approval(tmp_path / "approval.json", value)
+    client = FakeClient()
+    client.signed = signed
+    with pytest.raises(LivePilotError, match=message):
+        LivePilotExecutor(LivePilotJournal(tmp_path / "polybot.sqlite3")).execute_once(
+            client=client,
+            intent=value,
+            approval_path=path,
+            geoblocked=False,
+            now=NOW + timedelta(minutes=1),
+        )
+    assert client.post_calls == 0
+
+
+def test_usd_values_must_match_collateral_precision() -> None:
+    with pytest.raises(LivePilotError, match="six decimal places"):
+        intent(amount_usd=Decimal("1.9000001"))
