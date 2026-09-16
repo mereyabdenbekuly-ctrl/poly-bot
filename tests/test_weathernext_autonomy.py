@@ -338,6 +338,7 @@ def test_approval_is_required_and_reader_streams_one_chunk(monkeypatch, tmp_path
         weathernext_gcs_project="weather-508105",
         weathernext_full_refresh_enabled=True,
     )
+    _Blob.download_count = 0
 
     result = read_approved_manifest_sequentially(
         settings,
@@ -350,6 +351,11 @@ def test_approval_is_required_and_reader_streams_one_chunk(monkeypatch, tmp_path
     assert result.payload_read is True
     assert result.object_count == 1
     assert result.bytes_read == 1024
+    assert _Blob.download_count == 1
+    attempt = json.loads((tmp_path / "full-read-attempt.json").read_text())
+    assert attempt["state"] == "completed"
+    assert attempt["actual_payload_bytes"] == 1024
+    assert attempt["objects_downloaded"] == 1
     snapshot = json.loads(Path(result.snapshot_paths[0]).read_text())
     assert len(snapshot["trajectories"]) == 64
     assert len(snapshot["trajectories"][0]["values_c"]) == 24

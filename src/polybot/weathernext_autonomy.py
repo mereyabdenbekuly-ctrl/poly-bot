@@ -50,6 +50,7 @@ DEFAULT_APPROVAL_PATH = DEFAULT_ROOT / "read-approval.json"
 DEFAULT_PROBE_APPROVAL_PATH = DEFAULT_ROOT / "probe-approval.json"
 DEFAULT_PROBE_ATTEMPT_PATH = DEFAULT_ROOT / "probe-attempt.json"
 DEFAULT_PROBE_RESULT_PATH = DEFAULT_ROOT / "probe-result.json"
+DEFAULT_FULL_READ_ATTEMPT_PATH = DEFAULT_ROOT / "full-read-attempt.json"
 DEFAULT_TARGETS_PATH = DEFAULT_ROOT / "targets.json"
 DEFAULT_STATUS_PATH = DEFAULT_ROOT / "refresh-status.json"
 DEFAULT_FIRST_TRIAL_ROOT = DEFAULT_ROOT / "first-full-trial"
@@ -437,6 +438,83 @@ def _finish_probe_attempt(
     )
     if error_type is not None:
         payload["error_type"] = error_type
+    _atomic_write_private(path, payload)
+
+
+def _claim_full_read_attempt(
+    path: Path,
+    *,
+    manifest_sha256: str,
+    max_network_bytes: int,
+    max_objects: int,
+    max_object_bytes: int,
+) -> None:
+    """Consume the one-shot full-pass authorization before the first payload GET."""
+
+    payload = {
+        "schema_version": "weathernext-full-read-attempt/v1",
+        "state": "started",
+        "started_at_utc": datetime.now(UTC).isoformat(),
+        "manifest_sha256": manifest_sha256,
+        "max_network_bytes": max_network_bytes,
+        "max_objects": max_objects,
+        "max_object_bytes": max_object_bytes,
+        "actual_payload_bytes": 0,
+        "objects_downloaded": 0,
+    }
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError as error:
+        raise RuntimeError(
+            "full WeatherNext payload authorization was already consumed; replay is blocked"
+        ) from error
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def _update_full_read_attempt(
+    path: Path,
+    *,
+    state: Literal["started", "running", "completed", "failed"],
+    actual_payload_bytes: int,
+    objects_downloaded: int,
+    last_object_uri: str | None = None,
+    error_type: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    try:
+        raw = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    except Exception:
+        raw = {"schema_version": "weathernext-full-read-attempt/v1"}
+    payload: dict[str, object] = dict(raw) if isinstance(raw, Mapping) else {}
+    payload.update(
+        {
+            "state": state,
+            "updated_at_utc": datetime.now(UTC).isoformat(),
+            "actual_payload_bytes": actual_payload_bytes,
+            "objects_downloaded": objects_downloaded,
+        }
+    )
+    if state in {"completed", "failed"}:
+        payload["finished_at_utc"] = datetime.now(UTC).isoformat()
+    if last_object_uri is not None:
+        payload["last_object_uri"] = last_object_uri
+    if error_type is not None:
+        payload["error_type"] = error_type
+    if error_message is not None:
+        payload["error_message"] = error_message[:1000]
     _atomic_write_private(path, payload)
 
 
@@ -2058,6 +2136,96 @@ def _download_probe_object_once(
             temporary.close()
 
 
+class _FullObjectDownloadError(RuntimeError):
+    def __init__(self, message: str, *, actual_payload_bytes: int) -> None:
+        super().__init__(message)
+        self.actual_payload_bytes = actual_payload_bytes
+
+
+def _download_full_object_once(
+    client: object,
+    *,
+    item: WeatherNextCompressedObject,
+    approval: WeatherNextReadApproval,
+    temporary_root: Path,
+) -> tuple[Path, int, float]:
+    """Download one manifest object once with provider retries disabled."""
+
+    if item.compressed_bytes is None:
+        raise RuntimeError("full-read object has no compressed size")
+    root = temporary_root.expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(root, 0o700)
+    if shutil.disk_usage(root).free < item.compressed_bytes:
+        raise RuntimeError("insufficient temporary disk for the next WeatherNext object")
+    available_memory = _available_memory_bytes()
+    uncompressed_bound = int(item.uncompressed_upper_bound_bytes or 0)
+    conservative_memory_need = item.compressed_bytes * 2 + uncompressed_bound + 256 * 1024 * 1024
+    if available_memory is not None and available_memory < conservative_memory_need:
+        raise RuntimeError("insufficient available memory for one WeatherNext object")
+
+    bucket = getattr(client, "_bucket", None)
+    bucket_name = str(getattr(client, "bucket_name", ""))
+    if bucket is None or not bucket_name:
+        raise RuntimeError("WeatherNext client does not expose its requester-pays bucket")
+    blob = bucket.blob(_object_key(item.object_uri, bucket_name))
+    blob.reload(retry=None)
+    actual_size = getattr(blob, "size", None)
+    if actual_size is None or int(actual_size) != item.compressed_bytes:
+        raise RuntimeError(f"WeatherNext object size changed: {item.object_uri}")
+    for field in ("generation", "etag", "md5_hash", "crc32c"):
+        expected = getattr(item, field, None)
+        actual = getattr(blob, field, None)
+        if expected is not None and (actual is None or str(expected) != str(actual)):
+            raise RuntimeError(f"WeatherNext object metadata changed: {item.object_uri}")
+
+    descriptor, name = tempfile.mkstemp(
+        prefix="weathernext-full-",
+        suffix=".zarr-chunk",
+        dir=root,
+    )
+    path = Path(name)
+    os.chmod(path, 0o600)
+    handle = os.fdopen(descriptor, "w+b")
+    try:
+        started = monotonic_clock.monotonic()
+        generation = getattr(blob, "generation", None)
+        download_kwargs: dict[str, object] = {
+            "raw_download": True,
+            "retry": None,
+            "single_shot_download": True,
+            "checksum": "auto",
+        }
+        if generation is not None:
+            try:
+                download_kwargs["if_generation_match"] = int(generation)
+            except (TypeError, ValueError):
+                raise RuntimeError("WeatherNext object generation is not an integer") from None
+        blob.download_to_file(handle, **download_kwargs)
+        handle.flush()
+        os.fsync(handle.fileno())
+        handle.close()
+        elapsed = monotonic_clock.monotonic() - started
+        downloaded = path.stat().st_size
+        if downloaded != item.compressed_bytes:
+            raise RuntimeError("WeatherNext object byte count differs from the manifest")
+        if downloaded > approval.max_object_bytes:
+            raise RuntimeError("WeatherNext object exceeded the approved object-size limit")
+        return path, downloaded, elapsed
+    except Exception as error:
+        if not handle.closed:
+            handle.close()
+        actual = path.stat().st_size if path.exists() else 0
+        path.unlink(missing_ok=True)
+        raise _FullObjectDownloadError(
+            f"one-shot WeatherNext object download failed: {error}",
+            actual_payload_bytes=actual,
+        ) from error
+    finally:
+        if not handle.closed:
+            handle.close()
+
+
 def read_approved_manifest_sequentially(
     settings: object,
     *,
@@ -2074,6 +2242,8 @@ def read_approved_manifest_sequentially(
     expected_probe_max_network_bytes: int | None = None,
     expected_probe_max_object_bytes: int | None = None,
     probe_temporary_root: Path | None = None,
+    full_attempt_path: Path | None = None,
+    full_temporary_root: Path | None = None,
     require_strictly_future_targets: bool = False,
     now_utc: datetime | None = None,
 ) -> WeatherNextSequentialReadResult:
@@ -2178,6 +2348,22 @@ def read_approved_manifest_sequentially(
     probe_bytes = 0
     probe_download_seconds: float | None = None
     group: Any | None = None
+    full_attempt = (
+        full_attempt_path.expanduser()
+        if full_attempt_path is not None
+        else manifest_path.expanduser().parent / "full-read-attempt.json"
+    )
+    full_temp_root = (
+        full_temporary_root.expanduser()
+        if full_temporary_root is not None
+        else manifest_path.expanduser().parent / "full-tmp"
+    )
+    full_attempt_claimed = False
+    bytes_read = 0
+    object_count = 0
+    last_object_uri: str | None = None
+    local_group: Any | None = None
+    local_path: Path | None = None
     try:
         if probe_only:
             if probe_approval is None:
@@ -2249,17 +2435,25 @@ def read_approved_manifest_sequentially(
                 target_id: _target_member_accumulators(target)
                 for target_id, target in target_map.items()
             }
+            _claim_full_read_attempt(
+                full_attempt,
+                manifest_sha256=manifest.manifest_sha256,
+                max_network_bytes=approval.max_network_bytes,
+                max_objects=approval.max_objects,
+                max_object_bytes=approval.max_object_bytes,
+            )
+            full_attempt_claimed = True
         # The probe object was already downloaded exactly once to the local
         # file.  Start the loop counter at zero so its manifest size is
         # checked once rather than being double-counted against the budget.
-        bytes_read = 0
-        object_count = 0
         objects_to_read = (
             [probe_item]
             if probe_only and probe_item is not None
             else sorted(manifest.compressed_objects, key=lambda value: value.sequence)
         )
         for item in objects_to_read:
+            local_group = None
+            local_path = None
             if object_count >= approval.max_objects:
                 raise RuntimeError("WeatherNext read stopped before approved object limit")
             if item.compressed_bytes is None:
@@ -2271,20 +2465,32 @@ def read_approved_manifest_sequentially(
             if bytes_read + item.compressed_bytes > approval.max_network_bytes:
                 raise RuntimeError("WeatherNext read stopped before approved network limit")
             if not probe_only:
-                blob = client._bucket.blob(  # type: ignore[attr-defined]
-                    _object_key(item.object_uri, client.bucket_name)
+                try:
+                    local_path, downloaded, _download_seconds = _download_full_object_once(
+                        client,
+                        item=item,
+                        approval=cast(WeatherNextReadApproval, approval),
+                        temporary_root=full_temp_root,
+                    )
+                except _FullObjectDownloadError as error:
+                    bytes_read += error.actual_payload_bytes
+                    raise
+                bytes_read += downloaded
+                object_count += 1
+                last_object_uri = item.object_uri
+                if bytes_read > approval.max_network_bytes:
+                    raise RuntimeError("WeatherNext read exceeded the approved network limit")
+                local_group = client.open_sequential_zarr_group_from_local_object(
+                    store_prefix,
+                    object_key=_object_key(item.object_uri, client.bucket_name),
+                    object_path=local_path,
+                    array_key=manifest.variable,
                 )
-                blob.reload()
-                actual_size = getattr(blob, "size", None)
-                if actual_size is None or int(actual_size) != item.compressed_bytes:
-                    raise RuntimeError(f"WeatherNext object size changed: {item.object_uri}")
-                for field in ("generation", "etag", "md5_hash", "crc32c"):
-                    expected = getattr(item, field, None)
-                    actual = getattr(blob, field, None)
-                    if expected is not None and (actual is None or str(expected) != str(actual)):
-                        raise RuntimeError(
-                            f"WeatherNext object metadata changed: {item.object_uri}"
-                        )
+                if local_group is None:
+                    raise RuntimeError("local WeatherNext object group did not open")
+                decode_array = local_group[manifest.variable]
+            else:
+                decode_array = array
 
             # Exact chunk boundaries make this one payload GET.  No global
             # array selection is used, and ``chunk`` is released each loop.
@@ -2296,7 +2502,7 @@ def read_approved_manifest_sequentially(
                 for position, coordinate in enumerate(item.chunk_coordinates)
             )
             decode_started = monotonic_clock.monotonic()
-            chunk = np.asarray(array.get_basic_selection(selection))
+            chunk = np.asarray(decode_array.get_basic_selection(selection))
             decode_elapsed = monotonic_clock.monotonic() - decode_started
             expected_chunk_shape = tuple(value.stop - value.start for value in selection)
             if tuple(int(value) for value in chunk.shape) != expected_chunk_shape:
@@ -2414,10 +2620,29 @@ def read_approved_manifest_sequentially(
                                 else raw_value
                             )
                             member_values[member_id][valid_time] = value_c
-            bytes_read += item.compressed_bytes
-            object_count += 1
             del chunk
+            if not probe_only:
+                _update_full_read_attempt(
+                    full_attempt,
+                    state="running",
+                    actual_payload_bytes=bytes_read,
+                    objects_downloaded=object_count,
+                    last_object_uri=item.object_uri,
+                )
+            if local_group is not None:
+                close_local = getattr(local_group, "close", None)
+                if callable(close_local):
+                    close_local()
+            if local_path is not None:
+                local_path.unlink(missing_ok=True)
     except Exception as error:
+        if local_group is not None:
+            with suppress(Exception):
+                close_local = getattr(local_group, "close", None)
+                if callable(close_local):
+                    close_local()
+        if local_path is not None:
+            local_path.unlink(missing_ok=True)
         if probe_path is not None:
             with suppress(Exception):
                 _finish_probe_attempt(
@@ -2425,6 +2650,17 @@ def read_approved_manifest_sequentially(
                     state="failed",
                     actual_payload_bytes=probe_bytes,
                     error_type=type(error).__name__,
+                )
+        if full_attempt_claimed:
+            with suppress(Exception):
+                _update_full_read_attempt(
+                    full_attempt,
+                    state="failed",
+                    actual_payload_bytes=bytes_read,
+                    objects_downloaded=object_count,
+                    last_object_uri=last_object_uri,
+                    error_type=type(error).__name__,
+                    error_message=str(error),
                 )
         raise
     finally:
@@ -2502,6 +2738,14 @@ def read_approved_manifest_sequentially(
             }
         )
     _update_snapshot_index(index_path, index_entries)
+    if full_attempt_claimed:
+        _update_full_read_attempt(
+            full_attempt,
+            state="completed",
+            actual_payload_bytes=bytes_read,
+            objects_downloaded=object_count,
+            last_object_uri=last_object_uri,
+        )
     return WeatherNextSequentialReadResult(
         payload_read=True,
         manifest_sha256=cast(str, approval_result.manifest_sha256),
