@@ -752,6 +752,9 @@ def _verify_signed_order(
         raise LivePilotError("SDK signed a non-BUY order")
     if str(getattr(signed, "order_type", "")) != "FOK":
         raise LivePilotError("SDK signed a non-FOK order")
+    builder = str(getattr(signed, "builder", "")).lower()
+    if builder not in {"0x" + "00" * 32, "0" * 64}:
+        raise LivePilotError("builder fees are not permitted by the pilot")
     if str(getattr(signed, "token_id", "")) != intent.token_id:
         raise LivePilotError("SDK signed the wrong token")
     maker_amount = int(signed.maker_amount)
