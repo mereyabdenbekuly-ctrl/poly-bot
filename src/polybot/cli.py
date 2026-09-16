@@ -584,7 +584,10 @@ def _doctor(settings: Settings, storage: Storage, *, as_json: bool) -> None:
             is_protected_model_endpoint(settings.openai_fallback_base_url)
         ),
         "openai_key_present": settings.openai_api_key is not None,
-        "live_executor_present": False,
+        "live_executor_present": True,
+        "live_executor_enabled": False,
+        "live_executor_mode": "library_only_one_shot_fok",
+        "live_executor_cli_present": False,
         "weathernext": WeatherNextProvider(settings).status().model_dump(mode="json"),
     }
     try:
