@@ -145,6 +145,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     wn_stats_refresh.add_argument("--output", default=None)
 
+    wn_first_trial = wn_sub.add_parser(
+        "first-full-trial-plan",
+        aliases=["first-trial-plan"],
+        help=(
+            "Select real strictly-future market targets with common UTC coverage and "
+            "build a frozen metadata-only manifest"
+        ),
+    )
+    wn_first_trial.add_argument("--database", default=None)
+    wn_first_trial.add_argument("--root", default=None)
+    wn_first_trial.add_argument("--max-targets", type=int, default=None)
+    wn_first_trial.add_argument("--probe-result", default=None)
+    wn_first_trial.add_argument("--json", action="store_true", dest="as_json")
+
     wn_auto = wn_sub.add_parser(
         "autonomous-refresh",
         aliases=["refresh-auto", "preflight"],
@@ -166,7 +180,15 @@ def build_parser() -> argparse.ArgumentParser:
     wn_auto.add_argument(
         "--read-approved",
         action="store_true",
-        help="Permit the reader step only after local manifest/sidecar verification succeeds",
+        help=(
+            "Read the existing manifest only after local sidecar verification; do not "
+            "refresh or replace its digest first"
+        ),
+    )
+    wn_auto.add_argument(
+        "--require-strictly-future-targets",
+        action="store_true",
+        help="Require station-local midnight to remain in the future for the first full trial",
     )
     wn_auto.add_argument(
         "--probe-one-block",
@@ -219,6 +241,38 @@ def main(argv: list[str] | None = None) -> None:
 
             provider = WeatherNextProvider(settings)
             if args.weathernext_command in {
+                "first-full-trial-plan",
+                "first-trial-plan",
+            }:
+                from pathlib import Path
+
+                from polybot.weathernext_autonomy import plan_first_full_trial
+
+                root = Path(args.root).expanduser() if args.root else settings.weathernext_full_root
+                database = (
+                    Path(args.database).expanduser()
+                    if args.database
+                    else settings.database_path
+                )
+                status = plan_first_full_trial(
+                    database,
+                    settings=settings,
+                    root=root,
+                    max_targets=args.max_targets,
+                    probe_result_path=(
+                        Path(args.probe_result).expanduser() if args.probe_result else None
+                    ),
+                )
+                print(
+                    json.dumps(
+                        {"status": status.model_dump(mode="json")},
+                        ensure_ascii=False,
+                        indent=2,
+                        default=str,
+                    )
+                )
+                return
+            if args.weathernext_command in {
                 "autonomous-refresh",
                 "refresh-auto",
                 "preflight",
@@ -235,7 +289,6 @@ def main(argv: list[str] | None = None) -> None:
                     DEFAULT_TARGETS_PATH,
                     autonomous_refresh_preflight,
                     read_approved_manifest_sequentially,
-                    write_refresh_status,
                 )
 
                 root = Path(args.root).expanduser() if args.root else settings.weathernext_full_root
@@ -323,6 +376,26 @@ def main(argv: list[str] | None = None) -> None:
                     response = {"read": result.model_dump(mode="json")}
                     print(json.dumps(response, ensure_ascii=False, indent=2, default=str))
                     return
+                if args.read_approved:
+                    if not settings.weathernext_full_refresh_enabled:
+                        raise RuntimeError(
+                            "approved full read remains disabled by "
+                            "POLYBOT_WEATHERNEXT_FULL_REFRESH_ENABLED"
+                        )
+                    result = read_approved_manifest_sequentially(
+                        settings,
+                        manifest_path=manifest,
+                        approval_path=approval,
+                        index_path=index,
+                        snapshot_root=snapshot_root,
+                        probe_only=False,
+                        require_strictly_future_targets=(
+                            args.require_strictly_future_targets
+                        ),
+                    )
+                    response = {"read": result.model_dump(mode="json")}
+                    print(json.dumps(response, ensure_ascii=False, indent=2, default=str))
+                    return
                 status = autonomous_refresh_preflight(
                     database,
                     settings=settings,
@@ -336,29 +409,6 @@ def main(argv: list[str] | None = None) -> None:
                     max_object_bytes=settings.weathernext_full_max_object_bytes,
                 )
                 response: dict[str, object] = {"status": status.model_dump(mode="json")}
-                if (
-                    args.read_approved
-                    and settings.weathernext_full_refresh_enabled
-                    and status.target_count > 0
-                    and status.approval.state == "approved"
-                ):
-                    result = read_approved_manifest_sequentially(
-                        settings,
-                        manifest_path=manifest,
-                        approval_path=approval,
-                        index_path=index,
-                        snapshot_root=snapshot_root,
-                        probe_only=False,
-                    )
-                    status = status.model_copy(
-                        update={
-                            "payload_read": result.payload_read,
-                            "snapshots_written": result.snapshots_written,
-                            "message": result.message,
-                        }
-                    )
-                    write_refresh_status(status, status_path)
-                    response["read"] = result.model_dump(mode="json")
                 if args.as_json:
                     print(json.dumps(response, ensure_ascii=False, indent=2, default=str))
                 else:

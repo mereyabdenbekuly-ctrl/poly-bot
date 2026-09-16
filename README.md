@@ -276,17 +276,41 @@ chunk-shape, codecs, object sizes, число объектов и точный �
 compressed transfer. Sharded stores блокируются, а `max_network_bytes`,
 `max_objects` и `max_object_bytes` проверяются до body GET.
 
+Для первого заранее выбранного испытания отдельный планировщик берёт только
+реальные market/event IDs из завершённого discovery-цикла, оставляет цели, чьи
+station-local сутки ещё не начались, и объединяет крупнейшую группу с полностью
+одинаковым UTC-покрытием:
+
 ```bash
-uv run polybot weathernext autonomous-refresh --json
+uv run polybot weathernext first-full-trial-plan --json
 ```
 
-Эта команда не читает payload без sidecar
-`/var/lib/polybot/weathernext/full/read-approval.json`, связанного с точным
-`manifest_sha256`. После согласования лимитов и записи sidecar задаётся
-`POLYBOT_WEATHERNEXT_FULL_REFRESH_ENABLED=true`; hourly systemd timer вызывает
-тот же bounded путь. Чтение идёт ровно по одному Zarr object за раз, без
-глобального массива в памяти, и останавливается при изменении размера,
-generation/checksum, лимита или покрытия.
+`strictly_future` относится только к этому первому pre-day испытанию. Обычный
+inventory по-прежнему сохраняет уже начавшиеся, но ещё не закончившиеся сутки:
+они могут оцениваться отдельно как Intraday при наличии корректных наблюдений и
+своевременного решения. Прошедшие сутки не превращаются задним числом в paper
+results, а требование полного точного station-local покрытия не ослабляется.
+
+Планировщик делает только listing/metadata/HEAD, записывает exact-limit manifest
+под `first-full-trial/` и не создаёт approval. Hourly systemd timer запускает
+только этот metadata-only путь. Когда оператор отдельно согласует точный SHA и
+создаст sidecar, существующий manifest читается без предварительной
+регенерации:
+
+```bash
+uv run polybot weathernext autonomous-refresh \
+  --read-approved --require-strictly-future-targets \
+  --manifest /var/lib/polybot/weathernext/full/first-full-trial/read-manifest.json \
+  --approval /var/lib/polybot/weathernext/full/first-full-trial/read-approval.json \
+  --json
+```
+
+До отдельного согласования `POLYBOT_WEATHERNEXT_FULL_REFRESH_ENABLED=false`.
+Чтение идёт ровно по одному Zarr object за раз и останавливается при изменении
+размера, generation/checksum, лимита или покрытия. Измеренная проба заняла около
+49,7 секунды на один объект с учётом загрузки, decode и накладных расходов;
+поэтому прежний план из 448 объектов оценивается примерно в 6,2 часа, а не в
+два часа. План сохраняет рассчитанную продолжительность и ready-at timestamp.
 
 Результат — immutable snapshots с release/init provenance, UTC valid times,
 координатами, единицами, идентификаторами всех 64 участников и настоящими
@@ -320,8 +344,9 @@ uv run polybot weathernext autonomous-refresh \
   --read-approved --probe-one-block --json
 ```
 
-Проба возвращает compressed bytes, decoded shape/bytes и длительность; полный
-проход запускается отдельным timer-run и публикует snapshot только после
+Проба возвращает compressed bytes, decoded shape/bytes и длительность. Она
+одноразовая; после receipt повторять её не нужно. Полный проход выполняется
+только отдельной явно согласованной командой и публикует snapshot лишь после
 проверки 64 участников и полного набора UTC-часов.
 
 ## Docker Compose

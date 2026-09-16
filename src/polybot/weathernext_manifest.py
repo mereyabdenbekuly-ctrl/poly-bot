@@ -430,6 +430,47 @@ def verify_manifest_sha256(
     )
 
 
+def bind_manifest_to_exact_read_limits(
+    manifest: WeatherNextFullReadManifest,
+    *,
+    approval_sidecar_path: Path,
+) -> WeatherNextFullReadManifest:
+    """Return an approval-ready copy bound to its exact measured transfer.
+
+    This is a local metadata transformation: it never contacts GCS and never
+    changes the selected objects or coverage.  It is only valid after every
+    compressed size is known, sharding is supported, and every station-local
+    day is complete.  Binding the limits exactly keeps a later approval from
+    authorizing even one extra byte or object.
+    """
+
+    gate = manifest.approval_gate
+    if not (
+        gate.compressed_sizes_complete
+        and gate.sharding_supported
+        and gate.coverage_complete
+        and gate.object_count > 0
+        and gate.expected_network_bytes > 0
+        and gate.largest_compressed_object_bytes > 0
+    ):
+        raise ValueError("manifest metadata is not complete enough for exact read limits")
+    payload = manifest.model_dump(mode="json")
+    payload["manifest_sha256"] = "0" * 64
+    payload["approval_sidecar_path"] = str(approval_sidecar_path.expanduser())
+    payload["approval_gate"] = {
+        **gate.model_dump(mode="json"),
+        "state": "awaiting_operator_approval",
+        "max_network_bytes": gate.expected_network_bytes,
+        "max_objects": gate.object_count,
+        "max_object_bytes": gate.largest_compressed_object_bytes,
+        "within_network_limit": True,
+        "within_object_limit": True,
+        "within_object_size_limit": True,
+    }
+    rebound = WeatherNextFullReadManifest.model_validate(payload)
+    return rebound.model_copy(update={"manifest_sha256": recompute_manifest_sha256(rebound)})
+
+
 def validate_read_approval(
     manifest: WeatherNextFullReadManifest,
     approval: WeatherNextReadApproval | Mapping[str, object],

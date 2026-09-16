@@ -11,6 +11,7 @@ from polybot.config import Settings
 from polybot.weathernext import WeatherNextGcsClient
 from polybot.weathernext_manifest import (
     WeatherNextReadApproval,
+    bind_manifest_to_exact_read_limits,
     build_full_ensemble_read_manifest,
     estimate_and_build_full_ensemble_read_manifest_batch,
     expected_station_local_day_hours,
@@ -128,6 +129,18 @@ def test_batch_manifest_deduplicates_shared_chunks_and_stays_closed(tmp_path: Pa
     assert manifest.manifest_sha256 == manifest.manifest_sha256.lower()
     assert verify_manifest_sha256(manifest)
     assert recompute_manifest_sha256(manifest) == manifest.manifest_sha256
+
+    exact = bind_manifest_to_exact_read_limits(
+        manifest,
+        approval_sidecar_path=tmp_path / "first-trial-approval.json",
+    )
+    assert exact.approval_gate.state == "awaiting_operator_approval"
+    assert exact.approval_gate.max_network_bytes == 700
+    assert exact.approval_gate.max_objects == 3
+    assert exact.approval_gate.max_object_bytes == 400
+    assert exact.approval_sidecar_path == str(tmp_path / "first-trial-approval.json")
+    assert exact.manifest_sha256 != manifest.manifest_sha256
+    assert verify_manifest_sha256(exact)
 
 
 def test_manifest_blocks_missing_head_sizes_without_payload_read() -> None:

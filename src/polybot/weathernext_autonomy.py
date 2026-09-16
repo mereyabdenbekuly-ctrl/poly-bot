@@ -35,10 +35,13 @@ from polybot.weathernext_manifest import (
     WeatherNextOneBlockProbeApproval,
     WeatherNextReadApproval,
     assess_station_local_day_coverage,
+    bind_manifest_to_exact_read_limits,
+    estimate_and_build_full_ensemble_read_manifest_batch,
     expected_station_local_day_hours,
     validate_one_block_probe_approval,
     validate_read_approval,
     verify_manifest_sha256,
+    write_full_ensemble_read_manifest,
 )
 
 DEFAULT_ROOT = Path("/var/lib/polybot/weathernext/full")
@@ -46,8 +49,15 @@ DEFAULT_MANIFEST_PATH = DEFAULT_ROOT / "read-manifest.json"
 DEFAULT_APPROVAL_PATH = DEFAULT_ROOT / "read-approval.json"
 DEFAULT_PROBE_APPROVAL_PATH = DEFAULT_ROOT / "probe-approval.json"
 DEFAULT_PROBE_ATTEMPT_PATH = DEFAULT_ROOT / "probe-attempt.json"
+DEFAULT_PROBE_RESULT_PATH = DEFAULT_ROOT / "probe-result.json"
 DEFAULT_TARGETS_PATH = DEFAULT_ROOT / "targets.json"
 DEFAULT_STATUS_PATH = DEFAULT_ROOT / "refresh-status.json"
+DEFAULT_FIRST_TRIAL_ROOT = DEFAULT_ROOT / "first-full-trial"
+DEFAULT_FIRST_TRIAL_CANDIDATES_PATH = DEFAULT_FIRST_TRIAL_ROOT / "candidate-inventory.json"
+DEFAULT_FIRST_TRIAL_SELECTION_PATH = DEFAULT_FIRST_TRIAL_ROOT / "selection.json"
+DEFAULT_FIRST_TRIAL_MANIFEST_PATH = DEFAULT_FIRST_TRIAL_ROOT / "read-manifest.json"
+DEFAULT_FIRST_TRIAL_APPROVAL_PATH = DEFAULT_FIRST_TRIAL_ROOT / "read-approval.json"
+DEFAULT_FIRST_TRIAL_STATUS_PATH = DEFAULT_FIRST_TRIAL_ROOT / "status.json"
 
 
 def _parse_utc(value: object, *, field: str) -> datetime:
@@ -136,9 +146,7 @@ class WeatherNextRefreshTarget(StrictModel):
 
 
 class WeatherNextTargetInventory(StrictModel):
-    schema_version: Literal["weathernext-target-inventory/v1"] = (
-        "weathernext-target-inventory/v1"
-    )
+    schema_version: Literal["weathernext-target-inventory/v1"] = "weathernext-target-inventory/v1"
     generated_at_utc: datetime
     source: Literal["forecast_evaluation_registry_and_weather_snapshots"] = (
         "forecast_evaluation_registry_and_weather_snapshots"
@@ -150,6 +158,80 @@ class WeatherNextTargetInventory(StrictModel):
     @classmethod
     def _generated_aware(cls, value: datetime) -> datetime:
         return _aware(value, field="generated_at_utc")
+
+
+class WeatherNextFirstTrialSelection(StrictModel):
+    """Real market targets selected only for the first pre-day full trial."""
+
+    schema_version: Literal["weathernext-first-full-trial-selection/v1"] = (
+        "weathernext-first-full-trial-selection/v1"
+    )
+    generated_at_utc: datetime
+    state: Literal["waiting_for_discovery", "no_strictly_future_target", "selected"]
+    selection_rule: Literal[
+        "strictly_future_station_local_start_common_utc_coverage_largest_group"
+    ] = "strictly_future_station_local_start_common_utc_coverage_largest_group"
+    target_count: int = Field(ge=0)
+    future_candidate_count: int = Field(ge=0)
+    intraday_candidate_count: int = Field(ge=0)
+    coverage_start_utc: datetime | None = None
+    coverage_end_utc: datetime | None = None
+    targets: list[WeatherNextRefreshTarget] = Field(default_factory=list)
+    intraday_target_ids: list[str] = Field(default_factory=list)
+    message: str
+
+    @field_validator("generated_at_utc", "coverage_start_utc", "coverage_end_utc")
+    @classmethod
+    def _selection_time_aware(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else _aware(value, field="first-trial timestamp")
+
+
+class WeatherNextFirstTrialPlanStatus(StrictModel):
+    """Metadata-only state of the first full WeatherNext trial plan."""
+
+    schema_version: Literal["weathernext-first-full-trial-plan/v1"] = (
+        "weathernext-first-full-trial-plan/v1"
+    )
+    generated_at_utc: datetime
+    state: Literal[
+        "waiting_for_discovery",
+        "waiting_for_future_market",
+        "metadata_error",
+        "ready_for_separate_approval",
+    ]
+    payload_read: Literal[False] = False
+    full_pass_started: Literal[False] = False
+    candidate_inventory_path: str
+    selection_path: str
+    manifest_path: str | None = None
+    approval_path: str
+    target_count: int = Field(ge=0)
+    event_ids: list[str] = Field(default_factory=list)
+    station_ids: list[str] = Field(default_factory=list)
+    coverage_start_utc: datetime | None = None
+    coverage_end_utc: datetime | None = None
+    release_id: str | None = None
+    init_time_utc: datetime | None = None
+    object_count: int = Field(default=0, ge=0)
+    compressed_bytes: int = Field(default=0, ge=0)
+    manifest_sha256: str | None = None
+    estimated_duration_seconds: float | None = Field(default=None, ge=0)
+    estimated_duration_hours: float | None = Field(default=None, ge=0)
+    estimated_ready_at_utc_if_started_now: datetime | None = None
+    estimate_basis: str | None = None
+    discovery_scan_id: int | None = Field(default=None, ge=1)
+    message: str
+
+    @field_validator(
+        "generated_at_utc",
+        "coverage_start_utc",
+        "coverage_end_utc",
+        "init_time_utc",
+        "estimated_ready_at_utc_if_started_now",
+    )
+    @classmethod
+    def _plan_time_aware(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else _aware(value, field="first-trial plan timestamp")
 
 
 class WeatherNextApprovalResult(StrictModel):
@@ -362,11 +444,36 @@ def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
     return row is not None
 
 
-def _latest_weather_rows(connection: sqlite3.Connection) -> list[sqlite3.Row]:
-    """Read only the latest weather payload per event, never mutate SQLite."""
+def _latest_weather_rows(
+    connection: sqlite3.Connection,
+    *,
+    scan_run_id: int | None = None,
+) -> list[sqlite3.Row]:
+    """Read one weather payload per event, bounded to completed discovery evidence."""
 
     if not _table_exists(connection, "weather_snapshots"):
         return []
+    if scan_run_id is not None:
+        return list(
+            connection.execute(
+                """
+                SELECT w.event_id, w.fetched_at, w.payload_json
+                FROM weather_snapshots AS w
+                JOIN scan_runs AS s ON s.id = w.run_id
+                JOIN (
+                    SELECT prior.event_id, MAX(prior.id) AS max_id
+                    FROM weather_snapshots AS prior
+                    JOIN scan_runs AS prior_scan ON prior_scan.id = prior.run_id
+                    WHERE prior_scan.status = 'completed'
+                      AND prior_scan.id <= ?
+                    GROUP BY prior.event_id
+                ) AS latest ON latest.max_id = w.id
+                WHERE s.status = 'completed'
+                  AND s.id <= ?
+                """,
+                (scan_run_id, scan_run_id),
+            ).fetchall()
+        )
     return list(
         connection.execute(
             """
@@ -382,9 +489,13 @@ def _latest_weather_rows(connection: sqlite3.Connection) -> list[sqlite3.Row]:
     )
 
 
-def _latest_weather_by_event(connection: sqlite3.Connection) -> dict[str, WeatherForecast]:
+def _latest_weather_by_event(
+    connection: sqlite3.Connection,
+    *,
+    scan_run_id: int | None = None,
+) -> dict[str, WeatherForecast]:
     forecasts: dict[str, WeatherForecast] = {}
-    for row in _latest_weather_rows(connection):
+    for row in _latest_weather_rows(connection, scan_run_id=scan_run_id):
         try:
             forecast = WeatherForecast.model_validate_json(row["payload_json"])
         except Exception:
@@ -400,6 +511,7 @@ def derive_refresh_targets(
     now_utc: datetime | None = None,
     output_path: Path = DEFAULT_TARGETS_PATH,
     max_targets: int = 32,
+    scan_run_id: int | None = None,
 ) -> WeatherNextTargetInventory:
     """Derive bounded, eligible targets from read-only local evidence.
 
@@ -428,8 +540,9 @@ def derive_refresh_targets(
         if not _table_exists(connection, "forecast_evaluation_events_v2"):
             rows: Iterable[sqlite3.Row] = ()
         else:
+            scan_filter = "" if scan_run_id is None else "AND scan_run_id = ?"
             rows = connection.execute(
-                """
+                f"""
                 SELECT event_id, station_id, observation_date, station_timezone,
                        rule_day_end_utc, display_unit, eligible, considered_at_utc
                 FROM forecast_evaluation_events_v2
@@ -439,10 +552,12 @@ def derive_refresh_targets(
                   AND station_id IS NOT NULL
                   AND observation_date IS NOT NULL
                   AND station_timezone IS NOT NULL
+                  {scan_filter}
                 ORDER BY considered_at_utc DESC, id DESC
-                """
+                """,
+                (() if scan_run_id is None else (scan_run_id,)),
             ).fetchall()
-        forecasts = _latest_weather_by_event(connection)
+        forecasts = _latest_weather_by_event(connection, scan_run_id=scan_run_id)
         selected: dict[tuple[str, date], WeatherNextRefreshTarget] = {}
         skipped = 0
         for row in rows:
@@ -499,6 +614,413 @@ def derive_refresh_targets(
     return inventory
 
 
+def _latest_scan_state(database_path: Path) -> tuple[int | None, str | None]:
+    path = database_path.expanduser().resolve()
+    if not path.is_file():
+        return None, None
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+    connection.row_factory = sqlite3.Row
+    try:
+        if not _table_exists(connection, "scan_runs"):
+            return None, None
+        row = connection.execute(
+            "SELECT id, status FROM scan_runs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        return None, None
+    return int(row["id"]), str(row["status"])
+
+
+def _latest_completed_scan_id(database_path: Path) -> int | None:
+    """Return the newest fully completed discovery cycle, never a partial run."""
+
+    path = database_path.expanduser().resolve()
+    if not path.is_file():
+        return None
+    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+    connection.row_factory = sqlite3.Row
+    try:
+        if not _table_exists(connection, "scan_runs"):
+            return None
+        row = connection.execute(
+            "SELECT id FROM scan_runs WHERE status='completed' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    finally:
+        connection.close()
+    return None if row is None else int(row["id"])
+
+
+def _target_coverage_window(
+    target: WeatherNextRefreshTarget,
+) -> tuple[datetime, datetime, tuple[str, ...]]:
+    hours = expected_station_local_day_hours(
+        target.observation_date,
+        target.observation_timezone,
+    )
+    if not hours:
+        raise ValueError(f"target {target.station_id} has no expected station-local hours")
+    start = hours[0]
+    end = hours[-1] + timedelta(hours=1)
+    return start, end, tuple(value.isoformat() for value in hours)
+
+
+def select_first_full_trial_targets(
+    inventory: WeatherNextTargetInventory,
+    *,
+    now_utc: datetime | None = None,
+    max_targets: int = 32,
+) -> WeatherNextFirstTrialSelection:
+    """Choose the largest real future group with identical UTC hour coverage.
+
+    ``strictly_future`` is intentionally scoped to this first, pre-selected
+    trial.  The general inventory still includes an already-started local day
+    until it ends, so timely intraday evaluation remains possible elsewhere.
+    """
+
+    if max_targets < 1:
+        raise ValueError("max_targets must be positive")
+    now = _aware(now_utc or datetime.now(UTC), field="now_utc")
+    groups: dict[tuple[str, ...], list[tuple[datetime, datetime, WeatherNextRefreshTarget]]] = {}
+    future_count = 0
+    intraday_ids: list[str] = []
+    for target in inventory.targets:
+        start, end, signature = _target_coverage_window(target)
+        if start > now:
+            future_count += 1
+            groups.setdefault(signature, []).append((start, end, target))
+        elif now < end:
+            intraday_ids.append(target.station_id)
+    if not groups:
+        return WeatherNextFirstTrialSelection(
+            generated_at_utc=now,
+            state="no_strictly_future_target",
+            target_count=0,
+            future_candidate_count=0,
+            intraday_candidate_count=len(intraday_ids),
+            intraday_target_ids=sorted(set(intraday_ids)),
+            message=(
+                "no real market target starts in the future yet; already-started local days "
+                "remain separate intraday candidates and are not rewritten as a pre-day trial"
+            ),
+        )
+    ranked = sorted(
+        groups.values(),
+        key=lambda values: (
+            -len(values),
+            values[0][0],
+            tuple(sorted(item.station_id for _, _, item in values)),
+        ),
+    )
+    chosen = sorted(ranked[0], key=lambda item: (item[2].station_id, item[2].event_id))[
+        :max_targets
+    ]
+    coverage_start = chosen[0][0]
+    coverage_end = chosen[0][1]
+    return WeatherNextFirstTrialSelection(
+        generated_at_utc=now,
+        state="selected",
+        target_count=len(chosen),
+        future_candidate_count=future_count,
+        intraday_candidate_count=len(intraday_ids),
+        coverage_start_utc=coverage_start,
+        coverage_end_utc=coverage_end,
+        targets=[target for _, _, target in chosen],
+        intraday_target_ids=sorted(set(intraday_ids)),
+        message=(
+            "selected the largest strictly-future group with identical exact UTC hourly "
+            "coverage; this restriction applies only to the first full trial"
+        ),
+    )
+
+
+def _estimate_full_read_duration(
+    *,
+    compressed_bytes: int,
+    object_count: int,
+    probe_result_path: Path,
+) -> tuple[float, str]:
+    fallback_seconds_per_object = 50.0
+    try:
+        payload = json.loads(probe_result_path.expanduser().read_text(encoding="utf-8"))
+        raw_result = payload.get("read", payload) if isinstance(payload, Mapping) else {}
+        result = cast(Mapping[str, object], raw_result)
+        probe_bytes = int(cast(int | float | str, result["compressed_bytes"]))
+        download_seconds = float(cast(int | float | str, result["download_seconds"]))
+        elapsed_seconds = float(cast(int | float | str, result["elapsed_seconds"]))
+        if probe_bytes <= 0 or download_seconds <= 0 or elapsed_seconds <= 0:
+            raise ValueError("probe timing is not positive")
+        bytes_per_second = probe_bytes / download_seconds
+        non_download_seconds_per_object = max(0.0, elapsed_seconds - download_seconds)
+        estimate = compressed_bytes / bytes_per_second + (
+            object_count * non_download_seconds_per_object
+        )
+        return estimate, (
+            "measured one-block probe: byte-weighted download throughput plus measured "
+            "per-object decode/metadata overhead"
+        )
+    except Exception:
+        return object_count * fallback_seconds_per_object, (
+            "conservative fallback of 50 seconds per object; measured probe result unavailable"
+        )
+
+
+def _load_reusable_first_trial_plan(
+    *,
+    status_path: Path,
+    now_utc: datetime,
+) -> WeatherNextFirstTrialPlanStatus | None:
+    try:
+        status = WeatherNextFirstTrialPlanStatus.model_validate_json(
+            status_path.expanduser().read_text(encoding="utf-8")
+        )
+        if status.state != "ready_for_separate_approval" or status.manifest_path is None:
+            return None
+        if status.coverage_start_utc is None or status.coverage_start_utc <= now_utc:
+            return None
+        manifest = WeatherNextFullReadManifest.model_validate_json(
+            Path(status.manifest_path).read_text(encoding="utf-8")
+        )
+        if not verify_manifest_sha256(manifest):
+            return None
+        if manifest.manifest_sha256 != status.manifest_sha256:
+            return None
+        return status
+    except Exception:
+        return None
+
+
+def plan_first_full_trial(
+    database_path: Path,
+    *,
+    settings: object,
+    root: Path = DEFAULT_ROOT,
+    now_utc: datetime | None = None,
+    max_targets: int | None = None,
+    probe_result_path: Path | None = None,
+) -> WeatherNextFirstTrialPlanStatus:
+    """Build or reuse a frozen metadata-only plan for the first full trial."""
+
+    from polybot.config import Settings
+    from polybot.weathernext import WeatherNextGcsClient
+
+    if not isinstance(settings, Settings):
+        raise TypeError("settings must be a polybot.config.Settings instance")
+    now = _aware(now_utc or datetime.now(UTC), field="now_utc")
+    effective_root = root.expanduser()
+    trial_root = effective_root / DEFAULT_FIRST_TRIAL_ROOT.relative_to(DEFAULT_ROOT)
+    candidates_path = trial_root / DEFAULT_FIRST_TRIAL_CANDIDATES_PATH.relative_to(
+        DEFAULT_FIRST_TRIAL_ROOT
+    )
+    selection_path = trial_root / DEFAULT_FIRST_TRIAL_SELECTION_PATH.relative_to(
+        DEFAULT_FIRST_TRIAL_ROOT
+    )
+    manifest_path = trial_root / DEFAULT_FIRST_TRIAL_MANIFEST_PATH.relative_to(
+        DEFAULT_FIRST_TRIAL_ROOT
+    )
+    approval_path = trial_root / DEFAULT_FIRST_TRIAL_APPROVAL_PATH.relative_to(
+        DEFAULT_FIRST_TRIAL_ROOT
+    )
+    status_path = trial_root / DEFAULT_FIRST_TRIAL_STATUS_PATH.relative_to(DEFAULT_FIRST_TRIAL_ROOT)
+    trial_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(trial_root, 0o700)
+
+    reusable = _load_reusable_first_trial_plan(status_path=status_path, now_utc=now)
+    if reusable is not None:
+        return reusable
+
+    latest_scan_id, latest_scan_state = _latest_scan_state(database_path)
+    completed_scan_id = _latest_completed_scan_id(database_path)
+    if completed_scan_id is None:
+        selection = WeatherNextFirstTrialSelection(
+            generated_at_utc=now,
+            state="waiting_for_discovery",
+            target_count=0,
+            future_candidate_count=0,
+            intraday_candidate_count=0,
+            message=(
+                "no completed market discovery cycle is available yet; planner waits without "
+                "reading WeatherNext payload"
+            ),
+        )
+        _atomic_write_private(selection_path, selection.model_dump(mode="json"))
+        status = WeatherNextFirstTrialPlanStatus(
+            generated_at_utc=now,
+            state="waiting_for_discovery",
+            candidate_inventory_path=str(candidates_path),
+            selection_path=str(selection_path),
+            approval_path=str(approval_path),
+            target_count=0,
+            discovery_scan_id=latest_scan_id,
+            message=(
+                "market discovery has no completed cycle yet"
+                + ("; the latest cycle is still running" if latest_scan_state == "running" else "")
+                + "; no manifest or payload read was started"
+            ),
+        )
+        _atomic_write_private(status_path, status.model_dump(mode="json"))
+        return status
+
+    inventory = derive_refresh_targets(
+        database_path,
+        now_utc=now,
+        output_path=candidates_path,
+        max_targets=10_000,
+        scan_run_id=completed_scan_id,
+    )
+    os.chmod(candidates_path, 0o600)
+    selection = select_first_full_trial_targets(
+        inventory,
+        now_utc=now,
+        max_targets=max_targets or settings.weathernext_full_max_targets,
+    )
+    _atomic_write_private(selection_path, selection.model_dump(mode="json"))
+    if selection.state != "selected":
+        status = WeatherNextFirstTrialPlanStatus(
+            generated_at_utc=now,
+            state="waiting_for_future_market",
+            candidate_inventory_path=str(candidates_path),
+            selection_path=str(selection_path),
+            approval_path=str(approval_path),
+            target_count=0,
+            discovery_scan_id=completed_scan_id,
+            message=(
+                "no strictly-future first-trial target is available; periodic metadata-only "
+                "planning may retry without changing general intraday eligibility"
+            ),
+        )
+        _atomic_write_private(status_path, status.model_dump(mode="json"))
+        return status
+    if approval_path.exists():
+        status = WeatherNextFirstTrialPlanStatus(
+            generated_at_utc=now,
+            state="metadata_error",
+            candidate_inventory_path=str(candidates_path),
+            selection_path=str(selection_path),
+            approval_path=str(approval_path),
+            target_count=selection.target_count,
+            event_ids=[target.event_id for target in selection.targets],
+            station_ids=[target.station_id for target in selection.targets],
+            coverage_start_utc=selection.coverage_start_utc,
+            coverage_end_utc=selection.coverage_end_utc,
+            discovery_scan_id=completed_scan_id,
+            message=(
+                "an approval sidecar already exists for a non-reusable plan; refusing to rotate "
+                "the manifest digest"
+            ),
+        )
+        _atomic_write_private(status_path, status.model_dump(mode="json"))
+        return status
+
+    target_payloads = [
+        {
+            "event_id": target.event_id,
+            "station_id": target.station_id,
+            "latitude": target.latitude,
+            "longitude": target.longitude,
+            "location": target.location,
+            "observation_date": target.observation_date.isoformat(),
+            "timezone": target.observation_timezone,
+        }
+        for target in selection.targets
+    ]
+    snapshot_root = effective_root / "snapshots"
+    planning_network_limit = 1_000_000_000_000
+    planning_object_limit = 100_000
+    planning_object_size_limit = 2_000_000_000
+    try:
+        client = WeatherNextGcsClient(settings)
+        manifest = estimate_and_build_full_ensemble_read_manifest_batch(
+            client,
+            targets=target_payloads,
+            max_network_bytes=planning_network_limit,
+            max_objects=planning_object_limit,
+            max_object_bytes=planning_object_size_limit,
+            snapshot_root=snapshot_root,
+        )
+        coverage_complete, _incomplete, _mixed = _manifest_coverage_summary(manifest)
+        if not coverage_complete:
+            fallback = _find_complete_release_manifest(
+                client,
+                targets=target_payloads,
+                initial_manifest=manifest,
+                max_network_bytes=planning_network_limit,
+                max_objects=planning_object_limit,
+                max_object_bytes=planning_object_size_limit,
+                snapshot_root=snapshot_root,
+            )
+            if fallback is not None:
+                manifest = fallback
+        manifest = bind_manifest_to_exact_read_limits(
+            manifest,
+            approval_sidecar_path=approval_path,
+        )
+        write_full_ensemble_read_manifest(manifest, manifest_path)
+        os.chmod(manifest_path, 0o600)
+        archive = (
+            effective_root
+            / "manifests"
+            / "by-sha"
+            / manifest.manifest_sha256
+            / "read-manifest.json"
+        )
+        write_full_ensemble_read_manifest(manifest, archive)
+        os.chmod(archive, 0o600)
+    except Exception as error:
+        status = WeatherNextFirstTrialPlanStatus(
+            generated_at_utc=now,
+            state="metadata_error",
+            candidate_inventory_path=str(candidates_path),
+            selection_path=str(selection_path),
+            approval_path=str(approval_path),
+            target_count=selection.target_count,
+            event_ids=[target.event_id for target in selection.targets],
+            station_ids=[target.station_id for target in selection.targets],
+            coverage_start_utc=selection.coverage_start_utc,
+            coverage_end_utc=selection.coverage_end_utc,
+            discovery_scan_id=completed_scan_id,
+            message=f"metadata-only manifest planning failed: {error}",
+        )
+        _atomic_write_private(status_path, status.model_dump(mode="json"))
+        return status
+
+    duration_seconds, estimate_basis = _estimate_full_read_duration(
+        compressed_bytes=manifest.approval_gate.expected_network_bytes,
+        object_count=manifest.approval_gate.object_count,
+        probe_result_path=probe_result_path or effective_root / "probe-result.json",
+    )
+    status = WeatherNextFirstTrialPlanStatus(
+        generated_at_utc=now,
+        state="ready_for_separate_approval",
+        candidate_inventory_path=str(candidates_path),
+        selection_path=str(selection_path),
+        manifest_path=str(manifest_path),
+        approval_path=str(approval_path),
+        target_count=selection.target_count,
+        event_ids=[target.event_id for target in selection.targets],
+        station_ids=[target.station_id for target in selection.targets],
+        coverage_start_utc=selection.coverage_start_utc,
+        coverage_end_utc=selection.coverage_end_utc,
+        release_id=manifest.release_id,
+        init_time_utc=manifest.init_time_utc,
+        object_count=manifest.approval_gate.object_count,
+        compressed_bytes=manifest.approval_gate.expected_network_bytes,
+        manifest_sha256=manifest.manifest_sha256,
+        estimated_duration_seconds=duration_seconds,
+        estimated_duration_hours=duration_seconds / 3600,
+        estimated_ready_at_utc_if_started_now=now + timedelta(seconds=duration_seconds),
+        estimate_basis=estimate_basis,
+        discovery_scan_id=completed_scan_id,
+        message=(
+            "metadata-only first-trial manifest is frozen and ready for a separate operator "
+            "approval; no payload read has started"
+        ),
+    )
+    _atomic_write_private(status_path, status.model_dump(mode="json"))
+    return status
+
+
 def verify_read_approval(
     manifest_path: Path = DEFAULT_MANIFEST_PATH,
     approval_path: Path = DEFAULT_APPROVAL_PATH,
@@ -530,7 +1052,8 @@ def verify_read_approval(
         manifest_mapping = cast(Mapping[str, object], manifest_payload)
         digest = str(manifest_mapping.get("manifest_sha256") or "")
         return WeatherNextApprovalResult(
-            state="missing", manifest_sha256=digest or None,
+            state="missing",
+            manifest_sha256=digest or None,
             message="operator approval sidecar is absent; payload read remains blocked",
         )
     except Exception as error:
@@ -544,13 +1067,15 @@ def verify_read_approval(
         approval = WeatherNextReadApproval.model_validate(approval_payload)
     except Exception as error:
         return WeatherNextApprovalResult(
-            state="invalid", manifest_sha256=digest or None,
-            message=f"approval validation failed: {error}"
+            state="invalid",
+            manifest_sha256=digest or None,
+            message=f"approval validation failed: {error}",
         )
 
     if not verify_manifest_sha256(manifest):
         return WeatherNextApprovalResult(
-            state="invalid", manifest_sha256=manifest.manifest_sha256,
+            state="invalid",
+            manifest_sha256=manifest.manifest_sha256,
             message="manifest digest does not match its contents; payload read remains blocked",
         )
 
@@ -572,22 +1097,28 @@ def verify_read_approval(
         )
     if approval.manifest_sha256 != manifest.manifest_sha256:
         return WeatherNextApprovalResult(
-            state="manifest_mismatch", manifest_sha256=manifest.manifest_sha256,
-            expected_network_bytes=expected, object_count=object_count,
+            state="manifest_mismatch",
+            manifest_sha256=manifest.manifest_sha256,
+            expected_network_bytes=expected,
+            object_count=object_count,
             message="approval is bound to a different manifest digest",
         )
     try:
         validate_read_approval(manifest, approval, now_utc=now_utc)
     except Exception as error:
         return WeatherNextApprovalResult(
-            state="limit_mismatch", manifest_sha256=manifest.manifest_sha256,
-            expected_network_bytes=expected, object_count=object_count,
+            state="limit_mismatch",
+            manifest_sha256=manifest.manifest_sha256,
+            expected_network_bytes=expected,
+            object_count=object_count,
             message=f"manifest or approval limits are not approval-ready: {error}",
         )
     return WeatherNextApprovalResult(
-        state="approved", payload_read_permitted=True,
+        state="approved",
+        payload_read_permitted=True,
         manifest_sha256=manifest.manifest_sha256,
-        expected_network_bytes=expected, object_count=object_count,
+        expected_network_bytes=expected,
+        object_count=object_count,
         message="operator approval matches the immutable manifest and bounded limits",
     )
 
@@ -690,9 +1221,7 @@ def verify_one_block_probe_approval(
         else:
             state = "limit_mismatch"
         raw_object_uri = (
-            approval_payload.get("object_uri")
-            if isinstance(approval_payload, Mapping)
-            else None
+            approval_payload.get("object_uri") if isinstance(approval_payload, Mapping) else None
         )
         raw_object_bytes = (
             approval_payload.get("object_compressed_bytes")
@@ -809,6 +1338,33 @@ def _manifest_coverage_summary(
         if raw_target.get("complete_station_local_day") is not True or not complete:
             incomplete.append(target_id)
     return not incomplete, sorted(set(incomplete)), len(observation_dates) > 1
+
+
+def _require_manifest_targets_strictly_future(
+    manifest: WeatherNextFullReadManifest,
+    *,
+    now_utc: datetime,
+) -> None:
+    """Apply the pre-day gate only when executing the designated first trial."""
+
+    now = _aware(now_utc, field="now_utc")
+    started: list[str] = []
+    for target in manifest.targets:
+        target_id = str(target.get("target_id", "?"))
+        try:
+            target_date = date.fromisoformat(str(target["observation_date"]))
+            timezone_name = str(target["observation_timezone"])
+            start = expected_station_local_day_hours(target_date, timezone_name)[0]
+        except (KeyError, TypeError, ValueError, IndexError):
+            started.append(target_id)
+            continue
+        if start <= now:
+            started.append(target_id)
+    if started:
+        raise RuntimeError(
+            "first full trial requires every station-local day to start in the future; "
+            f"not future: {', '.join(sorted(set(started)))}"
+        )
 
 
 def _find_complete_release_manifest(
@@ -954,9 +1510,7 @@ def _manifest_target_selection(
 ) -> tuple[list[str], list[dict[str, object]]]:
     raw_selection = target.get("selection")
     selection = (
-        cast(Mapping[str, object], raw_selection)
-        if isinstance(raw_selection, Mapping)
-        else {}
+        cast(Mapping[str, object], raw_selection) if isinstance(raw_selection, Mapping) else {}
     )
     raw_dims = selection.get("dimensions", [])
     dimensions = [str(item) for item in raw_dims] if isinstance(raw_dims, list) else []
@@ -980,8 +1534,7 @@ def _target_member_accumulators(
     if not isinstance(raw_times, list) or not raw_times:
         raise ValueError(f"WeatherNext target {target.get('target_id', '?')} has no valid times")
     valid_times = [
-        _parse_utc(value, field="target.valid_times_utc").isoformat()
-        for value in raw_times
+        _parse_utc(value, field="target.valid_times_utc").isoformat() for value in raw_times
     ]
     # A full station-local day is required for a usable paper snapshot.  A
     # short publication remains a metadata artifact and is never promoted to
@@ -1045,9 +1598,7 @@ def _extract_probe_values(
             raise RuntimeError(f"Target {target_id} dimensions do not match manifest array")
         raw_selection = target.get("selection")
         selection = (
-            cast(Mapping[str, object], raw_selection)
-            if isinstance(raw_selection, Mapping)
-            else {}
+            cast(Mapping[str, object], raw_selection) if isinstance(raw_selection, Mapping) else {}
         )
         lat_index = int(cast(int | str, selection["latitude_index"]))
         lon_index = int(cast(int | str, selection["longitude_index"]))
@@ -1063,9 +1614,7 @@ def _extract_probe_values(
                 "lon": lon_index,
             }
             if "lead_subtime_index" in record:
-                global_indices["lead_subtime"] = int(
-                    cast(int | str, record["lead_subtime_index"])
-                )
+                global_indices["lead_subtime"] = int(cast(int | str, record["lead_subtime_index"]))
             member_values: list[dict[str, object]] = []
             for member_index in range(64):
                 global_indices["sample"] = member_index
@@ -1105,9 +1654,7 @@ def _extract_probe_values(
                             record.get("valid_time_utc", ""), field="valid_time_utc"
                         ).isoformat(),
                         "units": (
-                            "C"
-                            if source_units.casefold() in {"k", "kelvin"}
-                            else source_units
+                            "C" if source_units.casefold() in {"k", "kelvin"} else source_units
                         ),
                         "members": member_values,
                     }
@@ -1194,8 +1741,7 @@ def _write_immutable_snapshot(path: Path, snapshot: Mapping[str, object]) -> Non
         existing = path.read_text(encoding="utf-8")
         if existing != payload:
             raise RuntimeError(
-                "WeatherNext immutable snapshot already exists with different content: "
-                f"{path}"
+                f"WeatherNext immutable snapshot already exists with different content: {path}"
             )
         return
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1208,7 +1754,7 @@ def _write_immutable_snapshot(path: Path, snapshot: Mapping[str, object]) -> Non
         temporary.unlink(missing_ok=True)
         if path.read_text(encoding="utf-8") != payload:
             raise RuntimeError(
-                "WeatherNext immutable snapshot changed concurrently: " f"{path}"
+                f"WeatherNext immutable snapshot changed concurrently: {path}"
             ) from None
         return
     try:
@@ -1296,14 +1842,10 @@ def _download_probe_object_once(
     os.chmod(root, 0o700)
     free_bytes = shutil.disk_usage(root).free
     if free_bytes < item.compressed_bytes:
-        raise RuntimeError(
-            "insufficient temporary disk space for the approved WeatherNext object"
-        )
+        raise RuntimeError("insufficient temporary disk space for the approved WeatherNext object")
     available_memory = _available_memory_bytes()
     uncompressed_bound = int(item.uncompressed_upper_bound_bytes or 0)
-    conservative_memory_need = (
-        item.compressed_bytes * 2 + uncompressed_bound + 256 * 1024 * 1024
-    )
+    conservative_memory_need = item.compressed_bytes * 2 + uncompressed_bound + 256 * 1024 * 1024
     if available_memory is not None and available_memory < conservative_memory_need:
         raise RuntimeError(
             "insufficient available memory for single-shot download and bounded decode"
@@ -1403,6 +1945,8 @@ def read_approved_manifest_sequentially(
     expected_probe_max_network_bytes: int | None = None,
     expected_probe_max_object_bytes: int | None = None,
     probe_temporary_root: Path | None = None,
+    require_strictly_future_targets: bool = False,
+    now_utc: datetime | None = None,
 ) -> WeatherNextSequentialReadResult:
     """Read an approved manifest one compressed object at a time.
 
@@ -1435,17 +1979,14 @@ def read_approved_manifest_sequentially(
         ]
         if missing_probe_values:
             raise RuntimeError(
-                "one-block probe requires explicit expected "
-                + ", ".join(missing_probe_values)
+                "one-block probe requires explicit expected " + ", ".join(missing_probe_values)
             )
         manifest, probe_approval, probe_approval_result = _load_probe_approved_manifest(
             manifest_path,
             probe_approval_path,
             expected_manifest_sha256=cast(str, expected_probe_manifest_sha256),
             expected_object_uri=cast(str, expected_probe_object_uri),
-            expected_object_compressed_bytes=cast(
-                int, expected_probe_object_compressed_bytes
-            ),
+            expected_object_compressed_bytes=cast(int, expected_probe_object_compressed_bytes),
             expected_max_network_bytes=cast(int, expected_probe_max_network_bytes),
             expected_max_object_bytes=cast(int, expected_probe_max_object_bytes),
             attempt_path=probe_attempt_path,
@@ -1469,6 +2010,11 @@ def read_approved_manifest_sequentially(
                 "WeatherNext payload read blocked: incomplete station-local-day coverage for "
                 f"{targets}; no hours are synthesized"
             )
+    if require_strictly_future_targets:
+        _require_manifest_targets_strictly_future(
+            manifest,
+            now_utc=now_utc or datetime.now(UTC),
+        )
     if manifest.payload_read or manifest.approval_gate.payload_read_permitted:
         raise RuntimeError("manifest must remain immutable and payload_read=false")
     if manifest.approval_gate.sharding_supported is not True:
@@ -1591,7 +2137,7 @@ def read_approved_manifest_sequentially(
                 raise RuntimeError(f"WeatherNext object has no compressed size: {item.object_uri}")
             if item.compressed_bytes > approval.max_object_bytes:
                 raise RuntimeError(
-                    "WeatherNext object exceeds approved size limit: " f"{item.object_uri}"
+                    f"WeatherNext object exceeds approved size limit: {item.object_uri}"
                 )
             if bytes_read + item.compressed_bytes > approval.max_network_bytes:
                 raise RuntimeError("WeatherNext read stopped before approved network limit")
@@ -1631,8 +2177,7 @@ def read_approved_manifest_sequentially(
                 and int(chunk.nbytes) > item.uncompressed_upper_bound_bytes
             ):
                 raise RuntimeError(
-                    "Decoded WeatherNext chunk exceeded its manifest bound: "
-                    f"{item.object_uri}"
+                    f"Decoded WeatherNext chunk exceeded its manifest bound: {item.object_uri}"
                 )
             if probe_only:
                 decoded_shape = [int(value) for value in chunk.shape]
@@ -1789,8 +2334,7 @@ def read_approved_manifest_sequentially(
         snapshot_path = Path(raw_target_path).expanduser()
         if not snapshot_path.is_relative_to(snapshot_root.expanduser().resolve()):
             raise RuntimeError(
-                "Snapshot path escapes the configured WeatherNext root: "
-                f"{snapshot_path}"
+                f"Snapshot path escapes the configured WeatherNext root: {snapshot_path}"
             )
         snapshot = WeatherNextSnapshot(
             init_time_utc=manifest.init_time_utc,
@@ -1837,8 +2381,7 @@ def read_approved_manifest_sequentially(
         bytes_read=bytes_read,
         object_count=object_count,
         message=(
-            "approved WeatherNext payload read completed sequentially with full "
-            "trajectory coverage"
+            "approved WeatherNext payload read completed sequentially with full trajectory coverage"
         ),
         probe_only=False,
         elapsed_seconds=monotonic_clock.monotonic() - started,
@@ -1998,12 +2541,15 @@ def autonomous_refresh_preflight(
             if isinstance(raw_incomplete, list)
             else []
         )
-        coverage_complete = bool(
-            period.get(
-                "all_targets_complete_station_local_day",
-                gate.get("coverage_complete", not incomplete_target_ids),
+        coverage_complete = (
+            bool(
+                period.get(
+                    "all_targets_complete_station_local_day",
+                    gate.get("coverage_complete", not incomplete_target_ids),
+                )
             )
-        ) and not incomplete_target_ids
+            and not incomplete_target_ids
+        )
         mixed_observation_dates = bool(period.get("mixed_observation_dates", False))
     except Exception:
         manifest_state = "missing"
@@ -2022,14 +2568,15 @@ def autonomous_refresh_preflight(
             ),
         )
         message = (
-            "metadata manifest refresh failed; payload read remains blocked: "
-            f"{metadata_error}"
+            f"metadata manifest refresh failed; payload read remains blocked: {metadata_error}"
         )
     elif approval.state != "approved":
         if approval.state == "coverage_blocked" or not coverage_complete:
-            targets = ", ".join(approval.incomplete_target_ids) or ", ".join(
-                incomplete_target_ids
-            ) or "unknown target"
+            targets = (
+                ", ".join(approval.incomplete_target_ids)
+                or ", ".join(incomplete_target_ids)
+                or "unknown target"
+            )
             message = (
                 "payload read remains blocked: incomplete station-local-day coverage for "
                 f"{targets}; no hours are synthesized"
@@ -2041,8 +2588,7 @@ def autonomous_refresh_preflight(
             )
         if mixed_observation_dates:
             message += (
-                "; manifest contains multiple observation dates, each target is "
-                "checked separately"
+                "; manifest contains multiple observation dates, each target is checked separately"
             )
     else:
         message = "approval verified; sequential payload reader may run as a separate bounded step"
@@ -2067,13 +2613,22 @@ def autonomous_refresh_preflight(
 
 __all__ = [
     "DEFAULT_APPROVAL_PATH",
+    "DEFAULT_FIRST_TRIAL_APPROVAL_PATH",
+    "DEFAULT_FIRST_TRIAL_CANDIDATES_PATH",
+    "DEFAULT_FIRST_TRIAL_MANIFEST_PATH",
+    "DEFAULT_FIRST_TRIAL_ROOT",
+    "DEFAULT_FIRST_TRIAL_SELECTION_PATH",
+    "DEFAULT_FIRST_TRIAL_STATUS_PATH",
     "DEFAULT_MANIFEST_PATH",
     "DEFAULT_PROBE_APPROVAL_PATH",
     "DEFAULT_PROBE_ATTEMPT_PATH",
+    "DEFAULT_PROBE_RESULT_PATH",
     "DEFAULT_ROOT",
     "DEFAULT_STATUS_PATH",
     "DEFAULT_TARGETS_PATH",
     "WeatherNextApprovalResult",
+    "WeatherNextFirstTrialPlanStatus",
+    "WeatherNextFirstTrialSelection",
     "WeatherNextReadApproval",
     "WeatherNextRefreshStatus",
     "WeatherNextRefreshTarget",
@@ -2081,7 +2636,9 @@ __all__ = [
     "WeatherNextTargetInventory",
     "autonomous_refresh_preflight",
     "derive_refresh_targets",
+    "plan_first_full_trial",
     "read_approved_manifest_sequentially",
+    "select_first_full_trial_targets",
     "verify_one_block_probe_approval",
     "verify_read_approval",
     "write_refresh_status",

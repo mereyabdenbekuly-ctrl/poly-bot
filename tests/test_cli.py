@@ -25,6 +25,25 @@ def test_diagnostics_command_is_available_without_runtime_side_effects() -> None
     assert args.as_json is True
 
 
+def test_weathernext_first_trial_and_existing_read_flags_are_explicit() -> None:
+    planned = build_parser().parse_args(
+        ["weathernext", "first-full-trial-plan", "--json"]
+    )
+    assert planned.weathernext_command == "first-full-trial-plan"
+    assert planned.as_json is True
+
+    read = build_parser().parse_args(
+        [
+            "weathernext",
+            "autonomous-refresh",
+            "--read-approved",
+            "--require-strictly-future-targets",
+        ]
+    )
+    assert read.read_approved is True
+    assert read.require_strictly_future_targets is True
+
+
 @pytest.mark.parametrize("requested", [0, 21])
 def test_event_limit_stays_bounded(requested: int) -> None:
     with pytest.raises(ValueError, match="between 1 and 20"):

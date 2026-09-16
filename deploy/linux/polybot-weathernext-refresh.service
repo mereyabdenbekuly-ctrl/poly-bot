@@ -1,9 +1,10 @@
 [Unit]
-Description=Polybot approval-gated WeatherNext full-ensemble refresh
+Description=Polybot metadata-only WeatherNext first-full-trial planner
 Wants=network-online.target
 After=network-online.target
 ConditionPathExists=/var/lib/polybot/polybot.sqlite3
 ConditionPathExists=/etc/polybot/polybot.env
+ConditionPathExists=/var/lib/polybot/.config/gcloud/application_default_credentials.json
 
 [Service]
 Type=oneshot
@@ -12,16 +13,11 @@ Group=polybot
 WorkingDirectory=/opt/polybot
 EnvironmentFile=/etc/polybot/polybot.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/opt/polybot/.venv/bin/polybot weathernext autonomous-refresh \
+ExecStart=/opt/polybot/.venv/bin/polybot weathernext first-full-trial-plan \
   --database /var/lib/polybot/polybot.sqlite3 \
   --root /var/lib/polybot/weathernext/full \
-  --targets /var/lib/polybot/weathernext/full/targets.json \
-  --manifest /var/lib/polybot/weathernext/full/read-manifest.json \
-  --approval /var/lib/polybot/weathernext/full/read-approval.json \
-  --status /var/lib/polybot/weathernext/full/refresh-status.json \
-  --index /var/lib/polybot/weathernext/full/latest-index.json \
-  --snapshot-root /var/lib/polybot/weathernext/full/snapshots \
-  --read-approved --json
+  --probe-result /var/lib/polybot/weathernext/full/probe-result.json \
+  --json
 Nice=15
 IOSchedulingClass=idle
 IOSchedulingPriority=7
@@ -38,6 +34,5 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
 CapabilityBoundingSet=
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET
 ReadWritePaths=/var/lib/polybot
-

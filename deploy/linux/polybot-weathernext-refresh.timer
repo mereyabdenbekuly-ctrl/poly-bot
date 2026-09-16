@@ -1,5 +1,5 @@
 [Unit]
-Description=Refresh approved WeatherNext release metadata and snapshots hourly
+Description=Check hourly for a real metadata-only WeatherNext first-trial plan
 
 [Timer]
 OnBootSec=15min

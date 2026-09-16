@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -13,9 +13,13 @@ from polybot.config import Settings
 from polybot.models import RuleInterpretation
 from polybot.storage import Storage
 from polybot.weathernext_autonomy import (
+    WeatherNextRefreshTarget,
+    WeatherNextTargetInventory,
     autonomous_refresh_preflight,
     derive_refresh_targets,
+    plan_first_full_trial,
     read_approved_manifest_sequentially,
+    select_first_full_trial_targets,
     verify_one_block_probe_approval,
     verify_read_approval,
 )
@@ -34,15 +38,135 @@ def test_target_inventory_is_read_only_and_requires_full_identity(tmp_path: Path
     )
 
     assert inventory.targets == []
-    assert json.loads((tmp_path / "targets.json").read_text()) ["targets"] == []
+    assert json.loads((tmp_path / "targets.json").read_text())["targets"] == []
+
+
+def test_first_trial_selects_largest_common_future_window_without_banning_intraday() -> None:
+    now = datetime(2026, 9, 16, 12, tzinfo=UTC)
+
+    def target(
+        event_id: str,
+        station_id: str,
+        observation_date: date,
+        timezone_name: str,
+    ) -> WeatherNextRefreshTarget:
+        hours = expected_station_local_day_hours(observation_date, timezone_name)
+        return WeatherNextRefreshTarget(
+            event_id=event_id,
+            station_id=station_id,
+            location=station_id,
+            latitude=1,
+            longitude=2,
+            observation_date=observation_date,
+            observation_timezone=timezone_name,
+            rule_day_end_utc=hours[-1] + timedelta(hours=1),
+            source_fetched_at_utc=now,
+        )
+
+    inventory = WeatherNextTargetInventory(
+        generated_at_utc=now,
+        targets=[
+            target("event-shanghai", "ZSPD", date(2026, 9, 17), "Asia/Shanghai"),
+            target("event-singapore", "WSSS", date(2026, 9, 17), "Asia/Singapore"),
+            target("event-milan", "LIMC", date(2026, 9, 17), "Europe/Rome"),
+            target("event-intraday", "EDDM", date(2026, 9, 16), "Europe/Berlin"),
+        ],
+        skipped_count=0,
+    )
+
+    selection = select_first_full_trial_targets(inventory, now_utc=now)
+
+    assert selection.state == "selected"
+    assert [item.station_id for item in selection.targets] == ["WSSS", "ZSPD"]
+    assert selection.coverage_start_utc == datetime(2026, 9, 16, 16, tzinfo=UTC)
+    assert selection.coverage_end_utc == datetime(2026, 9, 17, 16, tzinfo=UTC)
+    assert selection.future_candidate_count == 3
+    assert selection.intraday_target_ids == ["EDDM"]
+    assert selection.intraday_candidate_count == 1
+
+
+def test_first_trial_planner_waits_for_running_discovery_without_gcs(
+    monkeypatch, tmp_path: Path
+) -> None:
+    storage = Storage(tmp_path / "polybot.sqlite3")
+    run_id = storage.start_scan(query="highest temperature", mode="paper")
+
+    class _FailingClient:
+        def __init__(self, _settings: Settings) -> None:
+            raise AssertionError("running discovery must block WeatherNext metadata access")
+
+    monkeypatch.setattr("polybot.weathernext.WeatherNextGcsClient", _FailingClient)
+    status = plan_first_full_trial(
+        storage.path,
+        settings=Settings(
+            database_path=storage.path,
+            weathernext_enabled=True,
+            weathernext_gcs_project="weather-508105",
+        ),
+        root=tmp_path / "weathernext",
+        now_utc=datetime(2026, 9, 16, 12, tzinfo=UTC),
+    )
+
+    assert status.state == "waiting_for_discovery"
+    assert status.discovery_scan_id == run_id
+    assert status.payload_read is False
+    assert not (tmp_path / "weathernext" / "first-full-trial" / "read-manifest.json").exists()
+
+
+def test_first_trial_planner_uses_latest_completed_cycle_while_next_scan_runs(
+    monkeypatch, tmp_path: Path
+) -> None:
+    storage = Storage(tmp_path / "polybot.sqlite3")
+    completed_id = storage.start_scan(query="highest temperature", mode="paper")
+    storage.finish_scan(completed_id, geoblocked=False)
+    running_id = storage.start_scan(query="highest temperature", mode="paper")
+    captured_scan_ids: list[int | None] = []
+
+    def _empty_completed_inventory(
+        _database_path: Path,
+        *,
+        now_utc: datetime | None = None,
+        output_path: Path,
+        max_targets: int,
+        scan_run_id: int | None = None,
+    ) -> WeatherNextTargetInventory:
+        del max_targets
+        captured_scan_ids.append(scan_run_id)
+        inventory = WeatherNextTargetInventory(
+            generated_at_utc=now_utc or datetime.now(UTC),
+            targets=[],
+            skipped_count=0,
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(inventory.model_dump_json(), encoding="utf-8")
+        return inventory
+
+    monkeypatch.setattr(
+        "polybot.weathernext_autonomy.derive_refresh_targets",
+        _empty_completed_inventory,
+    )
+    status = plan_first_full_trial(
+        storage.path,
+        settings=Settings(
+            database_path=storage.path,
+            weathernext_enabled=True,
+            weathernext_gcs_project="weather-508105",
+        ),
+        root=tmp_path / "weathernext",
+        now_utc=datetime(2026, 9, 16, 12, tzinfo=UTC),
+    )
+
+    assert running_id > completed_id
+    assert captured_scan_ids == [completed_id]
+    assert status.state == "waiting_for_future_market"
+    assert status.discovery_scan_id == completed_id
+    assert status.payload_read is False
 
 
 def _estimate(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
     valid_times = [
         value.isoformat()
-        for value in expected_station_local_day_hours(
-            date(2026, 9, 15), "Europe/Amsterdam"
-        )
+        for value in expected_station_local_day_hours(date(2026, 9, 15), "Europe/Amsterdam")
     ]
     estimate: dict[str, object] = {
         "target_id": "EHAM",
@@ -238,6 +362,35 @@ def test_approval_is_required_and_reader_streams_one_chunk(monkeypatch, tmp_path
     assert len(reused.snapshot_paths) == 1
 
 
+def test_first_full_trial_reader_rejects_a_day_that_already_started(
+    monkeypatch, tmp_path: Path
+) -> None:
+    manifest_path, approval_path, snapshot_root, index_path = _estimate(tmp_path)
+
+    class _FailingClient:
+        def __init__(self, _settings: Settings) -> None:
+            raise AssertionError("strictly-future rejection must happen before GCS access")
+
+    monkeypatch.setattr("polybot.weathernext.WeatherNextGcsClient", _FailingClient)
+    settings = Settings(
+        database_path=tmp_path / "db.sqlite3",
+        weathernext_enabled=True,
+        weathernext_gcs_project="weather-508105",
+        weathernext_full_refresh_enabled=True,
+    )
+
+    with pytest.raises(RuntimeError, match="requires every station-local day"):
+        read_approved_manifest_sequentially(
+            settings,
+            manifest_path=manifest_path,
+            approval_path=approval_path,
+            snapshot_root=snapshot_root,
+            index_path=index_path,
+            require_strictly_future_targets=True,
+            now_utc=datetime(2026, 9, 15, 12, tzinfo=UTC),
+        )
+
+
 def test_approved_probe_reads_one_block_without_publishing_snapshot(
     monkeypatch, tmp_path: Path
 ) -> None:
@@ -343,9 +496,7 @@ def test_incomplete_coverage_blocks_approval_and_payload_client(
 ) -> None:
     valid_times = [
         value.isoformat()
-        for value in expected_station_local_day_hours(
-            date(2026, 9, 15), "Europe/Amsterdam"
-        )[:-1]
+        for value in expected_station_local_day_hours(date(2026, 9, 15), "Europe/Amsterdam")[:-1]
     ]
     estimate: dict[str, object] = {
         "target_id": "EHAM",
