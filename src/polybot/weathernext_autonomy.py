@@ -1008,7 +1008,11 @@ def plan_first_full_trial(
             snapshot_root=snapshot_root,
         )
         coverage_complete, _incomplete, _mixed = _manifest_coverage_summary(manifest)
-        if not coverage_complete:
+        metadata_complete = (
+            manifest.approval_gate.compressed_sizes_complete
+            and manifest.approval_gate.sharding_supported
+        )
+        if not coverage_complete or not metadata_complete:
             fallback = _find_complete_release_manifest(
                 client,
                 targets=target_payloads,
@@ -1020,6 +1024,18 @@ def plan_first_full_trial(
             )
             if fallback is not None:
                 manifest = fallback
+        if not (
+            manifest.approval_gate.coverage_complete
+            and manifest.approval_gate.compressed_sizes_complete
+            and manifest.approval_gate.sharding_supported
+        ):
+            gate = manifest.approval_gate
+            raise RuntimeError(
+                "manifest metadata is not exact/readable after bounded release fallback: "
+                f"state={gate.state}, coverage_complete={gate.coverage_complete}, "
+                f"compressed_sizes_complete={gate.compressed_sizes_complete}, "
+                f"sharding_supported={gate.sharding_supported}"
+            )
         manifest = bind_manifest_to_exact_read_limits(
             manifest,
             approval_sidecar_path=approval_path,
@@ -1582,7 +1598,11 @@ def _find_complete_release_manifest(
                 snapshot_root=snapshot_root,
             )
             complete, _incomplete, _mixed = _manifest_coverage_summary(candidate)
-            if complete:
+            if (
+                complete
+                and candidate.approval_gate.compressed_sizes_complete
+                and candidate.approval_gate.sharding_supported
+            ):
                 return candidate
         except Exception:
             pass
