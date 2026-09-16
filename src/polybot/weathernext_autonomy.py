@@ -58,6 +58,8 @@ DEFAULT_FIRST_TRIAL_SELECTION_PATH = DEFAULT_FIRST_TRIAL_ROOT / "selection.json"
 DEFAULT_FIRST_TRIAL_MANIFEST_PATH = DEFAULT_FIRST_TRIAL_ROOT / "read-manifest.json"
 DEFAULT_FIRST_TRIAL_APPROVAL_PATH = DEFAULT_FIRST_TRIAL_ROOT / "read-approval.json"
 DEFAULT_FIRST_TRIAL_STATUS_PATH = DEFAULT_FIRST_TRIAL_ROOT / "status.json"
+FIRST_TRIAL_REFERENCE_OBJECT_COUNT = 448
+FIRST_TRIAL_FALLBACK_MINIMUM_LEAD_SECONDS = 6.5 * 3600
 
 
 def _parse_utc(value: object, *, field: str) -> datetime:
@@ -167,13 +169,20 @@ class WeatherNextFirstTrialSelection(StrictModel):
         "weathernext-first-full-trial-selection/v1"
     )
     generated_at_utc: datetime
-    state: Literal["waiting_for_discovery", "no_strictly_future_target", "selected"]
+    state: Literal[
+        "waiting_for_discovery",
+        "no_strictly_future_target",
+        "no_sufficient_lead_time",
+        "selected",
+    ]
     selection_rule: Literal[
         "strictly_future_station_local_start_common_utc_coverage_largest_group"
     ] = "strictly_future_station_local_start_common_utc_coverage_largest_group"
     target_count: int = Field(ge=0)
     future_candidate_count: int = Field(ge=0)
     intraday_candidate_count: int = Field(ge=0)
+    minimum_lead_seconds: float = Field(default=0, ge=0)
+    minimum_lead_basis: str | None = None
     coverage_start_utc: datetime | None = None
     coverage_end_utc: datetime | None = None
     targets: list[WeatherNextRefreshTarget] = Field(default_factory=list)
@@ -219,6 +228,9 @@ class WeatherNextFirstTrialPlanStatus(StrictModel):
     estimated_duration_hours: float | None = Field(default=None, ge=0)
     estimated_ready_at_utc_if_started_now: datetime | None = None
     estimate_basis: str | None = None
+    minimum_selection_lead_seconds: float | None = Field(default=None, ge=0)
+    minimum_selection_lead_hours: float | None = Field(default=None, ge=0)
+    minimum_selection_lead_basis: str | None = None
     discovery_scan_id: int | None = Field(default=None, ge=1)
     message: str
 
@@ -671,6 +683,8 @@ def select_first_full_trial_targets(
     *,
     now_utc: datetime | None = None,
     max_targets: int = 32,
+    minimum_lead_seconds: float = 0,
+    minimum_lead_basis: str | None = None,
 ) -> WeatherNextFirstTrialSelection:
     """Choose the largest real future group with identical UTC hour coverage.
 
@@ -681,7 +695,10 @@ def select_first_full_trial_targets(
 
     if max_targets < 1:
         raise ValueError("max_targets must be positive")
+    if not math.isfinite(minimum_lead_seconds) or minimum_lead_seconds < 0:
+        raise ValueError("minimum_lead_seconds must be finite and non-negative")
     now = _aware(now_utc or datetime.now(UTC), field="now_utc")
+    earliest_suitable_start = now + timedelta(seconds=minimum_lead_seconds)
     groups: dict[tuple[str, ...], list[tuple[datetime, datetime, WeatherNextRefreshTarget]]] = {}
     future_count = 0
     intraday_ids: list[str] = []
@@ -689,20 +706,33 @@ def select_first_full_trial_targets(
         start, end, signature = _target_coverage_window(target)
         if start > now:
             future_count += 1
-            groups.setdefault(signature, []).append((start, end, target))
+            if start > earliest_suitable_start:
+                groups.setdefault(signature, []).append((start, end, target))
         elif now < end:
             intraday_ids.append(target.station_id)
     if not groups:
+        state = (
+            "no_sufficient_lead_time"
+            if future_count > 0 and minimum_lead_seconds > 0
+            else "no_strictly_future_target"
+        )
         return WeatherNextFirstTrialSelection(
             generated_at_utc=now,
-            state="no_strictly_future_target",
+            state=state,
             target_count=0,
-            future_candidate_count=0,
+            future_candidate_count=future_count,
             intraday_candidate_count=len(intraday_ids),
+            minimum_lead_seconds=minimum_lead_seconds,
+            minimum_lead_basis=minimum_lead_basis,
             intraday_target_ids=sorted(set(intraday_ids)),
             message=(
-                "no real market target starts in the future yet; already-started local days "
-                "remain separate intraday candidates and are not rewritten as a pre-day trial"
+                "real future targets exist, but none leaves enough measured time for the full "
+                "read to finish before station-local midnight"
+                if state == "no_sufficient_lead_time"
+                else (
+                    "no real market target starts in the future yet; already-started local days "
+                    "remain separate intraday candidates and are not rewritten as a pre-day trial"
+                )
             ),
         )
     ranked = sorted(
@@ -724,15 +754,40 @@ def select_first_full_trial_targets(
         target_count=len(chosen),
         future_candidate_count=future_count,
         intraday_candidate_count=len(intraday_ids),
+        minimum_lead_seconds=minimum_lead_seconds,
+        minimum_lead_basis=minimum_lead_basis,
         coverage_start_utc=coverage_start,
         coverage_end_utc=coverage_end,
         targets=[target for _, _, target in chosen],
         intraday_target_ids=sorted(set(intraday_ids)),
         message=(
             "selected the largest strictly-future group with identical exact UTC hourly "
-            "coverage; this restriction applies only to the first full trial"
+            "coverage and enough measured lead time; this restriction applies only to the "
+            "first full trial"
         ),
     )
+
+
+def _minimum_first_trial_lead(
+    *,
+    probe_result_path: Path,
+) -> tuple[float, str]:
+    """Reserve the measured duration of the earlier 448-object plan."""
+
+    try:
+        payload = json.loads(probe_result_path.expanduser().read_text(encoding="utf-8"))
+        raw_result = payload.get("read", payload) if isinstance(payload, Mapping) else {}
+        result = cast(Mapping[str, object], raw_result)
+        elapsed_seconds = float(cast(int | float | str, result["elapsed_seconds"]))
+        if not math.isfinite(elapsed_seconds) or elapsed_seconds <= 0:
+            raise ValueError("probe elapsed time is not positive")
+        return elapsed_seconds * FIRST_TRIAL_REFERENCE_OBJECT_COUNT, (
+            "measured one-block total time multiplied by the prior 448-object plan"
+        )
+    except Exception:
+        return FIRST_TRIAL_FALLBACK_MINIMUM_LEAD_SECONDS, (
+            "conservative 6.5-hour first-trial lead because measured probe timing is unavailable"
+        )
 
 
 def _estimate_full_read_duration(
@@ -870,10 +925,16 @@ def plan_first_full_trial(
         scan_run_id=completed_scan_id,
     )
     os.chmod(candidates_path, 0o600)
+    effective_probe_result_path = probe_result_path or effective_root / "probe-result.json"
+    minimum_lead_seconds, minimum_lead_basis = _minimum_first_trial_lead(
+        probe_result_path=effective_probe_result_path,
+    )
     selection = select_first_full_trial_targets(
         inventory,
         now_utc=now,
         max_targets=max_targets or settings.weathernext_full_max_targets,
+        minimum_lead_seconds=minimum_lead_seconds,
+        minimum_lead_basis=minimum_lead_basis,
     )
     _atomic_write_private(selection_path, selection.model_dump(mode="json"))
     if selection.state != "selected":
@@ -885,9 +946,13 @@ def plan_first_full_trial(
             approval_path=str(approval_path),
             target_count=0,
             discovery_scan_id=completed_scan_id,
+            minimum_selection_lead_seconds=minimum_lead_seconds,
+            minimum_selection_lead_hours=minimum_lead_seconds / 3600,
+            minimum_selection_lead_basis=minimum_lead_basis,
             message=(
-                "no strictly-future first-trial target is available; periodic metadata-only "
-                "planning may retry without changing general intraday eligibility"
+                "no strictly-future first-trial target with enough measured completion lead is "
+                "available; periodic metadata-only planning may retry without changing general "
+                "intraday eligibility"
             ),
         )
         _atomic_write_private(status_path, status.model_dump(mode="json"))
@@ -905,6 +970,9 @@ def plan_first_full_trial(
             coverage_start_utc=selection.coverage_start_utc,
             coverage_end_utc=selection.coverage_end_utc,
             discovery_scan_id=completed_scan_id,
+            minimum_selection_lead_seconds=minimum_lead_seconds,
+            minimum_selection_lead_hours=minimum_lead_seconds / 3600,
+            minimum_selection_lead_basis=minimum_lead_basis,
             message=(
                 "an approval sidecar already exists for a non-reusable plan; refusing to rotate "
                 "the manifest digest"
@@ -956,17 +1024,6 @@ def plan_first_full_trial(
             manifest,
             approval_sidecar_path=approval_path,
         )
-        write_full_ensemble_read_manifest(manifest, manifest_path)
-        os.chmod(manifest_path, 0o600)
-        archive = (
-            effective_root
-            / "manifests"
-            / "by-sha"
-            / manifest.manifest_sha256
-            / "read-manifest.json"
-        )
-        write_full_ensemble_read_manifest(manifest, archive)
-        os.chmod(archive, 0o600)
     except Exception as error:
         status = WeatherNextFirstTrialPlanStatus(
             generated_at_utc=now,
@@ -980,6 +1037,9 @@ def plan_first_full_trial(
             coverage_start_utc=selection.coverage_start_utc,
             coverage_end_utc=selection.coverage_end_utc,
             discovery_scan_id=completed_scan_id,
+            minimum_selection_lead_seconds=minimum_lead_seconds,
+            minimum_selection_lead_hours=minimum_lead_seconds / 3600,
+            minimum_selection_lead_basis=minimum_lead_basis,
             message=f"metadata-only manifest planning failed: {error}",
         )
         _atomic_write_private(status_path, status.model_dump(mode="json"))
@@ -988,10 +1048,56 @@ def plan_first_full_trial(
     duration_seconds, estimate_basis = _estimate_full_read_duration(
         compressed_bytes=manifest.approval_gate.expected_network_bytes,
         object_count=manifest.approval_gate.object_count,
-        probe_result_path=probe_result_path or effective_root / "probe-result.json",
+        probe_result_path=effective_probe_result_path,
     )
+    planned_at = datetime.now(UTC)
+    estimated_ready_at = planned_at + timedelta(seconds=duration_seconds)
+    if selection.coverage_start_utc is None or estimated_ready_at >= selection.coverage_start_utc:
+        insufficient = selection.model_copy(
+            update={
+                "state": "no_sufficient_lead_time",
+                "target_count": 0,
+                "coverage_start_utc": None,
+                "coverage_end_utc": None,
+                "targets": [],
+                "message": (
+                    "metadata confirms that the full pass would not finish before the selected "
+                    "station-local day starts; no executable manifest was published"
+                ),
+            }
+        )
+        _atomic_write_private(selection_path, insufficient.model_dump(mode="json"))
+        status = WeatherNextFirstTrialPlanStatus(
+            generated_at_utc=planned_at,
+            state="waiting_for_future_market",
+            candidate_inventory_path=str(candidates_path),
+            selection_path=str(selection_path),
+            approval_path=str(approval_path),
+            target_count=0,
+            discovery_scan_id=completed_scan_id,
+            estimated_duration_seconds=duration_seconds,
+            estimated_duration_hours=duration_seconds / 3600,
+            estimate_basis=estimate_basis,
+            minimum_selection_lead_seconds=minimum_lead_seconds,
+            minimum_selection_lead_hours=minimum_lead_seconds / 3600,
+            minimum_selection_lead_basis=minimum_lead_basis,
+            message=(
+                "no first-trial target has enough lead for a timely pre-day full pass; no "
+                "payload read, approval, or executable manifest was created"
+            ),
+        )
+        _atomic_write_private(status_path, status.model_dump(mode="json"))
+        return status
+
+    write_full_ensemble_read_manifest(manifest, manifest_path)
+    os.chmod(manifest_path, 0o600)
+    archive = (
+        effective_root / "manifests" / "by-sha" / manifest.manifest_sha256 / "read-manifest.json"
+    )
+    write_full_ensemble_read_manifest(manifest, archive)
+    os.chmod(archive, 0o600)
     status = WeatherNextFirstTrialPlanStatus(
-        generated_at_utc=now,
+        generated_at_utc=planned_at,
         state="ready_for_separate_approval",
         candidate_inventory_path=str(candidates_path),
         selection_path=str(selection_path),
@@ -1009,8 +1115,11 @@ def plan_first_full_trial(
         manifest_sha256=manifest.manifest_sha256,
         estimated_duration_seconds=duration_seconds,
         estimated_duration_hours=duration_seconds / 3600,
-        estimated_ready_at_utc_if_started_now=now + timedelta(seconds=duration_seconds),
+        estimated_ready_at_utc_if_started_now=estimated_ready_at,
         estimate_basis=estimate_basis,
+        minimum_selection_lead_seconds=minimum_lead_seconds,
+        minimum_selection_lead_hours=minimum_lead_seconds / 3600,
+        minimum_selection_lead_basis=minimum_lead_basis,
         discovery_scan_id=completed_scan_id,
         message=(
             "metadata-only first-trial manifest is frozen and ready for a separate operator "

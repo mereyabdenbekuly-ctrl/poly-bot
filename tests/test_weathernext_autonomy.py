@@ -84,6 +84,19 @@ def test_first_trial_selects_largest_common_future_window_without_banning_intrad
     assert selection.intraday_target_ids == ["EDDM"]
     assert selection.intraday_candidate_count == 1
 
+    measured_lead = select_first_full_trial_targets(
+        inventory,
+        now_utc=now,
+        minimum_lead_seconds=6 * 3600,
+        minimum_lead_basis="measured probe",
+    )
+    assert measured_lead.state == "selected"
+    assert [item.station_id for item in measured_lead.targets] == ["LIMC"]
+    assert measured_lead.coverage_start_utc == datetime(2026, 9, 16, 22, tzinfo=UTC)
+    assert measured_lead.coverage_end_utc == datetime(2026, 9, 17, 22, tzinfo=UTC)
+    assert measured_lead.minimum_lead_seconds == 6 * 3600
+    assert measured_lead.minimum_lead_basis == "measured probe"
+
 
 def test_first_trial_planner_waits_for_running_discovery_without_gcs(
     monkeypatch, tmp_path: Path
