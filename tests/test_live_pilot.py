@@ -270,6 +270,35 @@ def test_timeout_after_acceptance_is_never_retried_and_reconciles(tmp_path: Path
     assert reconciled.remote_order_id == "remote-after-timeout"
 
 
+def test_unresolved_manual_review_blocks_every_new_intent(tmp_path: Path) -> None:
+    first = intent()
+    journal = LivePilotJournal(tmp_path / "polybot.sqlite3")
+    executor = LivePilotExecutor(journal)
+    client = FakeClient()
+    client.post_error = TimeoutError("response lost")
+    with pytest.raises(LivePilotError, match="ambiguous"):
+        executor.execute_once(
+            client=client,
+            intent=first,
+            approval_path=approval(tmp_path / "first.json", first),
+            geoblocked=False,
+            now=NOW + timedelta(minutes=1),
+        )
+    client.post_error = None
+    assert executor.reconcile(client=client, intent=first).state is LiveIntentState.MANUAL_REVIEW
+
+    second = intent(event_id="event-2", market_id="market-2", book_hash="book-2")
+    with pytest.raises(LivePilotError, match="another live intent is unresolved"):
+        executor.execute_once(
+            client=client,
+            intent=second,
+            approval_path=approval(tmp_path / "second.json", second),
+            geoblocked=False,
+            now=NOW + timedelta(minutes=2),
+        )
+    assert client.post_calls == 1
+
+
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
