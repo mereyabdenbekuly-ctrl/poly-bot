@@ -696,3 +696,57 @@ def test_provider_resolves_immutable_snapshot_from_index(tmp_path: Path) -> None
     )
     assert retroactive is None
     assert retroactive_reason == "SNAPSHOT_RETROACTIVE_BLOCKED"
+
+
+def test_provider_matches_short_city_label_to_canonical_index_location(tmp_path: Path) -> None:
+    from polybot.weathernext import WeatherNextProvider, WeatherNextSnapshot
+
+    snapshot_path = tmp_path / "snapshots" / "LIMC.json"
+    snapshot = WeatherNextSnapshot(
+        init_time_utc=datetime(2026, 9, 16, 5, tzinfo=UTC),
+        received_at_utc=datetime(2026, 9, 16, 18, 53, tzinfo=UTC),
+        location="Milan, Lombardy, Italy",
+        observation_date=date(2026, 9, 17),
+        observation_timezone="Europe/Rome",
+        scenario_max_c=[25.0] * 64,
+        source_uri=(
+            "gs://weathernext3_spatial/weathernext_3_0_0/zarr/"
+            "2026_to_present/20260916_05hr_01_preds/predictions.zarr"
+        ),
+        station_id="LIMC",
+    )
+    snapshot_path.parent.mkdir(parents=True)
+    snapshot_path.write_text(snapshot.model_dump_json())
+    index_path = tmp_path / "latest-index.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "weathernext-full-snapshot-index/v1",
+                "entries": [
+                    {
+                        "target_id": "LIMC",
+                        "station_id": "LIMC",
+                        "location": "Milan, Lombardy, Italy",
+                        "observation_date": "2026-09-17",
+                        "path": str(snapshot_path),
+                    }
+                ],
+            }
+        )
+    )
+    settings = Settings(
+        database_path=tmp_path / "db.sqlite3",
+        weathernext_enabled=True,
+        weathernext_snapshot_path=None,
+        weathernext_snapshot_index_path=str(index_path),
+        weathernext_gcs_project=None,
+    )
+    provider = WeatherNextProvider(settings)
+    rules = SimpleNamespace(
+        location="Milan",
+        observation_date=date(2026, 9, 17),
+        station_or_authority="NOAA; Milan station (LIMC)",
+    )
+    resolved = provider.snapshot_for(rules)  # type: ignore[arg-type]
+    assert resolved is not None
+    assert resolved.station_id == "LIMC"

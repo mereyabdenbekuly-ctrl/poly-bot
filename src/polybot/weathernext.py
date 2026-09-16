@@ -24,6 +24,42 @@ _WEATHERNEXT_STATISTICS_MODE = "SUMMARY_ONLY"
 _STATISTICS_QUANTILES = ("mean", "p10", "p25", "p50", "p75", "p90")
 _GCS_READ_SCOPE = "https://www.googleapis.com/auth/devstorage.read_only"
 _RUN_RE = re.compile(r"(?P<date>\d{8})_(?P<hour>\d{2})hr_(?P<batch>\d{2})_preds(?:/|$)")
+_ICAO_RE = re.compile(r"(?<![a-z])([a-z]{4})(?![a-z])", re.IGNORECASE)
+
+
+def _weathernext_identity_matches(
+    requested: str,
+    indexed_location: str,
+    indexed_station: str,
+) -> bool:
+    """Match a rule location to an indexed station without inventing identity.
+
+    Market rule parsers often retain a short city label (for example,
+    ``Milan``), while the frozen manifest records the canonical geocoded name
+    (``Milan, Lombardy, Italy``).  Exact matching made a valid immutable
+    station snapshot invisible to the observer.  We permit only normalized
+    whole-phrase containment or an explicit four-letter ICAO token; a one-
+    character/empty fragment can never match.
+    """
+
+    requested_key = _identity_text(requested)
+    if not requested_key:
+        return False
+    location_key = _identity_text(indexed_location)
+    station_key = _identity_text(indexed_station)
+    if requested_key in (location_key, station_key):
+        return True
+    if len(requested_key) >= 4 and (
+        requested_key in location_key or location_key in requested_key
+    ):
+        return True
+    requested_codes = set(_ICAO_RE.findall(requested.casefold()))
+    station_codes = set(_ICAO_RE.findall(indexed_station.casefold()))
+    return bool(requested_codes & station_codes)
+
+
+def _identity_text(value: str) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", value.casefold()))
 
 
 def _format_bytes(value: int) -> str:
@@ -2870,8 +2906,14 @@ class WeatherNextProvider:
                 continue
             entry_location = str(entry.get("location") or "").casefold().strip()
             entry_station = str(entry.get("station_id") or "").casefold().strip()
-            if location_key not in {entry_location, entry_station} and (
-                not authority_key or authority_key not in {entry_location, entry_station}
+            if not (
+                _weathernext_identity_matches(location_key, entry_location, entry_station)
+                or (
+                    authority_key
+                    and _weathernext_identity_matches(
+                        authority_key, entry_location, entry_station
+                    )
+                )
             ):
                 continue
             raw_path = entry.get("path")
