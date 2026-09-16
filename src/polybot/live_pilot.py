@@ -15,6 +15,8 @@ from typing import Any, Protocol, cast
 
 PILOT_MAX_WALLET_USD = Decimal("10.00")
 PILOT_MAX_BUY_USD = Decimal("2.00")
+PILOT_MAX_BUY_NOTIONAL_USD = Decimal("1.90")
+PILOT_MAX_FEE_RATE = Decimal("0.05")
 COLLATERAL_BASE_UNITS = Decimal(1_000_000)
 APPROVAL_KIND = "polybot-live-pilot-buy-v1"
 
@@ -65,12 +67,14 @@ class LiveBuyIntent:
                 raise LivePilotError(f"{name} is required")
         if self.amount_usd <= 0:
             raise LivePilotError("amount_usd must be positive")
+        _usd_base_units_exact(self.amount_usd, field="amount_usd")
+        _usd_base_units_exact(self.max_spend_usd, field="max_spend_usd")
+        if self.amount_usd > PILOT_MAX_BUY_NOTIONAL_USD:
+            raise LivePilotError("pilot BUY notional cap is $1.90 before fees")
         if self.max_spend_usd < self.amount_usd:
             raise LivePilotError("max_spend_usd cannot be below amount_usd")
         if self.max_spend_usd > PILOT_MAX_BUY_USD:
             raise LivePilotError("pilot BUY cap is $2.00 including the signed spend")
-        _usd_base_units_exact(self.amount_usd, field="amount_usd")
-        _usd_base_units_exact(self.max_spend_usd, field="max_spend_usd")
         if not Decimal("0") < self.max_price < Decimal("1"):
             raise LivePilotError("max_price must be strictly between 0 and 1")
         if _as_utc(self.decision_created_at_utc) >= _as_utc(self.expires_at_utc):
@@ -538,7 +542,7 @@ class LivePilotExecutor:
             raise LivePilotError("pilot wallet already has an open position")
 
         market = client.get_market(id=intent.market_id)
-        _verify_market_identity(market, intent)
+        fee_rate, fee_exponent = _verify_market_identity(market, intent)
         book = client.get_order_book(token_id=intent.token_id)
         _verify_book_identity(book, intent)
 
@@ -555,6 +559,8 @@ class LivePilotExecutor:
             intent,
             balance_units=balance_units,
             allowances=balance.allowances,
+            fee_rate=fee_rate,
+            fee_exponent=fee_exponent,
         )
         signed_payload = _signed_payload(signed)
         self.journal.save_signed(intent.digest, signed_payload)
@@ -692,7 +698,9 @@ def _consume_approval(path: Path, intent_sha256: str) -> None:
     resolved.replace(used)
 
 
-def _verify_market_identity(market: Any, intent: LiveBuyIntent) -> None:
+def _verify_market_identity(
+    market: Any, intent: LiveBuyIntent
+) -> tuple[Decimal, Decimal]:
     if str(getattr(market, "id", "")) != intent.market_id:
         raise LivePilotError("market id changed")
     condition = getattr(market, "condition_id", None)
@@ -708,6 +716,18 @@ def _verify_market_identity(market: Any, intent: LiveBuyIntent) -> None:
     }
     if intent.token_id not in tokens:
         raise LivePilotError("token no longer belongs to the selected market")
+    try:
+        fee_rate = Decimal(str(market.fee_rate))
+        fee_exponent = Decimal(str(market.fee_exponent))
+    except (AttributeError, ValueError) as error:
+        raise LivePilotError("market fee metadata is unavailable") from error
+    if fee_rate < 0 or fee_exponent < 0:
+        raise LivePilotError("market fee metadata is invalid")
+    if fee_rate > PILOT_MAX_FEE_RATE:
+        raise LivePilotError("market fee rate exceeds the pilot's 5% safety bound")
+    if fee_rate > 0 and fee_exponent < 1:
+        raise LivePilotError("market fee exponent is outside the pilot safety model")
+    return fee_rate, fee_exponent
 
 
 def _verify_book_identity(book: Any, intent: LiveBuyIntent) -> None:
@@ -725,6 +745,8 @@ def _verify_signed_order(
     *,
     balance_units: int,
     allowances: Mapping[str, int],
+    fee_rate: Decimal,
+    fee_exponent: Decimal,
 ) -> None:
     if str(getattr(signed, "side", "")) != "BUY":
         raise LivePilotError("SDK signed a non-BUY order")
@@ -738,6 +760,9 @@ def _verify_signed_order(
     intent_max_units = _usd_base_units_exact(intent.max_spend_usd, field="max_spend_usd")
     if maker_amount > intent_max_units:
         raise LivePilotError("signed maker amount exceeds the approved intent maximum")
+    intent_amount_units = _usd_base_units_exact(intent.amount_usd, field="amount_usd")
+    if maker_amount > intent_amount_units:
+        raise LivePilotError("signed maker amount exceeds the approved BUY notional")
     if maker_amount > int(PILOT_MAX_BUY_USD * COLLATERAL_BASE_UNITS):
         raise LivePilotError("signed maker amount exceeds the exact $2 cap")
     if maker_amount > balance_units:
@@ -752,6 +777,15 @@ def _verify_signed_order(
     signed_price = Decimal(maker_amount) / Decimal(taker_amount)
     if signed_price > intent.max_price:
         raise LivePilotError("signed effective price exceeds the approved intent maximum")
+    # For the platform curve fee = shares * rate * (p * (1-p))**exponent.
+    # When exponent >= 1, fee/notional is bounded by rate for every p in
+    # (0, 1).  A $1.90 notional and rate <= 5% therefore remain below $2.00,
+    # including the conservative worst-case platform fee. Builder code is not
+    # accepted by this executor, so no builder fee is possible.
+    maker_usd = Decimal(maker_amount) / COLLATERAL_BASE_UNITS
+    worst_fee = Decimal(0) if fee_rate == 0 else maker_usd * fee_rate
+    if maker_usd + worst_fee > intent.max_spend_usd:
+        raise LivePilotError("signed notional plus worst-case fee exceeds the $2 pilot cap")
 
 
 def _position_is_open(position: Any) -> bool:
@@ -902,6 +936,7 @@ __all__ = [
     "LivePilotExecutor",
     "LivePilotJournal",
     "PILOT_MAX_BUY_USD",
+    "PILOT_MAX_BUY_NOTIONAL_USD",
     "PILOT_MAX_WALLET_USD",
     "load_live_approval",
 ]

@@ -110,6 +110,8 @@ class FakeClient:
             condition_id="condition-1",
             state=SimpleNamespace(accepting_orders=True),
             outcomes=outcomes,
+            fee_rate=Decimal("0.05"),
+            fee_exponent=Decimal("1"),
         )
 
     def get_order_book(self, *, token_id: str) -> Any:
@@ -180,6 +182,8 @@ def test_intent_hard_caps_cannot_be_raised() -> None:
         intent(order_type="FAK")
     with pytest.raises(LivePilotError, match="BUY"):
         intent(side="SELL")
+    with pytest.raises(LivePilotError, match=r"\$1\.90"):
+        intent(amount_usd=Decimal("1.91"))
 
 
 def test_success_is_one_shot_and_approval_is_burned(tmp_path: Path) -> None:
@@ -430,3 +434,27 @@ def test_signed_payload_cannot_exceed_exact_intent(
 def test_usd_values_must_match_collateral_precision() -> None:
     with pytest.raises(LivePilotError, match="six decimal places"):
         intent(amount_usd=Decimal("1.9000001"))
+
+
+def test_fee_metadata_must_fit_conservative_two_dollar_cap(tmp_path: Path) -> None:
+    value = intent()
+    path = approval(tmp_path / "approval.json", value)
+    client = FakeClient()
+
+    original = client.get_market
+
+    def high_fee(*, id: str) -> Any:
+        market = original(id=id)
+        market.fee_rate = Decimal("0.051")
+        return market
+
+    client.get_market = high_fee  # type: ignore[method-assign]
+    with pytest.raises(LivePilotError, match="5% safety bound"):
+        LivePilotExecutor(LivePilotJournal(tmp_path / "polybot.sqlite3")).execute_once(
+            client=client,
+            intent=value,
+            approval_path=path,
+            geoblocked=False,
+            now=NOW + timedelta(minutes=1),
+        )
+    assert client.post_calls == 0
