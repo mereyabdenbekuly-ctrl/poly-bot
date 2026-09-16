@@ -9,24 +9,34 @@ does not alter v1 decisions, paper orders, or the live executor.
 
 from __future__ import annotations
 
+import hmac
 import json
 import math
+import os
+import resource
+import shutil
 import sqlite3
+import sys
+import tempfile
 import time as monotonic_clock
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextlib import suppress
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field, field_validator
 
 from polybot.models import StrictModel, WeatherForecast
 from polybot.weathernext_manifest import (
+    WeatherNextCompressedObject,
     WeatherNextFullReadManifest,
+    WeatherNextOneBlockProbeApproval,
     WeatherNextReadApproval,
     assess_station_local_day_coverage,
     expected_station_local_day_hours,
+    validate_one_block_probe_approval,
     validate_read_approval,
     verify_manifest_sha256,
 )
@@ -34,6 +44,8 @@ from polybot.weathernext_manifest import (
 DEFAULT_ROOT = Path("/var/lib/polybot/weathernext/full")
 DEFAULT_MANIFEST_PATH = DEFAULT_ROOT / "read-manifest.json"
 DEFAULT_APPROVAL_PATH = DEFAULT_ROOT / "read-approval.json"
+DEFAULT_PROBE_APPROVAL_PATH = DEFAULT_ROOT / "probe-approval.json"
+DEFAULT_PROBE_ATTEMPT_PATH = DEFAULT_ROOT / "probe-attempt.json"
 DEFAULT_TARGETS_PATH = DEFAULT_ROOT / "targets.json"
 DEFAULT_STATUS_PATH = DEFAULT_ROOT / "refresh-status.json"
 
@@ -54,6 +66,30 @@ def _aware(value: datetime, *, field: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field} must be timezone-aware")
     return value.astimezone(UTC)
+
+
+def _process_peak_rss_bytes() -> int | None:
+    """Return process peak RSS in bytes on the supported Unix hosts."""
+
+    try:
+        value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except (AttributeError, OSError, ValueError):
+        return None
+    # Linux reports KiB; macOS reports bytes.  The probe runs on Linux VPS,
+    # but retaining the branch keeps local diagnostics truthful.
+    return value if sys.platform == "darwin" else value * 1024
+
+
+def _available_memory_bytes() -> int | None:
+    """Return Linux MemAvailable when present; otherwise leave the gate unknown."""
+
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024
+    except (FileNotFoundError, IndexError, OSError, ValueError):
+        return None
+    return None
 
 
 class WeatherNextRefreshTarget(StrictModel):
@@ -169,6 +205,36 @@ class WeatherNextSequentialReadResult(StrictModel):
     elapsed_seconds: float | None = Field(default=None, ge=0)
     decoded_shape: list[int] = Field(default_factory=list)
     decoded_bytes: int = Field(default=0, ge=0)
+    object_uri: str | None = None
+    compressed_bytes: int = Field(default=0, ge=0)
+    download_seconds: float | None = Field(default=None, ge=0)
+    decode_seconds: float | None = Field(default=None, ge=0)
+    peak_memory_bytes: int | None = Field(default=None, ge=0)
+    temporary_path: str | None = None
+    temporary_bytes: int = Field(default=0, ge=0)
+    temporary_retained: bool = False
+    extracted_values: list[dict[str, object]] = Field(default_factory=list)
+
+
+class WeatherNextProbeApprovalResult(StrictModel):
+    """Local-only result of validating the one-object probe sidecar."""
+
+    state: Literal[
+        "missing",
+        "invalid",
+        "manifest_mismatch",
+        "object_mismatch",
+        "limit_mismatch",
+        "expired",
+        "consumed",
+        "approved",
+    ]
+    payload_read_permitted: bool = False
+    manifest_sha256: str | None = None
+    object_uri: str | None = None
+    object_compressed_bytes: int = 0
+    max_network_bytes: int = 0
+    message: str
 
 
 def _atomic_write(path: Path, payload: Mapping[str, object]) -> Path:
@@ -181,6 +247,103 @@ def _atomic_write(path: Path, payload: Mapping[str, object]) -> Path:
     )
     temporary.replace(path)
     return path
+
+
+def _atomic_write_private(path: Path, payload: Mapping[str, object]) -> Path:
+    """Atomically write an operator/audit sidecar with owner-only permissions."""
+
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, default=str)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return path
+
+
+def _claim_probe_attempt(
+    path: Path,
+    *,
+    manifest_sha256: str,
+    object_uri: str,
+    object_compressed_bytes: int,
+    max_network_bytes: int,
+) -> datetime:
+    """Consume the one-shot probe authorization before the payload request."""
+
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    started_at = datetime.now(UTC)
+    payload = {
+        "schema_version": "weathernext-one-block-probe-attempt/v1",
+        "state": "started",
+        "started_at_utc": started_at.isoformat(),
+        "manifest_sha256": manifest_sha256,
+        "object_uri": object_uri,
+        "object_compressed_bytes": object_compressed_bytes,
+        "max_network_bytes": max_network_bytes,
+        "actual_payload_bytes": 0,
+    }
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except FileExistsError as error:
+        raise RuntimeError(
+            "one-block probe authorization was already consumed; replay is blocked"
+        ) from error
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+    return started_at
+
+
+def _finish_probe_attempt(
+    path: Path,
+    *,
+    state: Literal["completed", "failed"],
+    actual_payload_bytes: int,
+    error_type: str | None = None,
+) -> None:
+    """Finalize the persistent one-shot receipt without making it reusable."""
+
+    path = path.expanduser()
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        raw = {
+            "schema_version": "weathernext-one-block-probe-attempt/v1",
+        }
+    payload: dict[str, object] = dict(raw) if isinstance(raw, Mapping) else {}
+    payload.update(
+        {
+            "state": state,
+            "finished_at_utc": datetime.now(UTC).isoformat(),
+            "actual_payload_bytes": actual_payload_bytes,
+        }
+    )
+    if error_type is not None:
+        payload["error_type"] = error_type
+    _atomic_write_private(path, payload)
 
 
 def _day_end_utc(observation_date: date, timezone_name: str) -> datetime:
@@ -429,6 +592,146 @@ def verify_read_approval(
     )
 
 
+def verify_one_block_probe_approval(
+    manifest_path: Path = DEFAULT_MANIFEST_PATH,
+    approval_path: Path = DEFAULT_PROBE_APPROVAL_PATH,
+    *,
+    expected_manifest_sha256: str | None = None,
+    expected_object_uri: str | None = None,
+    expected_object_compressed_bytes: int | None = None,
+    expected_max_network_bytes: int | None = None,
+    expected_max_object_bytes: int | None = None,
+    attempt_path: Path = DEFAULT_PROBE_ATTEMPT_PATH,
+    now_utc: datetime | None = None,
+) -> WeatherNextProbeApprovalResult:
+    """Verify a probe sidecar without consulting or changing full-read approval.
+
+    This function performs only local file reads.  In particular, no GCS
+    client is constructed until the caller receives ``state=approved``.
+    """
+
+    manifest_path = manifest_path.expanduser()
+    approval_path = approval_path.expanduser()
+    try:
+        manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return WeatherNextProbeApprovalResult(
+            state="missing",
+            message="metadata manifest is not present; one-block probe remains blocked",
+        )
+    except Exception as error:
+        return WeatherNextProbeApprovalResult(
+            state="invalid", message=f"manifest is unreadable: {error}"
+        )
+    if not isinstance(manifest_payload, Mapping):
+        return WeatherNextProbeApprovalResult(
+            state="invalid", message="manifest root is not an object"
+        )
+    manifest_digest = str(manifest_payload.get("manifest_sha256") or "")
+    if expected_manifest_sha256 and not hmac.compare_digest(
+        manifest_digest, expected_manifest_sha256
+    ):
+        return WeatherNextProbeApprovalResult(
+            state="manifest_mismatch",
+            manifest_sha256=manifest_digest or None,
+            message="current manifest does not match the requested probe digest",
+        )
+    if attempt_path.expanduser().exists():
+        return WeatherNextProbeApprovalResult(
+            state="consumed",
+            manifest_sha256=manifest_digest or None,
+            message="one-block probe authorization was already consumed; replay is blocked",
+        )
+    try:
+        approval_payload = json.loads(approval_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return WeatherNextProbeApprovalResult(
+            state="missing",
+            manifest_sha256=manifest_digest or None,
+            message="one-block probe approval sidecar is absent; probe remains blocked",
+        )
+    except Exception as error:
+        return WeatherNextProbeApprovalResult(
+            state="invalid",
+            manifest_sha256=manifest_digest or None,
+            message=f"probe approval is unreadable: {error}",
+        )
+    try:
+        manifest = WeatherNextFullReadManifest.model_validate(manifest_payload)
+        approval = WeatherNextOneBlockProbeApproval.model_validate(approval_payload)
+        validate_one_block_probe_approval(
+            manifest,
+            approval,
+            expected_manifest_sha256=expected_manifest_sha256,
+            expected_object_uri=expected_object_uri,
+            expected_object_compressed_bytes=expected_object_compressed_bytes,
+            expected_max_network_bytes=expected_max_network_bytes,
+            expected_max_object_bytes=expected_max_object_bytes,
+            now_utc=now_utc,
+        )
+    except Exception as error:
+        message = str(error)
+        lowered = message.casefold()
+        if "expired" in lowered:
+            state: Literal[
+                "missing",
+                "invalid",
+                "manifest_mismatch",
+                "object_mismatch",
+                "limit_mismatch",
+                "expired",
+                "consumed",
+                "approved",
+            ] = "expired"
+        elif "object uri" in lowered or "compressed size" in lowered:
+            state = "object_mismatch"
+        elif "manifest" in lowered or "digest" in lowered:
+            state = "manifest_mismatch"
+        else:
+            state = "limit_mismatch"
+        raw_object_uri = (
+            approval_payload.get("object_uri")
+            if isinstance(approval_payload, Mapping)
+            else None
+        )
+        raw_object_bytes = (
+            approval_payload.get("object_compressed_bytes")
+            if isinstance(approval_payload, Mapping)
+            else None
+        )
+        raw_max_network = (
+            approval_payload.get("max_network_bytes")
+            if isinstance(approval_payload, Mapping)
+            else None
+        )
+        return WeatherNextProbeApprovalResult(
+            state=state,
+            manifest_sha256=manifest_digest or None,
+            object_uri=str(raw_object_uri) if raw_object_uri is not None else None,
+            object_compressed_bytes=(
+                int(raw_object_bytes)
+                if isinstance(raw_object_bytes, (int, float, str))
+                and str(raw_object_bytes).isdigit()
+                else 0
+            ),
+            max_network_bytes=(
+                int(raw_max_network)
+                if isinstance(raw_max_network, (int, float, str)) and str(raw_max_network).isdigit()
+                else 0
+            ),
+            message=f"one-block probe approval is not valid: {message}",
+        )
+    return WeatherNextProbeApprovalResult(
+        state="approved",
+        payload_read_permitted=True,
+        manifest_sha256=manifest.manifest_sha256,
+        object_uri=approval.object_uri,
+        object_compressed_bytes=approval.object_compressed_bytes,
+        max_network_bytes=approval.max_network_bytes,
+        message="one-block probe approval matches the immutable manifest object and limits",
+    )
+
+
 def _load_approved_manifest(
     manifest_path: Path, approval_path: Path
 ) -> tuple[WeatherNextFullReadManifest, WeatherNextReadApproval, WeatherNextApprovalResult]:
@@ -441,6 +744,42 @@ def _load_approved_manifest(
     approval_payload = json.loads(approval_path.expanduser().read_text(encoding="utf-8"))
     manifest = WeatherNextFullReadManifest.model_validate(payload)
     approval = WeatherNextReadApproval.model_validate(approval_payload)
+    return manifest, approval, result
+
+
+def _load_probe_approved_manifest(
+    manifest_path: Path,
+    approval_path: Path,
+    *,
+    expected_manifest_sha256: str,
+    expected_object_uri: str,
+    expected_object_compressed_bytes: int,
+    expected_max_network_bytes: int,
+    expected_max_object_bytes: int,
+    attempt_path: Path,
+) -> tuple[
+    WeatherNextFullReadManifest,
+    WeatherNextOneBlockProbeApproval,
+    WeatherNextProbeApprovalResult,
+]:
+    """Load the exact object only after the narrow local probe gate succeeds."""
+
+    result = verify_one_block_probe_approval(
+        manifest_path,
+        approval_path,
+        expected_manifest_sha256=expected_manifest_sha256,
+        expected_object_uri=expected_object_uri,
+        expected_object_compressed_bytes=expected_object_compressed_bytes,
+        expected_max_network_bytes=expected_max_network_bytes,
+        expected_max_object_bytes=expected_max_object_bytes,
+        attempt_path=attempt_path,
+    )
+    if result.state != "approved":
+        raise RuntimeError(result.message)
+    manifest_payload = json.loads(manifest_path.expanduser().read_text(encoding="utf-8"))
+    approval_payload = json.loads(approval_path.expanduser().read_text(encoding="utf-8"))
+    manifest = WeatherNextFullReadManifest.model_validate(manifest_payload)
+    approval = WeatherNextOneBlockProbeApproval.model_validate(approval_payload)
     return manifest, approval, result
 
 
@@ -675,6 +1014,107 @@ def _target_member_accumulators(
     return member_ids, valid_times, values
 
 
+def _extract_probe_values(
+    *,
+    chunk: object,
+    item: WeatherNextCompressedObject,
+    target_map: Mapping[str, Mapping[str, object]],
+    dimensions: Sequence[str],
+    array_shape: Sequence[int],
+    chunk_shape: Sequence[int],
+    source_units: str,
+) -> list[dict[str, object]]:
+    """Extract only real station/member values that fall inside one probe block."""
+
+    import numpy as np
+
+    values = np.asarray(chunk)
+    chunk_coordinates = list(item.chunk_coordinates)
+    chunk_starts = [
+        int(coordinate) * int(chunk_shape[position])
+        for position, coordinate in enumerate(chunk_coordinates)
+    ]
+    target_ids = [str(value) for value in item.target_ids]
+    output: list[dict[str, object]] = []
+    for target_id in target_ids:
+        target = target_map.get(target_id)
+        if target is None:
+            raise RuntimeError(f"Manifest object references unknown target {target_id}")
+        target_dimensions, valid_records = _manifest_target_selection(target)
+        if list(target_dimensions) != list(dimensions):
+            raise RuntimeError(f"Target {target_id} dimensions do not match manifest array")
+        raw_selection = target.get("selection")
+        selection = (
+            cast(Mapping[str, object], raw_selection)
+            if isinstance(raw_selection, Mapping)
+            else {}
+        )
+        lat_index = int(cast(int | str, selection["latitude_index"]))
+        lon_index = int(cast(int | str, selection["longitude_index"]))
+        for record in valid_records:
+            global_indices: dict[str, int] = {
+                "sample": 0,
+                "lead_time": int(cast(int | str, record["lead_time_index"])),
+                "lat_0p05": lat_index,
+                "latitude": lat_index,
+                "lat": lat_index,
+                "lon_0p05": lon_index,
+                "longitude": lon_index,
+                "lon": lon_index,
+            }
+            if "lead_subtime_index" in record:
+                global_indices["lead_subtime"] = int(
+                    cast(int | str, record["lead_subtime_index"])
+                )
+            member_values: list[dict[str, object]] = []
+            for member_index in range(64):
+                global_indices["sample"] = member_index
+                local_indices: list[int] = []
+                for position, dimension in enumerate(dimensions):
+                    if dimension not in global_indices:
+                        if int(array_shape[position]) != 1:
+                            raise RuntimeError(
+                                f"Target {target_id} leaves dimension {dimension} unspecified"
+                            )
+                        global_index = 0
+                    else:
+                        global_index = global_indices[dimension]
+                    local_index = global_index - chunk_starts[position]
+                    if local_index < 0 or local_index >= values.shape[position]:
+                        break
+                    local_indices.append(local_index)
+                else:
+                    raw_value = float(values[tuple(local_indices)])
+                    if not math.isfinite(raw_value):
+                        raise RuntimeError(f"Target {target_id} has a missing probe value")
+                    member_values.append(
+                        {
+                            "member_id": f"member-{member_index:03d}",
+                            "value": (
+                                raw_value - 273.15
+                                if source_units.casefold() in {"k", "kelvin"}
+                                else raw_value
+                            ),
+                        }
+                    )
+            if member_values:
+                output.append(
+                    {
+                        "target_id": target_id,
+                        "valid_time_utc": _parse_utc(
+                            record.get("valid_time_utc", ""), field="valid_time_utc"
+                        ).isoformat(),
+                        "units": (
+                            "C"
+                            if source_units.casefold() in {"k", "kelvin"}
+                            else source_units
+                        ),
+                        "members": member_values,
+                    }
+                )
+    return output
+
+
 def _reusable_snapshot_paths(
     manifest: WeatherNextFullReadManifest,
     *,
@@ -825,6 +1265,128 @@ def _update_snapshot_index(
     )
 
 
+def _download_probe_object_once(
+    client: object,
+    *,
+    item: WeatherNextCompressedObject,
+    approval: WeatherNextOneBlockProbeApproval,
+    temporary_root: Path,
+    attempt_path: Path,
+) -> tuple[Path, int, float]:
+    """Download the exact approved object once, with retries disabled.
+
+    The returned file must be deleted by the caller.  There is intentionally
+    no loop or retry callback in this function: a failed/partial attempt ends
+    the probe and requires a new explicit operator decision.
+    """
+
+    if item.object_uri != approval.object_uri:
+        raise RuntimeError("probe reader selected an object not named in the approval")
+    if item.compressed_bytes is None:
+        raise RuntimeError("probe object has no compressed size")
+    if item.compressed_bytes != approval.object_compressed_bytes:
+        raise RuntimeError("probe object size differs from the approved manifest size")
+    if item.compressed_bytes > approval.max_network_bytes:
+        raise RuntimeError("probe object exceeds the cumulative payload budget")
+    if approval.max_objects != 1 or approval.max_attempts != 1:
+        raise RuntimeError("probe must remain limited to one object and one attempt")
+
+    root = temporary_root.expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(root, 0o700)
+    free_bytes = shutil.disk_usage(root).free
+    if free_bytes < item.compressed_bytes:
+        raise RuntimeError(
+            "insufficient temporary disk space for the approved WeatherNext object"
+        )
+    available_memory = _available_memory_bytes()
+    uncompressed_bound = int(item.uncompressed_upper_bound_bytes or 0)
+    conservative_memory_need = (
+        item.compressed_bytes * 2 + uncompressed_bound + 256 * 1024 * 1024
+    )
+    if available_memory is not None and available_memory < conservative_memory_need:
+        raise RuntimeError(
+            "insufficient available memory for single-shot download and bounded decode"
+        )
+
+    bucket = getattr(client, "_bucket", None)
+    bucket_name = str(getattr(client, "bucket_name", ""))
+    if bucket is None or not bucket_name:
+        raise RuntimeError("WeatherNext client does not expose its requester-pays bucket")
+    blob = bucket.blob(_object_key(item.object_uri, bucket_name))
+    blob.reload(retry=None)
+    actual_size = getattr(blob, "size", None)
+    if actual_size is None or int(actual_size) != item.compressed_bytes:
+        raise RuntimeError(f"WeatherNext object size changed: {item.object_uri}")
+    for field in ("generation", "etag", "md5_hash", "crc32c"):
+        expected = getattr(item, field, None)
+        actual = getattr(blob, field, None)
+        if expected is not None and (actual is None or str(expected) != str(actual)):
+            raise RuntimeError(f"WeatherNext object metadata changed: {item.object_uri}")
+
+    temporary_descriptor, temporary_name = tempfile.mkstemp(
+        prefix="weathernext-probe-",
+        suffix=".zarr-chunk",
+        dir=root,
+    )
+    temporary = os.fdopen(temporary_descriptor, "w+b")
+    temporary_path = Path(temporary_name)
+    os.chmod(temporary_path, 0o600)
+    claimed = False
+    try:
+        _claim_probe_attempt(
+            attempt_path,
+            manifest_sha256=approval.manifest_sha256,
+            object_uri=approval.object_uri,
+            object_compressed_bytes=approval.object_compressed_bytes,
+            max_network_bytes=approval.max_network_bytes,
+        )
+        claimed = True
+        started = monotonic_clock.monotonic()
+        generation = getattr(blob, "generation", None)
+        download_kwargs: dict[str, object] = {
+            "raw_download": True,
+            "retry": None,
+            "single_shot_download": True,
+            "checksum": "auto",
+        }
+        if generation is not None:
+            try:
+                download_kwargs["if_generation_match"] = int(generation)
+            except (TypeError, ValueError):
+                raise RuntimeError("WeatherNext object generation is not an integer") from None
+        blob.download_to_file(temporary, **download_kwargs)
+        temporary.flush()
+        os.fsync(temporary.fileno())
+        temporary.close()
+        elapsed = monotonic_clock.monotonic() - started
+        downloaded_bytes = temporary_path.stat().st_size
+        if downloaded_bytes != item.compressed_bytes:
+            raise RuntimeError(
+                "one-block probe downloaded a different byte count than the manifest"
+            )
+        if downloaded_bytes > approval.max_network_bytes:
+            raise RuntimeError("one-block probe exceeded the cumulative payload limit")
+        return temporary_path, downloaded_bytes, elapsed
+    except Exception as error:
+        if not temporary.closed:
+            temporary.close()
+        actual_bytes = temporary_path.stat().st_size if temporary_path.exists() else 0
+        temporary_path.unlink(missing_ok=True)
+        if claimed:
+            with suppress(Exception):
+                _finish_probe_attempt(
+                    attempt_path,
+                    state="failed",
+                    actual_payload_bytes=actual_bytes,
+                    error_type=type(error).__name__,
+                )
+        raise
+    finally:
+        if not temporary.closed:
+            temporary.close()
+
+
 def read_approved_manifest_sequentially(
     settings: object,
     *,
@@ -833,6 +1395,14 @@ def read_approved_manifest_sequentially(
     index_path: Path = DEFAULT_ROOT / "latest-index.json",
     snapshot_root: Path = DEFAULT_ROOT / "snapshots",
     probe_only: bool = False,
+    probe_approval_path: Path = DEFAULT_PROBE_APPROVAL_PATH,
+    probe_attempt_path: Path = DEFAULT_PROBE_ATTEMPT_PATH,
+    expected_probe_manifest_sha256: str | None = None,
+    expected_probe_object_uri: str | None = None,
+    expected_probe_object_compressed_bytes: int | None = None,
+    expected_probe_max_network_bytes: int | None = None,
+    expected_probe_max_object_bytes: int | None = None,
+    probe_temporary_root: Path | None = None,
 ) -> WeatherNextSequentialReadResult:
     """Read an approved manifest one compressed object at a time.
 
@@ -851,14 +1421,54 @@ def read_approved_manifest_sequentially(
 
     if not isinstance(settings, Settings):
         raise TypeError("settings must be a polybot.config.Settings instance")
-    manifest, approval, approval_result = _load_approved_manifest(manifest_path, approval_path)
-    coverage_complete, incomplete_target_ids, _mixed_dates = _manifest_coverage_summary(manifest)
-    if not coverage_complete:
-        targets = ", ".join(incomplete_target_ids) or "unknown target"
-        raise RuntimeError(
-            "WeatherNext payload read blocked: incomplete station-local-day coverage for "
-            f"{targets}; no hours are synthesized"
+    probe_approval: WeatherNextOneBlockProbeApproval | None = None
+    if probe_only:
+        required_probe_values = {
+            "manifest SHA-256": expected_probe_manifest_sha256,
+            "object URI": expected_probe_object_uri,
+            "object compressed bytes": expected_probe_object_compressed_bytes,
+            "cumulative payload limit": expected_probe_max_network_bytes,
+            "object-size limit": expected_probe_max_object_bytes,
+        }
+        missing_probe_values = [
+            name for name, value in required_probe_values.items() if value is None
+        ]
+        if missing_probe_values:
+            raise RuntimeError(
+                "one-block probe requires explicit expected "
+                + ", ".join(missing_probe_values)
+            )
+        manifest, probe_approval, probe_approval_result = _load_probe_approved_manifest(
+            manifest_path,
+            probe_approval_path,
+            expected_manifest_sha256=cast(str, expected_probe_manifest_sha256),
+            expected_object_uri=cast(str, expected_probe_object_uri),
+            expected_object_compressed_bytes=cast(
+                int, expected_probe_object_compressed_bytes
+            ),
+            expected_max_network_bytes=cast(int, expected_probe_max_network_bytes),
+            expected_max_object_bytes=cast(int, expected_probe_max_object_bytes),
+            attempt_path=probe_attempt_path,
         )
+        approval: WeatherNextReadApproval | WeatherNextOneBlockProbeApproval = probe_approval
+        approval_result: WeatherNextApprovalResult | WeatherNextProbeApprovalResult = (
+            probe_approval_result
+        )
+    else:
+        manifest, full_approval, full_approval_result = _load_approved_manifest(
+            manifest_path, approval_path
+        )
+        approval = full_approval
+        approval_result = full_approval_result
+        coverage_complete, incomplete_target_ids, _mixed_dates = _manifest_coverage_summary(
+            manifest
+        )
+        if not coverage_complete:
+            targets = ", ".join(incomplete_target_ids) or "unknown target"
+            raise RuntimeError(
+                "WeatherNext payload read blocked: incomplete station-local-day coverage for "
+                f"{targets}; no hours are synthesized"
+            )
     if manifest.payload_read or manifest.approval_gate.payload_read_permitted:
         raise RuntimeError("manifest must remain immutable and payload_read=false")
     if manifest.approval_gate.sharding_supported is not True:
@@ -867,7 +1477,7 @@ def read_approved_manifest_sequentially(
     # A successful pass is immutable and reusable.  Do this local validation
     # before opening the GCS group so an hourly timer never re-downloads an
     # unchanged release merely because the approval sidecar is still valid.
-    if index_path.expanduser().is_file():
+    if not probe_only and index_path.expanduser().is_file():
         reused = _reusable_snapshot_paths(manifest, snapshot_root=snapshot_root)
         if reused is not None:
             return WeatherNextSequentialReadResult(
@@ -888,8 +1498,45 @@ def read_approved_manifest_sequentially(
     started = monotonic_clock.monotonic()
     client = WeatherNextGcsClient(settings)
     store_prefix = _source_prefix(manifest.source_uri, client.bucket_name)
-    group = client.open_sequential_zarr_group(store_prefix)
+    probe_item: WeatherNextCompressedObject | None = None
+    probe_path: Path | None = None
+    probe_bytes = 0
+    probe_download_seconds: float | None = None
+    group: Any | None = None
     try:
+        if probe_only:
+            if probe_approval is None:
+                raise RuntimeError("one-block probe approval was not loaded")
+            matches = [
+                item
+                for item in manifest.compressed_objects
+                if item.object_uri == probe_approval.object_uri
+            ]
+            if len(matches) != 1:
+                raise RuntimeError("probe approval does not name exactly one manifest object")
+            probe_item = matches[0]
+            temporary_root = (
+                probe_temporary_root
+                if probe_temporary_root is not None
+                else manifest_path.expanduser().parent / "probe-tmp"
+            )
+            probe_path, probe_bytes, probe_download_seconds = _download_probe_object_once(
+                client,
+                item=probe_item,
+                approval=probe_approval,
+                temporary_root=temporary_root,
+                attempt_path=probe_attempt_path,
+            )
+            group = client.open_sequential_zarr_group_from_local_object(
+                store_prefix,
+                object_key=_object_key(probe_item.object_uri, client.bucket_name),
+                object_path=probe_path,
+                array_key=manifest.variable,
+            )
+        else:
+            group = client.open_sequential_zarr_group(store_prefix)
+        if group is None:
+            raise RuntimeError("WeatherNext Zarr group did not open")
         array = group[manifest.variable]
         raw_dimensions = manifest.array.get("dimensions", [])
         dimensions = (
@@ -921,13 +1568,23 @@ def read_approved_manifest_sequentially(
         }
         if not target_map:
             raise RuntimeError("WeatherNext manifest has no target payloads")
-        accumulators: dict[str, tuple[list[str], list[str], dict[str, dict[str, float]]]] = {
-            target_id: _target_member_accumulators(target)
-            for target_id, target in target_map.items()
-        }
+        accumulators: dict[str, tuple[list[str], list[str], dict[str, dict[str, float]]]] = {}
+        if not probe_only:
+            accumulators = {
+                target_id: _target_member_accumulators(target)
+                for target_id, target in target_map.items()
+            }
+        # The probe object was already downloaded exactly once to the local
+        # file.  Start the loop counter at zero so its manifest size is
+        # checked once rather than being double-counted against the budget.
         bytes_read = 0
         object_count = 0
-        for item in sorted(manifest.compressed_objects, key=lambda value: value.sequence):
+        objects_to_read = (
+            [probe_item]
+            if probe_only and probe_item is not None
+            else sorted(manifest.compressed_objects, key=lambda value: value.sequence)
+        )
+        for item in objects_to_read:
             if object_count >= approval.max_objects:
                 raise RuntimeError("WeatherNext read stopped before approved object limit")
             if item.compressed_bytes is None:
@@ -938,18 +1595,21 @@ def read_approved_manifest_sequentially(
                 )
             if bytes_read + item.compressed_bytes > approval.max_network_bytes:
                 raise RuntimeError("WeatherNext read stopped before approved network limit")
-            blob = client._bucket.blob(  # type: ignore[attr-defined]
-                _object_key(item.object_uri, client.bucket_name)
-            )
-            blob.reload()
-            actual_size = getattr(blob, "size", None)
-            if actual_size is None or int(actual_size) != item.compressed_bytes:
-                raise RuntimeError(f"WeatherNext object size changed: {item.object_uri}")
-            for field in ("generation", "etag", "md5_hash", "crc32c"):
-                expected = getattr(item, field, None)
-                actual = getattr(blob, field, None)
-                if expected is not None and (actual is None or str(expected) != str(actual)):
-                    raise RuntimeError(f"WeatherNext object metadata changed: {item.object_uri}")
+            if not probe_only:
+                blob = client._bucket.blob(  # type: ignore[attr-defined]
+                    _object_key(item.object_uri, client.bucket_name)
+                )
+                blob.reload()
+                actual_size = getattr(blob, "size", None)
+                if actual_size is None or int(actual_size) != item.compressed_bytes:
+                    raise RuntimeError(f"WeatherNext object size changed: {item.object_uri}")
+                for field in ("generation", "etag", "md5_hash", "crc32c"):
+                    expected = getattr(item, field, None)
+                    actual = getattr(blob, field, None)
+                    if expected is not None and (actual is None or str(expected) != str(actual)):
+                        raise RuntimeError(
+                            f"WeatherNext object metadata changed: {item.object_uri}"
+                        )
 
             # Exact chunk boundaries make this one payload GET.  No global
             # array selection is used, and ``chunk`` is released each loop.
@@ -975,16 +1635,25 @@ def read_approved_manifest_sequentially(
                     f"{item.object_uri}"
                 )
             if probe_only:
-                compressed_bytes = int(item.compressed_bytes)
                 decoded_shape = [int(value) for value in chunk.shape]
                 decoded_bytes = int(chunk.nbytes)
+                extracted_values = _extract_probe_values(
+                    chunk=chunk,
+                    item=item,
+                    target_map=target_map,
+                    dimensions=dimensions,
+                    array_shape=array_shape,
+                    chunk_shape=chunk_shape,
+                    source_units=source_units,
+                )
+                peak_memory_bytes = _process_peak_rss_bytes()
                 del chunk
-                return WeatherNextSequentialReadResult(
+                result = WeatherNextSequentialReadResult(
                     payload_read=True,
                     manifest_sha256=manifest.manifest_sha256,
                     snapshots_written=0,
                     snapshot_paths=[],
-                    bytes_read=compressed_bytes,
+                    bytes_read=probe_bytes,
                     object_count=1,
                     message=(
                         "WeatherNext one-block probe completed; no snapshot was published. "
@@ -994,7 +1663,22 @@ def read_approved_manifest_sequentially(
                     elapsed_seconds=monotonic_clock.monotonic() - started,
                     decoded_shape=decoded_shape,
                     decoded_bytes=decoded_bytes,
+                    object_uri=item.object_uri,
+                    compressed_bytes=probe_bytes,
+                    download_seconds=probe_download_seconds,
+                    decode_seconds=decode_elapsed,
+                    peak_memory_bytes=peak_memory_bytes,
+                    temporary_path=str(probe_path) if probe_path is not None else None,
+                    temporary_bytes=probe_bytes,
+                    temporary_retained=False,
+                    extracted_values=extracted_values,
                 )
+                _finish_probe_attempt(
+                    probe_attempt_path,
+                    state="completed",
+                    actual_payload_bytes=probe_bytes,
+                )
+                return result
             chunk_starts = [int(value.start) for value in selection]
             for target_id in item.target_ids:
                 if target_id not in target_map:
@@ -1059,10 +1743,23 @@ def read_approved_manifest_sequentially(
             bytes_read += item.compressed_bytes
             object_count += 1
             del chunk
+    except Exception as error:
+        if probe_path is not None:
+            with suppress(Exception):
+                _finish_probe_attempt(
+                    probe_attempt_path,
+                    state="failed",
+                    actual_payload_bytes=probe_bytes,
+                    error_type=type(error).__name__,
+                )
+        raise
     finally:
-        close = getattr(group, "close", None)
-        if callable(close):
-            close()
+        if group is not None:
+            close = getattr(group, "close", None)
+            if callable(close):
+                close()
+        if probe_path is not None:
+            probe_path.unlink(missing_ok=True)
 
     now = datetime.now(UTC)
     snapshot_paths: list[str] = []
@@ -1371,6 +2068,8 @@ def autonomous_refresh_preflight(
 __all__ = [
     "DEFAULT_APPROVAL_PATH",
     "DEFAULT_MANIFEST_PATH",
+    "DEFAULT_PROBE_APPROVAL_PATH",
+    "DEFAULT_PROBE_ATTEMPT_PATH",
     "DEFAULT_ROOT",
     "DEFAULT_STATUS_PATH",
     "DEFAULT_TARGETS_PATH",
@@ -1383,6 +2082,7 @@ __all__ = [
     "autonomous_refresh_preflight",
     "derive_refresh_targets",
     "read_approved_manifest_sequentially",
+    "verify_one_block_probe_approval",
     "verify_read_approval",
     "write_refresh_status",
 ]

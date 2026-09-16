@@ -170,6 +170,82 @@ def test_scanner_records_missing_snapshot_as_explicit_filter(tmp_path) -> None:
     assert decision["action"] == "SKIP"
 
 
+def test_scanner_records_retroactive_snapshot_as_distinct_filter(tmp_path) -> None:
+    storage = Storage(tmp_path / "retroactive.sqlite3")
+    run_id = storage.start_scan(query="weather", mode="paper")
+    now = datetime.now(UTC)
+    market = MarketSnapshot(
+        event_id="event-wn",
+        event_slug="event-wn",
+        event_title="WeatherNext test",
+        market_id="market-wn",
+        market_slug="market-wn",
+        market_question="Will it be 20C?",
+        outcome_label="20C",
+        asset_id="asset-wn",
+        token_id="token-wn",
+        condition_id="condition-wn",
+        outcome=OutcomeSide.YES,
+        end_date=None,
+        accepting_orders=True,
+        book_timestamp=now,
+        book_hash="book-wn",
+        bids=[],
+        asks=[BookLevel(price=Decimal("0.20"), size=Decimal("5"))],
+        min_order_size=Decimal("5"),
+        tick_size=Decimal("0.01"),
+        fee_rate=Decimal(0),
+        fee_exponent=Decimal(0),
+        fee_taker_only=False,
+    )
+    event = EventDefinition(
+        id="event-wn",
+        slug="event-wn",
+        title="WeatherNext test",
+        description="",
+        observation_date=None,
+        markets=[
+            MarketDefinition(
+                id="market-wn",
+                slug="market-wn",
+                question="Will it be 20C?",
+                group_item_title="20C",
+                asset_id="asset-wn",
+                condition_id="condition-wn",
+                end_date=None,
+                accepting_orders=True,
+                fee_rate=Decimal(0),
+                fee_exponent=Decimal(0),
+                fee_taker_only=False,
+            )
+        ],
+    )
+    scanner = Scanner.__new__(Scanner)
+    scanner.settings = Settings(weathernext_paper_enabled=True)
+    scanner.storage = storage
+    opened, recorded, errors = scanner._run_weathernext_paper_strategy(  # noqa: SLF001
+        run_id=run_id,
+        event=event,
+        comparison=None,
+        snapshot_reason_code="SNAPSHOT_RETROACTIVE_BLOCKED",
+        brackets={"market-wn": Bracket(
+            market_id="market-wn", label="20C", lower=20, upper=21
+        )},
+        probabilities={},
+        market_snapshots={"market-wn": market},
+        event_blockers=[],
+        event_warnings=[],
+        paper=True,
+        allow_open=True,
+    )
+    assert opened == 0
+    assert recorded == 1
+    assert errors == []
+    decision = storage.weathernext_paper_summary()["recent_decisions"][0]
+    assert "SNAPSHOT_RETROACTIVE_BLOCKED" in decision["reason_codes"]
+    assert "SNAPSHOT_UNAVAILABLE" not in decision["reason_codes"]
+
+
 def test_scanner_opens_only_isolated_weathernext_position_when_snapshot_exists(tmp_path) -> None:
     storage = Storage(tmp_path / "available.sqlite3")
     run_id = storage.start_scan(query="weather", mode="paper")

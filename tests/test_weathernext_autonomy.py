@@ -4,15 +4,19 @@ import json
 from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import numpy as np
+import pytest
 
 from polybot.config import Settings
+from polybot.models import RuleInterpretation
 from polybot.storage import Storage
 from polybot.weathernext_autonomy import (
     autonomous_refresh_preflight,
     derive_refresh_targets,
     read_approved_manifest_sequentially,
+    verify_one_block_probe_approval,
     verify_read_approval,
 )
 from polybot.weathernext_manifest import (
@@ -123,9 +127,17 @@ class _Blob:
     etag = None
     md5_hash = None
     crc32c = None
+    download_count = 0
 
-    def reload(self) -> None:
+    def reload(self, retry: object | None = None) -> None:
+        assert retry is None
         return None
+
+    def download_to_file(self, handle: object, **kwargs: object) -> None:
+        assert kwargs["retry"] is None
+        assert kwargs["single_shot_download"] is True
+        type(self).download_count += 1
+        handle.write(b"x" * self.size)  # type: ignore[attr-defined]
 
 
 class _Bucket:
@@ -162,6 +174,19 @@ class _Client:
         self._bucket = _Bucket()
 
     def open_sequential_zarr_group(self, _prefix: str) -> _Group:
+        return _Group()
+
+    def open_sequential_zarr_group_from_local_object(
+        self,
+        _prefix: str,
+        *,
+        object_key: str,
+        object_path: Path,
+        array_key: str,
+    ) -> _Group:
+        assert object_key
+        assert object_path.stat().st_size == 1024
+        assert array_key == "station_head_temperature_2m"
         return _Group()
 
 
@@ -217,6 +242,29 @@ def test_approved_probe_reads_one_block_without_publishing_snapshot(
     monkeypatch, tmp_path: Path
 ) -> None:
     manifest_path, approval_path, snapshot_root, index_path = _estimate(tmp_path)
+    manifest = json.loads(manifest_path.read_text())
+    probe_object = manifest["compressed_objects"][0]
+    probe_approval_path = tmp_path / "probe-approval.json"
+    probe_approval_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "weathernext-one-block-probe-approval/v1",
+                "manifest_sha256": manifest["manifest_sha256"],
+                "object_uri": probe_object["object_uri"],
+                "object_compressed_bytes": 1024,
+                "approved": True,
+                "approved_at_utc": "2026-09-15T01:00:00Z",
+                "approved_by": "test",
+                "max_network_bytes": 1024,
+                "max_objects": 1,
+                "max_object_bytes": 1024,
+                "max_attempts": 1,
+                "retry_policy": "disabled",
+            }
+        )
+    )
+    probe_attempt_path = tmp_path / "probe-attempt.json"
+    _Blob.download_count = 0
     monkeypatch.setattr("polybot.weathernext.WeatherNextGcsClient", _Client)
     settings = Settings(
         database_path=tmp_path / "db.sqlite3",
@@ -232,6 +280,14 @@ def test_approved_probe_reads_one_block_without_publishing_snapshot(
         snapshot_root=snapshot_root,
         index_path=index_path,
         probe_only=True,
+        probe_approval_path=probe_approval_path,
+        probe_attempt_path=probe_attempt_path,
+        expected_probe_manifest_sha256=manifest["manifest_sha256"],
+        expected_probe_object_uri=probe_object["object_uri"],
+        expected_probe_object_compressed_bytes=1024,
+        expected_probe_max_network_bytes=1024,
+        expected_probe_max_object_bytes=1024,
+        probe_temporary_root=tmp_path / "probe-tmp",
     )
 
     assert result.payload_read is True
@@ -244,8 +300,42 @@ def test_approved_probe_reads_one_block_without_publishing_snapshot(
     assert result.elapsed_seconds >= 0
     assert result.snapshots_written == 0
     assert result.snapshot_paths == []
+    assert result.extracted_values
+    assert _Blob.download_count == 1
     assert not list(snapshot_root.glob("*.json"))
     assert not index_path.exists()
+    assert not list((tmp_path / "probe-tmp").glob("*.zarr-chunk"))
+    attempt = json.loads(probe_attempt_path.read_text())
+    assert attempt["state"] == "completed"
+    assert attempt["actual_payload_bytes"] == 1024
+    assert (
+        verify_one_block_probe_approval(
+            manifest_path,
+            probe_approval_path,
+            expected_manifest_sha256=manifest["manifest_sha256"],
+            expected_object_uri=probe_object["object_uri"],
+            expected_object_compressed_bytes=1024,
+            expected_max_network_bytes=1024,
+            expected_max_object_bytes=1024,
+            attempt_path=probe_attempt_path,
+        ).state
+        == "consumed"
+    )
+    with pytest.raises(RuntimeError, match="already consumed"):
+        read_approved_manifest_sequentially(
+            settings,
+            manifest_path=manifest_path,
+            probe_only=True,
+            probe_approval_path=probe_approval_path,
+            probe_attempt_path=probe_attempt_path,
+            expected_probe_manifest_sha256=manifest["manifest_sha256"],
+            expected_probe_object_uri=probe_object["object_uri"],
+            expected_probe_object_compressed_bytes=1024,
+            expected_probe_max_network_bytes=1024,
+            expected_probe_max_object_bytes=1024,
+            probe_temporary_root=tmp_path / "probe-tmp",
+        )
+    assert _Blob.download_count == 1
 
 
 def test_incomplete_coverage_blocks_approval_and_payload_client(
@@ -423,3 +513,16 @@ def test_provider_resolves_immutable_snapshot_from_index(tmp_path: Path) -> None
     resolved = provider.snapshot_for(rules)  # type: ignore[arg-type]
     assert resolved is not None
     assert resolved.scenario_max_c == [20.0] * 64
+    typed_rules = cast(RuleInterpretation, rules)
+    timely, timely_reason = provider.paper_snapshot_for(
+        typed_rules,
+        now_utc=datetime(2026, 9, 15, 12, tzinfo=UTC),
+    )
+    assert timely is not None
+    assert timely_reason is None
+    retroactive, retroactive_reason = provider.paper_snapshot_for(
+        typed_rules,
+        now_utc=datetime(2026, 9, 16, tzinfo=UTC),
+    )
+    assert retroactive is None
+    assert retroactive_reason == "SNAPSHOT_RETROACTIVE_BLOCKED"

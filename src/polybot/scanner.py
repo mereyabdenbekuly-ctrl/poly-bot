@@ -54,7 +54,7 @@ from polybot.risk import evaluate_market
 from polybot.rules import build_brackets, deterministic_rule_audit
 from polybot.storage import PaperRiskRejectedError, Storage
 from polybot.weather import OpenMeteoEnsemble
-from polybot.weathernext import WeatherNextProvider
+from polybot.weathernext import WeatherNextProvider, WeatherNextSnapshot
 from polybot.weathernext_paper import (
     WEATHERNEXT_PAPER_STRATEGY_VERSION,
 )
@@ -791,6 +791,7 @@ class Scanner:
         run_id: int,
         event: EventDefinition,
         comparison: object | None,
+        snapshot_reason_code: str | None = None,
         brackets: dict[str, Bracket],
         probabilities: dict[str, Decimal],
         market_snapshots: dict[str, MarketSnapshot],
@@ -876,7 +877,7 @@ class Scanner:
                 reason_codes = list(decision.reason_codes)
                 reason_codes.extend(event_blockers)
                 if comparison is None:
-                    reason_codes.append("SNAPSHOT_UNAVAILABLE")
+                    reason_codes.append(snapshot_reason_code or "SNAPSHOT_UNAVAILABLE")
                 elif probability is None:
                     reason_codes.append("WEATHERNEXT_PROBABILITY_UNAVAILABLE")
                 if market.id not in brackets:
@@ -1171,6 +1172,7 @@ class Scanner:
         weathernext_probabilities: dict[str, Decimal] = {}
         forecast = None
         comparison = None
+        weathernext_snapshot_reason: str | None = None
         ecmwf_snapshot = None
         v2_result = None
         post_event_reused_snapshot = False
@@ -1301,7 +1303,23 @@ class Scanner:
         # erase the separate paper strategy's decision record.
         if analysis_rules.tradeable and brackets:
             try:
-                comparison = self.weathernext.snapshot_for(analysis_rules)
+                paper_snapshot_for = getattr(self.weathernext, "paper_snapshot_for", None)
+                if callable(paper_snapshot_for):
+                    resolve_paper_snapshot = cast(
+                        Callable[
+                            [RuleInterpretation],
+                            tuple[WeatherNextSnapshot | None, str | None],
+                        ],
+                        paper_snapshot_for,
+                    )
+                    comparison, weathernext_snapshot_reason = resolve_paper_snapshot(
+                        analysis_rules
+                    )
+                else:
+                    # Compatibility for read-only adapters/tests predating the
+                    # timely-paper gate.  The production provider implements
+                    # paper_snapshot_for and enforces the retroactive block.
+                    comparison = self.weathernext.snapshot_for(analysis_rules)
                 if comparison is not None:
                     self.storage.record_weathernext_snapshot(run_id, event.id, comparison)
                     weathernext_probabilities = {
@@ -1387,6 +1405,7 @@ class Scanner:
             run_id=run_id,
             event=event,
             comparison=comparison,
+            snapshot_reason_code=weathernext_snapshot_reason,
             brackets=brackets,
             probabilities=weathernext_probabilities,
             market_snapshots=market_snapshots,

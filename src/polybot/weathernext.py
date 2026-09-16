@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import mmap
 import re
 from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime, time, timedelta
@@ -839,6 +840,93 @@ class WeatherNextGcsClient:
         )
         zarr_store = zarr.storage.ObjectStore(gcs_store)
         return zarr.open_group(zarr_store, mode="r")
+
+    def open_sequential_zarr_group_from_local_object(
+        self,
+        store_prefix: str,
+        *,
+        object_key: str,
+        object_path: Path,
+        array_key: str,
+    ) -> Any:
+        """Open metadata from GCS but serve one approved chunk from disk.
+
+        Used only by the one-block probe: the exact object is downloaded once
+        with automatic retries disabled, then Zarr decoding reads the local
+        mmap instead of issuing a hidden second payload request.
+        """
+
+        _require_gcs_stack()
+        import importlib
+
+        obstore = cast(Any, importlib.import_module("obstore"))
+        zarr = cast(Any, importlib.import_module("zarr"))
+        from zarr.abc.store import OffsetByteRequest, RangeByteRequest, SuffixByteRequest
+        from zarr.core.buffer import BufferPrototype
+
+        gcs_store = obstore.store.GCSStore(
+            bucket=self.bucket_name,
+            prefix=store_prefix,
+            client_options={
+                "default_headers": {
+                    "x-goog-user-project": self.billing_project,
+                }
+            },
+        )
+        upstream = zarr.storage.ObjectStore(gcs_store)
+        store_root = store_prefix.strip("/")
+        approved_key = object_key.strip("/")
+        if approved_key.startswith(store_root + "/"):
+            approved_key = approved_key.removeprefix(store_root + "/")
+        approved_path = object_path.expanduser().resolve()
+        normalized_array_key = array_key.strip("/")
+        allowed_metadata_keys = {
+            "zarr.json",
+            ".zgroup",
+            ".zattrs",
+            ".zmetadata",
+            f"{normalized_array_key}/zarr.json",
+            f"{normalized_array_key}/.zarray",
+            f"{normalized_array_key}/.zattrs",
+        }
+
+        class _OneLocalObjectStore(zarr.storage.WrapperStore):
+            async def get(
+                self,
+                key: str,
+                prototype: BufferPrototype,
+                byte_range: object | None = None,
+            ) -> Any:
+                normalized_key = key.strip("/")
+                if normalized_key in allowed_metadata_keys:
+                    return await self._store.get(key, prototype, byte_range)  # type: ignore[arg-type]
+                if normalized_key != approved_key:
+                    raise RuntimeError(
+                        "one-block probe refused a non-approved Zarr key: "
+                        f"{normalized_key}"
+                    )
+                with approved_path.open("rb") as handle:
+                    mapped = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+                    try:
+                        if byte_range is None:
+                            raw = mapped[:]
+                        elif isinstance(byte_range, RangeByteRequest):
+                            raw = mapped[byte_range.start : byte_range.end]
+                        elif isinstance(byte_range, OffsetByteRequest):
+                            raw = mapped[byte_range.offset :]
+                        elif isinstance(byte_range, SuffixByteRequest):
+                            raw = mapped[-byte_range.suffix :]
+                        else:
+                            # Partial-decode is not used by the current codec
+                            # chain, so reject rather than silently read GCS.
+                            raise RuntimeError(
+                                "unsupported local WeatherNext probe byte range"
+                            )
+                    finally:
+                        mapped.close()
+                return prototype.buffer.from_bytes(raw)
+
+        return zarr.open_group(_OneLocalObjectStore(upstream), mode="r")
 
     def _open_dataset_with_fallback(
         self,
@@ -2675,6 +2763,35 @@ class WeatherNextProvider:
         if snapshot.location.casefold() != rules.location.casefold():
             return None
         return snapshot
+
+    def paper_snapshot_for(
+        self,
+        rules: RuleInterpretation,
+        *,
+        now_utc: datetime | None = None,
+    ) -> tuple[WeatherNextSnapshot | None, str | None]:
+        """Resolve a snapshot for timely paper use, never historical backfill.
+
+        Diagnostic archives may contain old station days.  They remain visible
+        to comparison/reporting code, but the autonomous paper lane accepts a
+        snapshot only while its station-local observation date is current or
+        future.  This prevents a later extraction from creating retroactive
+        paper results for a market day that already ended.
+        """
+
+        snapshot = self.snapshot_for(rules)
+        if snapshot is None:
+            return None, "SNAPSHOT_UNAVAILABLE"
+        now = now_utc or datetime.now(UTC)
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("now_utc must be timezone-aware")
+        now = now.astimezone(UTC)
+        if snapshot.init_time_utc > now or snapshot.received_at_utc > now:
+            return None, "SNAPSHOT_FROM_FUTURE"
+        local_today = now.astimezone(ZoneInfo(snapshot.observation_timezone)).date()
+        if snapshot.observation_date < local_today:
+            return None, "SNAPSHOT_RETROACTIVE_BLOCKED"
+        return snapshot, None
 
     @staticmethod
     def probabilities(

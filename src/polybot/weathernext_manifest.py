@@ -18,6 +18,9 @@ from polybot.weathernext import WeatherNextGcsClient
 
 _DEFAULT_MANIFEST_PATH = Path("/var/lib/polybot/weathernext/full/read-manifest.json")
 _DEFAULT_APPROVAL_PATH = Path("/var/lib/polybot/weathernext/full/read-approval.json")
+_DEFAULT_PROBE_APPROVAL_PATH = Path(
+    "/var/lib/polybot/weathernext/full/probe-approval.json"
+)
 _DEFAULT_SNAPSHOT_ROOT = Path("/var/lib/polybot/weathernext/full/snapshots")
 _READ_ONLY_SCOPE = "https://www.googleapis.com/auth/devstorage.read_only"
 _OFFICIAL_SOURCE_PREFIX = "gs://weathernext3_spatial/"
@@ -185,6 +188,66 @@ class WeatherNextReadApproval(StrictModel):
     def _expiration_after_approval(self) -> WeatherNextReadApproval:
         if self.expires_at_utc is not None and self.expires_at_utc <= self.approved_at_utc:
             raise ValueError("approval expiry must follow approval time")
+        return self
+
+
+class WeatherNextOneBlockProbeApproval(StrictModel):
+    """Narrow, non-publishing authorization for exactly one manifest object.
+
+    This is deliberately a different schema from :class:`WeatherNextReadApproval`.
+    A probe may be approved even while the full manifest remains blocked by its
+    aggregate network/object limits, but it can never authorize a second object
+    or a retry.  The object URI and compressed size are repeated in the sidecar
+    so an operator cannot accidentally approve "the first object" by position.
+    """
+
+    schema_version: Literal["weathernext-one-block-probe-approval/v1"] = (
+        "weathernext-one-block-probe-approval/v1"
+    )
+    manifest_sha256: str
+    object_uri: str
+    object_compressed_bytes: int = Field(ge=1)
+    approved: Literal[True] = True
+    approved_at_utc: datetime
+    approved_by: str = Field(min_length=1, max_length=200)
+    max_network_bytes: int = Field(ge=1)
+    max_objects: Literal[1] = 1
+    max_object_bytes: int = Field(ge=1)
+    max_attempts: Literal[1] = 1
+    retry_policy: Literal["disabled"] = "disabled"
+    expires_at_utc: datetime | None = None
+
+    @field_validator("manifest_sha256")
+    @classmethod
+    def _probe_hash(cls, value: str) -> str:
+        if not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError("probe manifest_sha256 must be a lowercase SHA-256 digest")
+        return value
+
+    @field_validator("object_uri")
+    @classmethod
+    def _probe_object_uri(cls, value: str) -> str:
+        if not value.startswith(_OFFICIAL_SOURCE_PREFIX):
+            raise ValueError("probe object must use the official WeatherNext bucket")
+        return value
+
+    @field_validator("approved_at_utc", "expires_at_utc")
+    @classmethod
+    def _probe_time(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("probe approval timestamps must be timezone-aware")
+        return value.astimezone(UTC)
+
+    @model_validator(mode="after")
+    def _probe_limits(self) -> WeatherNextOneBlockProbeApproval:
+        if self.object_compressed_bytes > self.max_object_bytes:
+            raise ValueError("probe object exceeds its approved object-size limit")
+        if self.object_compressed_bytes > self.max_network_bytes:
+            raise ValueError("probe object exceeds its approved network limit")
+        if self.expires_at_utc is not None and self.expires_at_utc <= self.approved_at_utc:
+            raise ValueError("probe approval expiry must follow approval time")
         return self
 
 
@@ -398,6 +461,84 @@ def validate_read_approval(
         raise ValueError("now_utc must be timezone-aware")
     if parsed.expires_at_utc is not None and now.astimezone(UTC) >= parsed.expires_at_utc:
         raise ValueError("WeatherNext read approval has expired")
+    return parsed
+
+
+def validate_one_block_probe_approval(
+    manifest: WeatherNextFullReadManifest,
+    approval: WeatherNextOneBlockProbeApproval | Mapping[str, object],
+    *,
+    expected_manifest_sha256: str | None = None,
+    expected_object_uri: str | None = None,
+    expected_object_compressed_bytes: int | None = None,
+    expected_max_network_bytes: int | None = None,
+    expected_max_object_bytes: int | None = None,
+    now_utc: datetime | None = None,
+) -> WeatherNextOneBlockProbeApproval:
+    """Validate a probe sidecar without opening the full-read gate.
+
+    The full manifest must still be authentic and metadata-only, but its
+    aggregate gate may be ``blocked_network_limit`` (or another blocked
+    state).  Only the exact URI/size repeated in this sidecar may be fetched.
+    ``max_attempts=1`` and ``retry_policy=disabled`` make the cumulative
+    payload budget explicit even when the full reader remains unavailable.
+    """
+
+    parsed = (
+        approval
+        if isinstance(approval, WeatherNextOneBlockProbeApproval)
+        else WeatherNextOneBlockProbeApproval.model_validate(approval)
+    )
+    if expected_manifest_sha256 is not None and not hmac.compare_digest(
+        parsed.manifest_sha256, expected_manifest_sha256
+    ):
+        raise ValueError("probe approval is bound to a different requested manifest digest")
+    if expected_object_uri is not None and not hmac.compare_digest(
+        parsed.object_uri, expected_object_uri
+    ):
+        raise ValueError("probe approval is bound to a different requested object URI")
+    if (
+        expected_object_compressed_bytes is not None
+        and parsed.object_compressed_bytes != expected_object_compressed_bytes
+    ):
+        raise ValueError("probe approval has a different requested compressed size")
+    if (
+        expected_max_network_bytes is not None
+        and parsed.max_network_bytes != expected_max_network_bytes
+    ):
+        raise ValueError("probe approval has a different requested cumulative payload limit")
+    if (
+        expected_max_object_bytes is not None
+        and parsed.max_object_bytes != expected_max_object_bytes
+    ):
+        raise ValueError("probe approval has a different requested object-size limit")
+    if not verify_manifest_sha256(manifest):
+        raise ValueError("manifest digest is invalid")
+    if not hmac.compare_digest(parsed.manifest_sha256, manifest.manifest_sha256):
+        raise ValueError("probe approval is bound to a different manifest")
+    if manifest.payload_read or manifest.approval_gate.payload_read:
+        raise ValueError("probe manifest must remain metadata-only")
+    matches = [
+        item
+        for item in manifest.compressed_objects
+        if item.object_uri == parsed.object_uri
+    ]
+    if len(matches) != 1:
+        raise ValueError("probe object URI must identify exactly one manifest object")
+    item = matches[0]
+    if item.compressed_bytes is None:
+        raise ValueError("probe object has no metadata-only compressed size")
+    if parsed.object_compressed_bytes != item.compressed_bytes:
+        raise ValueError("probe object compressed size differs from the manifest")
+    if parsed.max_objects != 1 or parsed.max_attempts != 1:
+        raise ValueError("probe approval permits exactly one object and one attempt")
+    if parsed.retry_policy != "disabled":
+        raise ValueError("probe approval requires disabled automatic retries")
+    now = now_utc or datetime.now(UTC)
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now_utc must be timezone-aware")
+    if parsed.expires_at_utc is not None and now.astimezone(UTC) >= parsed.expires_at_utc:
+        raise ValueError("WeatherNext one-block probe approval has expired")
     return parsed
 
 

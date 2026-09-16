@@ -158,6 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
     wn_auto.add_argument("--targets", default=None)
     wn_auto.add_argument("--manifest", default=None)
     wn_auto.add_argument("--approval", default=None)
+    wn_auto.add_argument("--probe-approval", default=None)
     wn_auto.add_argument("--status", default=None)
     wn_auto.add_argument("--index", default=None)
     wn_auto.add_argument("--snapshot-root", default=None)
@@ -171,10 +172,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--probe-one-block",
         action="store_true",
         help=(
-            "After approval, read and decode exactly one compressed block for a timing probe; "
-            "do not publish snapshots"
+            "Use the separate one-shot probe sidecar to read and decode exactly one "
+            "compressed block; do not refresh the manifest or publish snapshots"
         ),
     )
+    wn_auto.add_argument("--probe-manifest-sha256", default=None)
+    wn_auto.add_argument("--probe-object-uri", default=None)
+    wn_auto.add_argument("--probe-object-bytes", type=int, default=None)
+    wn_auto.add_argument("--probe-max-network-bytes", type=int, default=None)
+    wn_auto.add_argument("--probe-max-object-bytes", type=int, default=None)
+    wn_auto.add_argument("--probe-temp-root", default=None)
     wn_auto.add_argument("--json", action="store_true", dest="as_json")
 
     settle = subparsers.add_parser("settle", help="Settle an open paper order manually")
@@ -221,6 +228,8 @@ def main(argv: list[str] | None = None) -> None:
                 from polybot.weathernext_autonomy import (
                     DEFAULT_APPROVAL_PATH,
                     DEFAULT_MANIFEST_PATH,
+                    DEFAULT_PROBE_APPROVAL_PATH,
+                    DEFAULT_PROBE_ATTEMPT_PATH,
                     DEFAULT_ROOT,
                     DEFAULT_STATUS_PATH,
                     DEFAULT_TARGETS_PATH,
@@ -250,6 +259,12 @@ def main(argv: list[str] | None = None) -> None:
                     if args.approval
                     else root / DEFAULT_APPROVAL_PATH.relative_to(DEFAULT_ROOT)
                 )
+                probe_approval = (
+                    Path(args.probe_approval).expanduser()
+                    if args.probe_approval
+                    else root / DEFAULT_PROBE_APPROVAL_PATH.relative_to(DEFAULT_ROOT)
+                )
+                probe_attempt = root / DEFAULT_PROBE_ATTEMPT_PATH.relative_to(DEFAULT_ROOT)
                 status_path = (
                     Path(args.status).expanduser()
                     if args.status
@@ -268,6 +283,46 @@ def main(argv: list[str] | None = None) -> None:
                     if args.snapshot_root
                     else root / "snapshots"
                 )
+                if args.probe_one_block:
+                    if not args.read_approved:
+                        raise ValueError("--probe-one-block requires --read-approved")
+                    required_probe_args = {
+                        "--probe-manifest-sha256": args.probe_manifest_sha256,
+                        "--probe-object-uri": args.probe_object_uri,
+                        "--probe-object-bytes": args.probe_object_bytes,
+                        "--probe-max-network-bytes": args.probe_max_network_bytes,
+                        "--probe-max-object-bytes": args.probe_max_object_bytes,
+                    }
+                    missing_probe_args = [
+                        name for name, value in required_probe_args.items() if value is None
+                    ]
+                    if missing_probe_args:
+                        raise ValueError(
+                            "--probe-one-block requires " + ", ".join(missing_probe_args)
+                        )
+                    result = read_approved_manifest_sequentially(
+                        settings,
+                        manifest_path=manifest,
+                        approval_path=approval,
+                        index_path=index,
+                        snapshot_root=snapshot_root,
+                        probe_only=True,
+                        probe_approval_path=probe_approval,
+                        probe_attempt_path=probe_attempt,
+                        expected_probe_manifest_sha256=args.probe_manifest_sha256,
+                        expected_probe_object_uri=args.probe_object_uri,
+                        expected_probe_object_compressed_bytes=args.probe_object_bytes,
+                        expected_probe_max_network_bytes=args.probe_max_network_bytes,
+                        expected_probe_max_object_bytes=args.probe_max_object_bytes,
+                        probe_temporary_root=(
+                            Path(args.probe_temp_root).expanduser()
+                            if args.probe_temp_root
+                            else None
+                        ),
+                    )
+                    response = {"read": result.model_dump(mode="json")}
+                    print(json.dumps(response, ensure_ascii=False, indent=2, default=str))
+                    return
                 status = autonomous_refresh_preflight(
                     database,
                     settings=settings,
@@ -293,7 +348,7 @@ def main(argv: list[str] | None = None) -> None:
                         approval_path=approval,
                         index_path=index,
                         snapshot_root=snapshot_root,
-                        probe_only=args.probe_one_block,
+                        probe_only=False,
                     )
                     status = status.model_copy(
                         update={
