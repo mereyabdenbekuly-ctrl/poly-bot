@@ -2364,6 +2364,7 @@ def read_approved_manifest_sequentially(
     last_object_uri: str | None = None
     local_group: Any | None = None
     local_path: Path | None = None
+    array: Any | None = None
     try:
         if probe_only:
             if probe_approval is None:
@@ -2394,32 +2395,40 @@ def read_approved_manifest_sequentially(
                 object_path=probe_path,
                 array_key=manifest.variable,
             )
-        else:
-            group = client.open_sequential_zarr_group(store_prefix)
-        if group is None:
-            raise RuntimeError("WeatherNext Zarr group did not open")
-        array = group[manifest.variable]
         raw_dimensions = manifest.array.get("dimensions", [])
         dimensions = (
             [str(item) for item in cast(list[object], raw_dimensions)]
             if isinstance(raw_dimensions, list)
             else []
         )
-        if not dimensions or len(dimensions) != len(array.shape):
-            raise RuntimeError("WeatherNext manifest dimensions do not match the Zarr array")
-        chunk_shape = tuple(int(value) for value in array.chunks)
-        array_shape = tuple(int(value) for value in array.shape)
         raw_manifest_shape = manifest.array.get("shape", [])
         raw_manifest_chunks = manifest.array.get("chunk_shape", [])
         if not isinstance(raw_manifest_shape, list) or not isinstance(raw_manifest_chunks, list):
             raise RuntimeError("WeatherNext manifest is missing array shape/chunk metadata")
         manifest_shape = tuple(int(value) for value in raw_manifest_shape)
         manifest_chunks = tuple(int(value) for value in raw_manifest_chunks)
-        if manifest_shape != array_shape or manifest_chunks != chunk_shape:
-            raise RuntimeError(
-                "WeatherNext array shape/chunk metadata changed since the manifest was built"
-            )
-        source_units = str(getattr(array, "attrs", {}).get("units", manifest.units)).strip()
+        if not dimensions or len(dimensions) != len(manifest_shape):
+            raise RuntimeError("WeatherNext manifest dimensions do not match its array shape")
+        array_shape = manifest_shape
+        chunk_shape = manifest_chunks
+        source_units = manifest.units.strip()
+        if probe_only:
+            if group is None:
+                raise RuntimeError("WeatherNext Zarr group did not open")
+            probe_array = group[manifest.variable]
+            if probe_array is None:
+                raise RuntimeError("WeatherNext probe array did not open")
+            array = probe_array
+            if (
+                tuple(int(value) for value in probe_array.shape) != array_shape
+                or tuple(int(value) for value in probe_array.chunks) != chunk_shape
+            ):
+                raise RuntimeError(
+                    "WeatherNext array shape/chunk metadata changed since the manifest was built"
+                )
+            source_units = str(
+                getattr(probe_array, "attrs", {}).get("units", manifest.units)
+            ).strip()
         if source_units.casefold() not in {manifest.units.casefold(), "k", "kelvin", "c", "degc"}:
             raise RuntimeError(f"WeatherNext array units changed unexpectedly: {source_units!r}")
         target_map = {
@@ -2489,7 +2498,30 @@ def read_approved_manifest_sequentially(
                 if local_group is None:
                     raise RuntimeError("local WeatherNext object group did not open")
                 decode_array = local_group[manifest.variable]
+                if (
+                    tuple(int(value) for value in decode_array.shape) != array_shape
+                    or tuple(int(value) for value in decode_array.chunks) != chunk_shape
+                ):
+                    raise RuntimeError(
+                        "WeatherNext local array metadata changed since the manifest was built"
+                    )
+                local_units = str(
+                    getattr(decode_array, "attrs", {}).get("units", manifest.units)
+                ).strip()
+                if local_units.casefold() not in {
+                    manifest.units.casefold(),
+                    "k",
+                    "kelvin",
+                    "c",
+                    "degc",
+                }:
+                    raise RuntimeError(
+                        f"WeatherNext array units changed unexpectedly: {local_units!r}"
+                    )
+                source_units = local_units
             else:
+                if array is None:
+                    raise RuntimeError("probe WeatherNext array did not open")
                 decode_array = array
 
             # Exact chunk boundaries make this one payload GET.  No global
