@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 import importlib.metadata
 import json
+from dataclasses import asdict
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, cast
 
 from rich.console import Console
@@ -63,6 +65,56 @@ def build_parser() -> argparse.ArgumentParser:
     operational.add_argument("--hours", type=float, default=24.0)
     operational.add_argument("--output", default=None)
     operational.add_argument("--json", action="store_true", dest="as_json")
+
+    live = subparsers.add_parser(
+        "live-pilot",
+        help="Approval-gated one-shot live pilot; never runs from a timer",
+    )
+    live_sub = live.add_subparsers(dest="live_command", required=True)
+    live_status = live_sub.add_parser("status", help="Show the persistent one-shot gate")
+    _add_live_paths(live_status, credentials=False)
+    live_status.add_argument("--json", action="store_true", dest="as_json")
+    live_provision = live_sub.add_parser(
+        "provision", help="Interactively store supported account auth; never signs an order"
+    )
+    live_provision.add_argument(
+        "--auth-mode", choices=("session_key", "direct_signer"), required=True
+    )
+    live_provision.add_argument("--wallet", required=True)
+    live_provision.add_argument("--relayer-address", default=None)
+    live_provision.add_argument("--credentials", default="/var/lib/polybot/live/credentials.json")
+    live_provision.add_argument("--json", action="store_true", dest="as_json")
+    live_check = live_sub.add_parser(
+        "account-check", help="Authenticated read-only balance/order/position check"
+    )
+    _add_live_paths(live_check)
+    live_check.add_argument("--json", action="store_true", dest="as_json")
+    live_preview = live_sub.add_parser(
+        "preview", help="Build a non-binding unsigned preview from one fresh v1 PAPER_BUY"
+    )
+    _add_live_paths(live_preview, credentials=False)
+    live_preview.add_argument("--decision-id", type=int, required=True)
+    live_preview.add_argument("--json", action="store_true", dest="as_json")
+    live_prepare = live_sub.add_parser(
+        "prepare", help="Reserve the one-shot slot and write an unsigned exact intent"
+    )
+    _add_live_paths(live_prepare)
+    live_prepare.add_argument("--decision-id", type=int, required=True)
+    live_prepare.add_argument("--intent-output", default="/var/lib/polybot/live/intent.json")
+    live_prepare.add_argument("--json", action="store_true", dest="as_json")
+    live_execute = live_sub.add_parser(
+        "execute", help="Submit only an exact prepared intent with a separate approval sidecar"
+    )
+    _add_live_paths(live_execute)
+    live_execute.add_argument("--intent", default="/var/lib/polybot/live/intent.json")
+    live_execute.add_argument("--approval", required=True)
+    live_execute.add_argument("--json", action="store_true", dest="as_json")
+    live_reconcile = live_sub.add_parser(
+        "reconcile", help="Read account state after an ambiguous or accepted submission"
+    )
+    _add_live_paths(live_reconcile)
+    live_reconcile.add_argument("--intent", default="/var/lib/polybot/live/intent.json")
+    live_reconcile.add_argument("--json", action="store_true", dest="as_json")
 
     wn = subparsers.add_parser("weathernext", help="WeatherNext3 GCS comparison source")
     wn_sub = wn.add_subparsers(dest="weathernext_command", required=True)
@@ -226,9 +278,24 @@ def _add_scan_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", dest="as_json")
 
 
+def _add_live_paths(parser: argparse.ArgumentParser, *, credentials: bool = True) -> None:
+    parser.add_argument("--database", default=None)
+    if credentials:
+        parser.add_argument("--credentials", default="/var/lib/polybot/live/credentials.json")
+
+
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     settings = Settings()
+    if args.command == "live-pilot":
+        try:
+            _run_live_pilot(settings, args)
+        except KeyboardInterrupt:
+            console.print("\nStopped.")
+        except Exception as error:
+            error_console.print(f"[bold red]Error:[/bold red] {error}")
+            raise SystemExit(1) from error
+        return
     if args.command == "weathernext":
         try:
             from datetime import date as _date
@@ -250,9 +317,7 @@ def main(argv: list[str] | None = None) -> None:
 
                 root = Path(args.root).expanduser() if args.root else settings.weathernext_full_root
                 database = (
-                    Path(args.database).expanduser()
-                    if args.database
-                    else settings.database_path
+                    Path(args.database).expanduser() if args.database else settings.database_path
                 )
                 status = plan_first_full_trial(
                     database,
@@ -293,9 +358,7 @@ def main(argv: list[str] | None = None) -> None:
 
                 root = Path(args.root).expanduser() if args.root else settings.weathernext_full_root
                 database = (
-                    Path(args.database).expanduser()
-                    if args.database
-                    else settings.database_path
+                    Path(args.database).expanduser() if args.database else settings.database_path
                 )
                 targets = (
                     Path(args.targets).expanduser()
@@ -327,8 +390,7 @@ def main(argv: list[str] | None = None) -> None:
                     Path(args.index).expanduser()
                     if args.index
                     else Path(
-                        settings.weathernext_snapshot_index_path
-                        or root / "latest-index.json"
+                        settings.weathernext_snapshot_index_path or root / "latest-index.json"
                     ).expanduser()
                 )
                 snapshot_root = (
@@ -389,9 +451,7 @@ def main(argv: list[str] | None = None) -> None:
                         index_path=index,
                         snapshot_root=snapshot_root,
                         probe_only=False,
-                        require_strictly_future_targets=(
-                            args.require_strictly_future_targets
-                        ),
+                        require_strictly_future_targets=(args.require_strictly_future_targets),
                     )
                     response = {"read": result.model_dump(mode="json")}
                     print(json.dumps(response, ensure_ascii=False, indent=2, default=str))
@@ -566,6 +626,125 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(1) from error
 
 
+def _run_live_pilot(settings: Settings, args: argparse.Namespace) -> None:
+    from polymarket import PublicClient
+
+    from polybot.live_pilot import LivePilotExecutor, LivePilotJournal
+    from polybot.live_pilot_runtime import (
+        account_check,
+        intent_report,
+        live_pilot_status,
+        load_live_credentials,
+        load_live_intent,
+        open_live_client,
+        preview_intent_from_decision,
+        provision_live_credentials,
+        write_prepared_intent,
+    )
+
+    database = Path(args.database).expanduser() if args.database else settings.database_path
+    journal = LivePilotJournal(database)
+    result: dict[str, Any]
+    if args.live_command == "status":
+        result = live_pilot_status(journal)
+    elif args.live_command == "provision":
+        import getpass
+        import sys
+
+        if not sys.stdin.isatty():
+            raise RuntimeError("live credential provisioning requires an interactive TTY")
+        private_key = getpass.getpass("Signer/session private key (hidden): ").strip()
+        relayer_key = None
+        if args.relayer_address:
+            relayer_key = getpass.getpass("Relayer API key (hidden): ").strip()
+        result = provision_live_credentials(
+            output_path=Path(args.credentials),
+            auth_mode=args.auth_mode,
+            wallet=args.wallet,
+            private_key=private_key,
+            relayer_api_key=relayer_key,
+            relayer_api_address=args.relayer_address,
+        )
+    elif args.live_command == "account-check":
+        check = account_check(
+            settings=settings,
+            credentials_path=Path(args.credentials),
+            journal=journal,
+        )
+        result = asdict(check)
+    elif args.live_command == "preview":
+        with PublicClient() as client:
+            intent = preview_intent_from_decision(
+                settings=settings,
+                decision_id=args.decision_id,
+                client=client,
+            )
+        result = {**intent_report(intent), "binding": False, "one_shot_reserved": False}
+    elif args.live_command == "prepare":
+        check = account_check(
+            settings=settings,
+            credentials_path=Path(args.credentials),
+            journal=journal,
+        )
+        if not check.ready_for_prepare:
+            raise RuntimeError(
+                "live account is not ready for intent preparation: " + ", ".join(check.blockers)
+            )
+        credentials = load_live_credentials(Path(args.credentials))
+        with open_live_client(credentials) as client:
+            intent = preview_intent_from_decision(
+                settings=settings,
+                decision_id=args.decision_id,
+                client=client,
+            )
+        result = write_prepared_intent(
+            journal=journal,
+            intent=intent,
+            output_path=Path(args.intent_output),
+        )
+        result["account_check"] = asdict(check)
+    elif args.live_command == "execute":
+        from polybot.geoblock import fetch_geoblock_status
+
+        intent = load_live_intent(Path(args.intent))
+        credentials = load_live_credentials(Path(args.credentials))
+        geoblock = fetch_geoblock_status(
+            url=settings.geoblock_url,
+            timeout=settings.http_timeout_seconds,
+        )
+        with open_live_client(credentials) as client:
+            record = LivePilotExecutor(journal).execute_once(
+                client=cast(Any, client),
+                intent=intent,
+                approval_path=Path(args.approval),
+                geoblocked=geoblock.blocked,
+            )
+        result = {
+            "intent_sha256": record.intent_sha256,
+            "state": record.state.value,
+            "remote_order_id": record.remote_order_id,
+            "submitted_at_utc": record.submitted_at_utc,
+        }
+    elif args.live_command == "reconcile":
+        intent = load_live_intent(Path(args.intent))
+        credentials = load_live_credentials(Path(args.credentials))
+        with open_live_client(credentials) as client:
+            record = LivePilotExecutor(journal).reconcile(client=cast(Any, client), intent=intent)
+        result = {
+            "intent_sha256": record.intent_sha256,
+            "state": record.state.value,
+            "remote_order_id": record.remote_order_id,
+            "reconciled_at_utc": record.reconciled_at_utc,
+        }
+    else:
+        raise RuntimeError(f"unknown live-pilot command: {args.live_command}")
+    if args.as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    else:
+        for key, value in result.items():
+            console.print(f"{key}: {value}")
+
+
 def _doctor(settings: Settings, storage: Storage, *, as_json: bool) -> None:
     checks: dict[str, Any] = {
         "database": str(storage.path),
@@ -586,8 +765,8 @@ def _doctor(settings: Settings, storage: Storage, *, as_json: bool) -> None:
         "openai_key_present": settings.openai_api_key is not None,
         "live_executor_present": True,
         "live_executor_enabled": False,
-        "live_executor_mode": "library_only_one_shot_fok",
-        "live_executor_cli_present": False,
+        "live_executor_mode": "manual_approval_gated_one_shot_fok",
+        "live_executor_cli_present": True,
         "weathernext": WeatherNextProvider(settings).status().model_dump(mode="json"),
     }
     try:

@@ -200,6 +200,13 @@ class LivePilotJournal:
                     payload_json TEXT NOT NULL,
                     UNIQUE(intent_id, trade_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS live_pilot_gate (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    intent_sha256 TEXT NOT NULL UNIQUE,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    reserved_at_utc TEXT NOT NULL
+                );
                 """
             )
 
@@ -216,8 +223,29 @@ class LivePilotJournal:
             if existing is not None:
                 if existing["intent_json"] != payload:
                     raise LivePilotError("idempotency key collision with different intent")
+                gate = connection.execute(
+                    "SELECT intent_sha256 FROM live_pilot_gate WHERE singleton = 1"
+                ).fetchone()
+                if gate is None or str(gate["intent_sha256"]) != intent.digest:
+                    raise LivePilotError("live pilot gate is inconsistent; manual review required")
                 connection.commit()
                 return _record(existing)
+            gate = connection.execute(
+                "SELECT intent_sha256 FROM live_pilot_gate WHERE singleton = 1"
+            ).fetchone()
+            if gate is not None:
+                raise LivePilotError(
+                    "the one-shot live pilot slot is already permanently reserved; "
+                    "a new intent is forbidden"
+                )
+            connection.execute(
+                """
+                INSERT INTO live_pilot_gate(
+                    singleton,intent_sha256,idempotency_key,reserved_at_utc
+                ) VALUES (1, ?, ?, ?)
+                """,
+                (intent.digest, intent.idempotency_key, now),
+            )
             cursor = connection.execute(
                 """
                 INSERT INTO live_order_intents(
@@ -253,6 +281,37 @@ class LivePilotJournal:
             raise
         finally:
             connection.close()
+
+    def gate(self) -> dict[str, str] | None:
+        """Return the persistent one-shot reservation without exposing signed data."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT intent_sha256,idempotency_key,reserved_at_utc
+                FROM live_pilot_gate WHERE singleton = 1
+                """
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "intent_sha256": str(row["intent_sha256"]),
+            "idempotency_key": str(row["idempotency_key"]),
+            "reserved_at_utc": str(row["reserved_at_utc"]),
+        }
+
+    def summary(self) -> dict[str, Any]:
+        """Return non-secret persistent accounting totals for operator status."""
+
+        with self._connect() as connection:
+            states = {
+                str(row["state"]): int(row["count"])
+                for row in connection.execute(
+                    "SELECT state, COUNT(*) AS count FROM live_order_intents GROUP BY state"
+                ).fetchall()
+            }
+            fills = int(connection.execute("SELECT COUNT(*) FROM live_order_fills").fetchone()[0])
+        return {"intent_states": states, "fill_rows": fills}
 
     def get(self, intent_sha256: str) -> LiveIntentRecord:
         with self._connect() as connection:
@@ -521,11 +580,7 @@ class LivePilotExecutor:
             raise LivePilotError(
                 f"intent already reached {record.state}; reconcile it and never submit again"
             )
-        other = [
-            item
-            for item in self.journal.unresolved()
-            if item.intent_sha256 != intent.digest
-        ]
+        other = [item for item in self.journal.unresolved() if item.intent_sha256 != intent.digest]
         if other:
             raise LivePilotError("another live intent is unresolved")
 
@@ -540,6 +595,8 @@ class LivePilotExecutor:
         positions = client.list_positions(user=str(client.wallet)).iter_items()
         if any(_position_is_open(value) for value in positions):
             raise LivePilotError("pilot wallet already has an open position")
+        if any(True for _ in client.list_account_trades().iter_items()):
+            raise LivePilotError("pilot wallet already has trade history")
 
         market = client.get_market(id=intent.market_id)
         fee_rate, fee_exponent = _verify_market_identity(market, intent)
@@ -698,9 +755,7 @@ def _consume_approval(path: Path, intent_sha256: str) -> None:
     resolved.replace(used)
 
 
-def _verify_market_identity(
-    market: Any, intent: LiveBuyIntent
-) -> tuple[Decimal, Decimal]:
+def _verify_market_identity(market: Any, intent: LiveBuyIntent) -> tuple[Decimal, Decimal]:
     if str(getattr(market, "id", "")) != intent.market_id:
         raise LivePilotError("market id changed")
     condition = getattr(market, "condition_id", None)
@@ -710,10 +765,7 @@ def _verify_market_identity(
     if state is not None and not bool(getattr(state, "accepting_orders", False)):
         raise LivePilotError("market no longer accepts orders")
     outcomes = getattr(market, "outcomes", None)
-    tokens = {
-        str(getattr(getattr(outcomes, side, None), "token_id", ""))
-        for side in ("yes", "no")
-    }
+    tokens = {str(getattr(getattr(outcomes, side, None), "token_id", "")) for side in ("yes", "no")}
     if intent.token_id not in tokens:
         raise LivePilotError("token no longer belongs to the selected market")
     try:
@@ -768,8 +820,9 @@ def _verify_signed_order(
         raise LivePilotError("signed maker amount exceeds the approved BUY notional")
     if maker_amount > int(PILOT_MAX_BUY_USD * COLLATERAL_BASE_UNITS):
         raise LivePilotError("signed maker amount exceeds the exact $2 cap")
-    if maker_amount > balance_units:
-        raise LivePilotError("pilot wallet balance is below signed spend")
+    required_balance_units = _usd_base_units_exact(intent.max_spend_usd, field="max_spend_usd")
+    if balance_units < required_balance_units:
+        raise LivePilotError("pilot wallet balance is below the approved all-in spend")
     if not allowances or max(int(value) for value in allowances.values()) < maker_amount:
         raise LivePilotError(
             "collateral allowance is insufficient; executor refuses automatic unlimited approval"
@@ -834,9 +887,7 @@ def _intent_payload(intent: LiveBuyIntent) -> dict[str, Any]:
 
 def _signed_payload(signed: Any) -> dict[str, Any]:
     names = (
-        [field.name for field in fields(signed)]
-        if hasattr(signed, "__dataclass_fields__")
-        else []
+        [field.name for field in fields(signed)] if hasattr(signed, "__dataclass_fields__") else []
     )
     if not names:
         raise LivePilotError("SDK signed order does not expose a stable dataclass payload")

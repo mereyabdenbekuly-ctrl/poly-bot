@@ -292,7 +292,7 @@ def test_unresolved_manual_review_blocks_every_new_intent(tmp_path: Path) -> Non
     assert executor.reconcile(client=client, intent=first).state is LiveIntentState.MANUAL_REVIEW
 
     second = intent(event_id="event-2", market_id="market-2", book_hash="book-2")
-    with pytest.raises(LivePilotError, match="another live intent is unresolved"):
+    with pytest.raises(LivePilotError, match="one-shot live pilot slot"):
         executor.execute_once(
             client=client,
             intent=second,
@@ -301,6 +301,33 @@ def test_unresolved_manual_review_blocks_every_new_intent(tmp_path: Path) -> Non
             now=NOW + timedelta(minutes=2),
         )
     assert client.post_calls == 1
+
+
+def test_rejected_attempt_still_permanently_blocks_a_new_intent(tmp_path: Path) -> None:
+    first = intent()
+    journal = LivePilotJournal(tmp_path / "polybot.sqlite3")
+    client = FakeClient()
+    client.response = FakeResponse(ok=False)
+    result = LivePilotExecutor(journal).execute_once(
+        client=client,
+        intent=first,
+        approval_path=approval(tmp_path / "first.json", first),
+        geoblocked=False,
+        now=NOW + timedelta(minutes=1),
+    )
+    assert result.state is LiveIntentState.REJECTED
+
+    second = intent(event_id="event-2", market_id="market-2", book_hash="book-2")
+    with pytest.raises(LivePilotError, match="one-shot live pilot slot"):
+        LivePilotExecutor(journal).execute_once(
+            client=client,
+            intent=second,
+            approval_path=approval(tmp_path / "second.json", second),
+            geoblocked=False,
+            now=NOW + timedelta(minutes=2),
+        )
+    assert client.post_calls == 1
+    assert journal.gate() is not None
 
 
 @pytest.mark.parametrize(
