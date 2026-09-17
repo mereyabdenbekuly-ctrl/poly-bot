@@ -78,9 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
         "provision", help="Interactively store supported account auth; never signs an order"
     )
     live_provision.add_argument(
-        "--auth-mode", choices=("session_key", "direct_signer"), required=True
+        "--auth-mode",
+        choices=("session_key", "direct_signer"),
+        default="direct_signer",
     )
-    live_provision.add_argument("--wallet", required=True)
+    live_provision.add_argument("--wallet", default=None)
     live_provision.add_argument("--relayer-address", default=None)
     live_provision.add_argument("--credentials", default="/var/lib/polybot/live/credentials.json")
     live_provision.add_argument("--json", action="store_true", dest="as_json")
@@ -96,7 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
     live_preview.add_argument("--decision-id", type=int, required=True)
     live_preview.add_argument("--json", action="store_true", dest="as_json")
     live_prepare = live_sub.add_parser(
-        "prepare", help="Reserve the one-shot slot and write an unsigned exact intent"
+        "prepare", help="Write an unsigned exact intent without reserving or submitting"
     )
     _add_live_paths(live_prepare)
     live_prepare.add_argument("--decision-id", type=int, required=True)
@@ -653,6 +655,9 @@ def _run_live_pilot(settings: Settings, args: argparse.Namespace) -> None:
 
         if not sys.stdin.isatty():
             raise RuntimeError("live credential provisioning requires an interactive TTY")
+        wallet = args.wallet or input("Account wallet address: ").strip()
+        if not wallet:
+            raise RuntimeError("account wallet address is required")
         private_key = getpass.getpass("Signer/session private key (hidden): ").strip()
         relayer_key = None
         if args.relayer_address:
@@ -660,7 +665,7 @@ def _run_live_pilot(settings: Settings, args: argparse.Namespace) -> None:
         result = provision_live_credentials(
             output_path=Path(args.credentials),
             auth_mode=args.auth_mode,
-            wallet=args.wallet,
+            wallet=wallet,
             private_key=private_key,
             relayer_api_key=relayer_key,
             relayer_api_address=args.relayer_address,

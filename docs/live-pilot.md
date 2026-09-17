@@ -34,13 +34,12 @@ variables, git, or command history.
 ```bash
 sudo install -d -o polybot -g polybot -m 0700 /var/lib/polybot/live
 sudo -u polybot -H /opt/polybot/.venv/bin/polybot live-pilot provision \
-  --auth-mode direct_signer \
-  --wallet 0xYOUR_ACCOUNT_WALLET \
-  --relayer-address 0xADDRESS_SHOWN_WITH_YOUR_RELAYER_KEY
+  --auth-mode direct_signer
 ```
 
-The command prompts, without echo, for the signer private key and (when
-`--relayer-address` is supplied) the Relayer API key. The resulting file is
+The command prompts for the public account wallet address and, without echo,
+for the signer private key. When `--relayer-address` is supplied, it also
+prompts without echo for the Relayer API key. The resulting file is
 `/var/lib/polybot/live/credentials.json`, owned by `polybot`, mode `0600`.
 For an EOA that does not use a Relayer key, omit `--relayer-address`.
 
