@@ -47,6 +47,22 @@ def test_live_auto_once_is_explicitly_bounded_and_opt_in() -> None:
     assert args.as_json is True
 
 
+def test_live_v2_status_and_run_are_explicitly_bounded_and_opt_in() -> None:
+    status = build_parser().parse_args(["live-v2", "status", "--json"])
+    assert status.command == "live-v2"
+    assert status.live_v2_command == "status"
+    assert status.as_json is True
+
+    run = build_parser().parse_args(["live-v2", "run", "--json"])
+    assert run.command == "live-v2"
+    assert run.live_v2_command == "run"
+    assert run.poll_seconds == 5.0
+    assert run.timeout_seconds == 0.0
+    assert run.credentials.endswith("credentials.json")
+    assert run.authorization.endswith("live-v2-authorization.json")
+    assert run.as_json is True
+
+
 def test_weathernext_first_trial_and_existing_read_flags_are_explicit() -> None:
     planned = build_parser().parse_args(["weathernext", "first-full-trial-plan", "--json"])
     assert planned.weathernext_command == "first-full-trial-plan"

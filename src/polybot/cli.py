@@ -146,6 +146,36 @@ def build_parser() -> argparse.ArgumentParser:
     live_reconcile.add_argument("--intent", default="/var/lib/polybot/live/intent.json")
     live_reconcile.add_argument("--json", action="store_true", dest="as_json")
 
+    live_v2 = subparsers.add_parser(
+        "live-v2",
+        help="Bounded autonomous live trading: one FOK BUY attempt per local day",
+    )
+    live_v2_sub = live_v2.add_subparsers(dest="live_v2_command", required=True)
+    live_v2_status = live_v2_sub.add_parser("status", help="Show the live-v2 journal")
+    live_v2_status.add_argument("--database", default=None)
+    live_v2_status.add_argument("--json", action="store_true", dest="as_json")
+    live_v2_run = live_v2_sub.add_parser(
+        "run",
+        help="Wait for and submit one bounded live-v2 attempt, then return",
+    )
+    live_v2_run.add_argument("--database", default=None)
+    live_v2_run.add_argument(
+        "--credentials",
+        default="/var/lib/polybot/live/credentials.json",
+    )
+    live_v2_run.add_argument(
+        "--authorization",
+        default="/var/lib/polybot/live/live-v2-authorization.json",
+    )
+    live_v2_run.add_argument("--poll-seconds", type=float, default=5.0)
+    live_v2_run.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=0.0,
+        help="Stop after this many seconds; 0 waits indefinitely",
+    )
+    live_v2_run.add_argument("--json", action="store_true", dest="as_json")
+
     wn = subparsers.add_parser("weathernext", help="WeatherNext3 GCS comparison source")
     wn_sub = wn.add_subparsers(dest="weathernext_command", required=True)
     wn_check = wn_sub.add_parser("check", help="Verify ADC and Requester Pays access")
@@ -320,6 +350,15 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "live-pilot":
         try:
             _run_live_pilot(settings, args)
+        except KeyboardInterrupt:
+            console.print("\nStopped.")
+        except Exception as error:
+            error_console.print(f"[bold red]Error:[/bold red] {error}")
+            raise SystemExit(1) from error
+        return
+    if args.command == "live-v2":
+        try:
+            _run_live_v2(settings, args)
         except KeyboardInterrupt:
             console.print("\nStopped.")
         except Exception as error:
@@ -799,6 +838,29 @@ def _print_live_result(result: dict[str, Any], *, as_json: bool) -> None:
     else:
         for key, value in result.items():
             console.print(f"{key}: {value}")
+
+
+def _run_live_v2(settings: Settings, args: argparse.Namespace) -> None:
+    from polybot.live_v2 import live_v2_status, run_live_v2
+
+    database = (
+        Path(args.database).expanduser() if args.database else settings.database_path
+    )
+    live_settings = settings.model_copy(update={"database_path": database})
+    if args.live_v2_command == "status":
+        result = live_v2_status(database)
+    elif args.live_v2_command == "run":
+        result = run_live_v2(
+            settings=live_settings,
+            database=database,
+            credentials_path=Path(args.credentials),
+            authorization_path=Path(args.authorization),
+            poll_seconds=args.poll_seconds,
+            timeout_seconds=args.timeout_seconds,
+        )
+    else:
+        raise RuntimeError(f"unknown live-v2 command: {args.live_v2_command}")
+    _print_live_result(result, as_json=args.as_json)
 
 
 def _doctor(settings: Settings, storage: Storage, *, as_json: bool) -> None:

@@ -1,0 +1,41 @@
+[Unit]
+Description=Polybot bounded autonomous live-v2 trader
+Wants=network-online.target
+After=network-online.target polybot-observer.service
+ConditionPathExists=/var/lib/polybot/polybot.sqlite3
+ConditionPathExists=/var/lib/polybot/live/credentials.json
+ConditionPathExists=/var/lib/polybot/live/live-v2-authorization.json
+
+[Service]
+Type=simple
+User=polybot
+Group=polybot
+WorkingDirectory=/opt/polybot
+EnvironmentFile=/etc/polybot/polybot.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/polybot/.venv/bin/polybot live-v2 run \
+  --database /var/lib/polybot/polybot.sqlite3 \
+  --credentials /var/lib/polybot/live/credentials.json \
+  --authorization /var/lib/polybot/live/live-v2-authorization.json \
+  --poll-seconds 5 \
+  --timeout-seconds 0 \
+  --json
+Restart=on-success
+RestartSec=10
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/polybot
+
+[Install]
+WantedBy=multi-user.target

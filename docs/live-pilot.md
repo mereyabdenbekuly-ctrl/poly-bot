@@ -125,3 +125,79 @@ to a `.used-*` path as soon as the one-shot gate is consumed. The optional
 `polybot-live-auto-once.service` waits in the background but is never enabled by
 the installation script; an operator must create the sidecar and start it
 explicitly.
+
+## Live-v2: bounded daily loop
+
+`polybot live-v2` is separate from the legacy `live-pilot` one-shot. It shares
+the provisioned credential file, but uses its own standing authorization and
+`live_v2_attempts` journal; it does not reset or extend the legacy one-shot
+gate.
+
+Its risk envelope is fixed:
+
+- only `FOK BUY` orders from fresh, authorized `v1` candidates;
+- BUY notional at most `$1.90` and signed all-in spend at most `$2.00`;
+- one reserved order attempt per `Asia/Almaty` local day. Reservation happens
+  before signing/POST, so one attempt with a `$2.00` maximum spend
+  conservatively bounds new daily risk to `$2.00`. A position closure consumes
+  that local day's slot too, and any other wallet trade observed that day blocks
+  a new attempt;
+- one position at a time: any open order or open position makes the loop wait;
+- dedicated-wallet collateral must be greater than zero and at most `$10.00`;
+- an ambiguous submission is never retried automatically. Reconciliation that
+  cannot prove a position or close marks `MANUAL_REVIEW`, and no new order is
+  allowed while any active/manual-review attempt remains unresolved.
+
+The loop requires an authorized Deposit Wallet `session_key` plus a private
+mode-`0600` `/var/lib/polybot/live/live-v2-authorization.json`. The sidecar has
+the exact fixed schema below; replace the wallet and timestamps, and choose the
+two non-negative signal thresholds explicitly:
+
+```json
+{
+  "kind": "polybot-live-v2-authorization-v1",
+  "wallet": "0xDEPOSIT_WALLET",
+  "strategy": "open-meteo-truncated-normal-v1",
+  "side": "BUY",
+  "order_type": "FOK",
+  "one_position_at_a_time": true,
+  "max_orders_per_day": 1,
+  "daily_stop_loss_usd": "2.00",
+  "daily_timezone": "Asia/Almaty",
+  "max_wallet_balance_usd": "10.00",
+  "max_buy_notional_usd": "1.90",
+  "max_total_spend_usd": "2.00",
+  "min_probability_edge": "0.08",
+  "min_expected_profit_usd": "0.25",
+  "jurisdiction_confirmed": true,
+  "authorized_at_utc": "<RFC3339 UTC timestamp>",
+  "expires_at_utc": "<later RFC3339 UTC timestamp>"
+}
+```
+
+Candidates older than `authorized_at_utc` are ignored. The authorization is
+re-read on every polling iteration, and an iteration at or after
+`expires_at_utc` fails closed before considering a new order.
+
+Inspect the journal or run one foreground wait/attempt with:
+
+```bash
+sudo -u polybot -H /opt/polybot/.venv/bin/polybot live-v2 status \
+  --database /var/lib/polybot/polybot.sqlite3 --json
+sudo -u polybot -H /opt/polybot/.venv/bin/polybot live-v2 run \
+  --database /var/lib/polybot/polybot.sqlite3 \
+  --credentials /var/lib/polybot/live/credentials.json \
+  --authorization /var/lib/polybot/live/live-v2-authorization.json \
+  --json
+```
+
+`deploy/linux/install-systemd.sh` installs but does not enable the opt-in
+`polybot-live-v2.service`. After the database, credentials, and unexpired
+authorization exist, manage it explicitly:
+
+```bash
+systemctl enable --now polybot-live-v2.service
+systemctl status polybot-live-v2.service
+journalctl -u polybot-live-v2.service -f
+systemctl stop polybot-live-v2.service
+```

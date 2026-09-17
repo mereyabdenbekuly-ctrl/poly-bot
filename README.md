@@ -11,7 +11,8 @@
   NOAA/WRH/Synoptic и сверяет их с Aviation Weather Center;
 - считает исполнимую цену по глубине стакана, комиссию, минимальный ордер и EV;
 - пишет все снимки и решения в SQLite;
-- умеет открывать только **виртуальные** позиции.
+- основной observer умеет открывать только **виртуальные** позиции; узкие
+  live-исполнители изолированы и запускаются отдельно;
 - автономно работает без браузера, формирует отчёты через 60 и 120 минут и
   продолжает следующее окно без сброса бюджета;
 - предоставляет локальный read-only dashboard;
@@ -19,11 +20,10 @@
   получения официального доступа, без подмены отсутствующих данных заглушками.
 
 > Проект не гарантирует прибыль. Модель вероятностей пока не откалибрована на
-> достаточной выборке завершившихся событий. По состоянию на 16 сентября 2026
-> года минимальный one-shot live-pilot доступен только как ручной,
-> approval-gated CLI. У него нет таймера, systemd-сервиса или связи со scanner.
-> Без защищённых реквизитов, свежего v1 `PAPER_BUY` и отдельного подтверждения
-> точного intent он ничего не подписывает и не отправляет.
+> достаточной выборке завершившихся событий. Legacy `live-pilot` остаётся
+> отдельным one-shot-контуром. `live-v2` — другой, явно включаемый bounded
+> контур с отдельными authorization и журналом; он не снимает фиксированные
+> лимиты и не подключает обычный observer напрямую к реальным заявкам.
 
 ### Ручной one-shot live-pilot
 
@@ -42,12 +42,27 @@
   автоматический unlimited approval SDK;
 - geoblock и неподтверждённая юрисдикционная доступность блокируют выполнение.
 
-Контур доступен через `polybot live-pilot`, но запускается только вручную и не
-имеет cron/systemd unit. При первой попытке исполнения exact intent навсегда занимает one-shot slot в
-SQLite ещё до подписи/POST, поэтому новый intent не обходит запрет после рестарта.
+Основные `preview`/`prepare`/`execute` команды запускаются вручную. Отдельный
+`auto-once` wrapper может ждать кандидата через opt-in systemd unit, но всё
+равно расходует тот же постоянный one-shot slot. При первой попытке исполнения
+exact intent slot занимается в SQLite ещё до подписи/POST, поэтому новый intent
+не обходит запрет после рестарта.
 Приватный ключ нельзя передавать в чат, git, `.env` или аргументах процесса;
 подключение выполняется скрытым TTY-вводом на VPS. Пошаговая процедура и
 read-only проверка описаны в `docs/live-pilot.md`.
+
+### Ограниченный live-v2
+
+`polybot live-v2` отделён от legacy one-shot: собственный журнал и standing
+authorization, только `FOK BUY` до `$1.90`/`$2.00` all-in, одна попытка за
+локальные сутки `Asia/Almaty`, одна позиция и не более `$10.00` collateral.
+Одна попытка в сутки консервативно ограничивает новый дневной риск `$2.00`;
+закрытие позиции или иная торговая активность кошелька в этот день также
+блокируют новую попытку. Ambiguous результат не повторяется, а `MANUAL_REVIEW`
+блокирует новые заявки.
+Authorization имеет обязательный срок действия. Команды `status`/`run`, схема
+sidecar и opt-in unit `polybot-live-v2.service` описаны в
+[`docs/live-pilot.md`](docs/live-pilot.md#live-v2-bounded-daily-loop).
 
 ## Текущий контур
 
@@ -402,8 +417,8 @@ Production-like paper deployment uses the checked-in units under `deploy/linux`.
 They keep the observer in explicit `--paper` mode, bind the dashboard only to
 `127.0.0.1:8787`, and retain twelve SQLite backups. The official raw ECMWF
 archive timer is installed but must remain disabled until the operator has set
-a storage-retention/free-space policy. The repository contains no live-order
-executor.
+a storage-retention/free-space policy. Live units are installed as disabled,
+opt-in units and are not part of the paper deployment.
 
 Expected paths:
 
@@ -434,6 +449,15 @@ systemctl enable --now polybot-backup.timer
 Do not enable `polybot-ecmwf-archive.timer` merely as part of deployment: its
 raw archive is intentionally immutable and currently has no automatic pruning.
 
+The installer also copies `polybot-live-v2.service` but never enables it. Start
+it only after the protected credentials and unexpired authorization from
+`docs/live-pilot.md` exist:
+
+```bash
+systemctl enable --now polybot-live-v2.service
+systemctl status polybot-live-v2.service
+```
+
 Do not expose port 8787 publicly. Use a local SSH tunnel instead:
 
 ```bash
@@ -449,6 +473,8 @@ polybot scan --paper           один цикл с виртуальными п�
 polybot run --interval 300     непрерывный цикл
 polybot dashboard              локальная read-only страница состояния
 polybot status                 экспозиция, P&L и расходы API
+polybot live-v2 status --json  журнал и фиксированные live-v2 лимиты
+polybot live-v2 run --json     ожидать и выполнить одну bounded live-попытку
 polybot diagnostics [--json]   forecast-vs-trade и sigma-диагностика
 polybot comparison [--json]    сравнительный отчёт v1 / ECMWF / v2
 polybot settle ID --won|--lost ручной результат paper-позиции
@@ -526,10 +552,11 @@ uv run pyright
 uv run pytest --cov=polybot
 ```
 
-## Почему live trading отсутствует
+## Почему live trading остаётся жёстко ограниченным
 
-Реальный исполнитель нельзя безопасно добавлять до выполнения как минимум
-следующих условий:
+Обычный scanner/observer остаётся paper-only. Изолированные `live-pilot` и
+`live-v2` нельзя расширять за пределы их фиксированных лимитов без выполнения
+как минимум следующих условий:
 
 1. положительный out-of-sample результат после всех расходов;
 2. калиброванные вероятности и устойчивость к худшему исполнению;
