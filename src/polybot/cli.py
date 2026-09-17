@@ -644,7 +644,8 @@ def _run_live_pilot(settings: Settings, args: argparse.Namespace) -> None:
         write_prepared_intent,
     )
 
-    database = Path(args.database).expanduser() if args.database else settings.database_path
+    database_option = getattr(args, "database", None)
+    database = Path(database_option).expanduser() if database_option else settings.database_path
     journal = LivePilotJournal(database)
     result: dict[str, Any]
     if args.live_command == "status":

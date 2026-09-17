@@ -25,10 +25,18 @@ def test_diagnostics_command_is_available_without_runtime_side_effects() -> None
     assert args.as_json is True
 
 
+def test_live_provision_defaults_to_supported_direct_signer_without_database_arg() -> None:
+    args = build_parser().parse_args(["live-pilot", "provision"])
+
+    assert args.command == "live-pilot"
+    assert args.live_command == "provision"
+    assert args.auth_mode == "direct_signer"
+    assert args.wallet is None
+    assert not hasattr(args, "database")
+
+
 def test_weathernext_first_trial_and_existing_read_flags_are_explicit() -> None:
-    planned = build_parser().parse_args(
-        ["weathernext", "first-full-trial-plan", "--json"]
-    )
+    planned = build_parser().parse_args(["weathernext", "first-full-trial-plan", "--json"])
     assert planned.weathernext_command == "first-full-trial-plan"
     assert planned.as_json is True
 
