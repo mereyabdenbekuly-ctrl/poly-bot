@@ -670,13 +670,14 @@ def _run_live_pilot(settings: Settings, args: argparse.Namespace) -> None:
 
     database_option = getattr(args, "database", None)
     database = Path(database_option).expanduser() if database_option else settings.database_path
+    live_settings = settings.model_copy(update={"database_path": database})
     journal = LivePilotJournal(database)
     result: dict[str, Any]
     if args.live_command == "status":
         result = live_pilot_status(journal)
     elif args.live_command == "account-check":
         check = account_check(
-            settings=settings,
+            settings=live_settings,
             credentials_path=Path(args.credentials),
             journal=journal,
         )
@@ -684,14 +685,14 @@ def _run_live_pilot(settings: Settings, args: argparse.Namespace) -> None:
     elif args.live_command == "preview":
         with PublicClient() as client:
             intent = preview_intent_from_decision(
-                settings=settings,
+                settings=live_settings,
                 decision_id=args.decision_id,
                 client=client,
             )
         result = {**intent_report(intent), "binding": False, "one_shot_reserved": False}
     elif args.live_command == "prepare":
         check = account_check(
-            settings=settings,
+            settings=live_settings,
             credentials_path=Path(args.credentials),
             journal=journal,
         )
@@ -702,7 +703,7 @@ def _run_live_pilot(settings: Settings, args: argparse.Namespace) -> None:
         credentials = load_live_credentials(Path(args.credentials))
         with open_live_client(credentials) as client:
             intent = preview_intent_from_decision(
-                settings=settings,
+                settings=live_settings,
                 decision_id=args.decision_id,
                 client=client,
             )
