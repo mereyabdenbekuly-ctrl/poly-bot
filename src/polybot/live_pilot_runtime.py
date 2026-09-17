@@ -320,10 +320,34 @@ def preview_intent_from_decision(
         raise LivePilotError("paper decision payload is invalid") from error
     if not isinstance(payload, dict):
         raise LivePilotError("paper decision payload is invalid")
-    if str(row["action"]) != "PAPER_BUY" or payload.get("action") != "PAPER_BUY":
-        raise LivePilotError("live pilot can only mirror a PAPER_BUY decision")
+    row_action = str(row["action"])
+    payload_action = str(payload.get("action", ""))
+    reason_codes = payload.get("reason_codes")
+    virtual_monitor_only = (
+        row_action == "OBSERVE"
+        and payload_action == "OBSERVE"
+        and reason_codes == ["ACTIVE_PAPER_EVENT_MONITOR_ONLY"]
+    )
+    if (
+        not (row_action == "PAPER_BUY" and payload_action == "PAPER_BUY")
+        and not virtual_monitor_only
+    ):
+        raise LivePilotError(
+            "live pilot requires PAPER_BUY or a v1 candidate suppressed solely by "
+            "the virtual-paper duplicate guard"
+        )
     if payload.get("strategy_version") != "v1":
         raise LivePilotError("live pilot is fixed to the existing v1 strategy")
+    if virtual_monitor_only:
+        try:
+            edge = Decimal(str(payload["probability_edge"]))
+            expected_profit = Decimal(str(payload["expected_profit_usd"]))
+        except (KeyError, ValueError) as error:
+            raise LivePilotError("monitor-only v1 candidate is missing risk metrics") from error
+        if edge < settings.min_probability_edge:
+            raise LivePilotError("monitor-only v1 candidate no longer meets the edge gate")
+        if expected_profit < settings.min_expected_profit_usd:
+            raise LivePilotError("monitor-only v1 candidate no longer meets the EV gate")
     if newer is not None:
         raise LivePilotError(
             f"paper decision is superseded by decision {int(newer['id'])} ({newer['action']})"
@@ -331,7 +355,7 @@ def preview_intent_from_decision(
     created = _parse_time(payload.get("created_at", row["created_at"]))
     expires = created + timedelta(seconds=settings.max_book_age_seconds)
     if current >= expires:
-        raise LivePilotError("paper decision is stale; wait for a new v1 PAPER_BUY")
+        raise LivePilotError("paper decision is stale; wait for a new v1 candidate")
     end_date = _parse_time(payload.get("end_date"))
     if current >= end_date:
         raise LivePilotError("market target has already ended")

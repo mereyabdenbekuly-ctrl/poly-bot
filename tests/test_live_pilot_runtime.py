@@ -43,7 +43,13 @@ class FakePublicClient:
         )
 
 
-def _decision_db(path: Path, *, created: datetime = NOW) -> None:
+def _decision_db(
+    path: Path,
+    *,
+    created: datetime = NOW,
+    action: str = "PAPER_BUY",
+    reason_codes: list[str] | None = None,
+) -> None:
     with sqlite3.connect(path) as connection:
         connection.execute(
             """
@@ -58,7 +64,8 @@ def _decision_db(path: Path, *, created: datetime = NOW) -> None:
             """
         )
         payload = {
-            "action": "PAPER_BUY",
+            "action": action,
+            "reason_codes": reason_codes or [],
             "strategy_version": "v1",
             "event_id": "event-1",
             "market_id": "market-1",
@@ -67,6 +74,8 @@ def _decision_db(path: Path, *, created: datetime = NOW) -> None:
             "book_hash": "book-1",
             "notional_usd": "1.90",
             "executable_price": "0.50",
+            "probability_edge": "0.10",
+            "expected_profit_usd": "0.30",
             "created_at": created.isoformat(),
             "end_date": (created + timedelta(days=1)).isoformat(),
         }
@@ -75,7 +84,7 @@ def _decision_db(path: Path, *, created: datetime = NOW) -> None:
             (
                 "event-1",
                 "market-1",
-                "PAPER_BUY",
+                action,
                 created.isoformat(),
                 json.dumps(payload),
             ),
@@ -169,6 +178,42 @@ def test_preview_rejects_stale_or_superseded_decision(tmp_path: Path) -> None:
             decision_id=1,
             client=FakePublicClient(),
             now=NOW + timedelta(seconds=20),
+        )
+
+
+def test_preview_accepts_candidate_suppressed_only_by_virtual_paper_duplicate(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "polybot.sqlite3"
+    _decision_db(
+        database,
+        action="OBSERVE",
+        reason_codes=["ACTIVE_PAPER_EVENT_MONITOR_ONLY"],
+    )
+    settings = Settings(database_path=database, max_book_age_seconds=180)
+
+    intent = preview_intent_from_decision(
+        settings=settings,
+        decision_id=1,
+        client=FakePublicClient(),
+        now=NOW + timedelta(seconds=30),
+    )
+
+    assert intent.strategy == "open-meteo-truncated-normal-v1"
+    assert intent.amount_usd == Decimal("1.90")
+
+
+def test_preview_rejects_observe_with_any_non_virtual_reason(tmp_path: Path) -> None:
+    database = tmp_path / "polybot.sqlite3"
+    _decision_db(database, action="OBSERVE", reason_codes=["EDGE_TOO_SMALL"])
+    settings = Settings(database_path=database, max_book_age_seconds=180)
+
+    with pytest.raises(LivePilotError, match="requires PAPER_BUY"):
+        preview_intent_from_decision(
+            settings=settings,
+            decision_id=1,
+            client=FakePublicClient(),
+            now=NOW + timedelta(seconds=30),
         )
 
 

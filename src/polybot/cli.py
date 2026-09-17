@@ -92,7 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_live_paths(live_check)
     live_check.add_argument("--json", action="store_true", dest="as_json")
     live_preview = live_sub.add_parser(
-        "preview", help="Build a non-binding unsigned preview from one fresh v1 PAPER_BUY"
+        "preview", help="Build a non-binding unsigned preview from one fresh v1 candidate"
     )
     _add_live_paths(live_preview, credentials=False)
     live_preview.add_argument("--decision-id", type=int, required=True)

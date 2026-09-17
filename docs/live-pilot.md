@@ -65,9 +65,12 @@ closed-only state, geoblock result, and the persistent one-shot gate.
 
 ## Preview and prepare
 
-Only a fresh, non-superseded `v1` `PAPER_BUY` with the exact still-current book
-hash can be mirrored. A preview is unsigned, non-binding, and does not reserve
-the slot:
+Only a fresh, non-superseded `v1` candidate with the exact still-current book
+hash can be mirrored. This is either `PAPER_BUY`, or `OBSERVE` when its sole
+reason is `ACTIVE_PAPER_EVENT_MONITOR_ONLY`: that state is the same computed v1
+buy candidate downgraded only to prevent a duplicate **virtual** paper position.
+Every other `OBSERVE`/`SKIP` remains ineligible. A preview is unsigned,
+non-binding, and does not reserve the slot:
 
 ```bash
 sudo -u polybot -H /opt/polybot/.venv/bin/polybot live-pilot preview \
