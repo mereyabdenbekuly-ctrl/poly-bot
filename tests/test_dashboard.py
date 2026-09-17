@@ -8,6 +8,7 @@ from typing import cast
 import polybot.dashboard as dashboard_module
 from polybot.dashboard import COMPARISON_VERSION, ComparisonCache
 from polybot.forecast_store import ForecastStore
+from polybot.live_v2 import LiveV2Journal
 from polybot.storage import Storage
 
 
@@ -46,6 +47,25 @@ def test_dashboard_is_read_only_snapshot(tmp_path) -> None:
     comparison = cast(dict[str, object], payload["forecast_comparison"])
     assert comparison["events"] == []
     assert comparison["metrics"] == []
+    live_v2 = cast(dict[str, object], payload["live_v2"])
+    assert live_v2["configured"] is False
+
+
+def test_dashboard_includes_live_v2_heartbeat_and_limits(tmp_path) -> None:
+    storage = Storage(tmp_path / "live-dashboard.sqlite3")
+    journal = LiveV2Journal(storage.path)
+    journal.heartbeat("WAITING_FOR_SIGNAL")
+
+    payload = storage.dashboard_payload(forecast_store=ForecastStore(storage.path))
+
+    live_v2 = cast(dict[str, object], payload["live_v2"])
+    assert live_v2["configured"] is True
+    assert live_v2["state"] == "WAITING_FOR_SIGNAL"
+    runtime = cast(dict[str, object], live_v2["runtime"])
+    assert runtime["state"] == "WAITING_FOR_SIGNAL"
+    limits = cast(dict[str, object], live_v2["limits"])
+    assert limits["order_type"] == "FOK"
+    assert limits["max_all_in_spend_usd"] == "2.00"
 
 
 def test_comparison_cache_returns_read_only_no_data_for_fresh_database(tmp_path) -> None:
@@ -187,6 +207,14 @@ def test_dashboard_renders_cached_comparison_gate() -> None:
     assert 'id="comparison-gate"' in dashboard_module._HTML  # noqa: SLF001
     assert "fetch('/api/comparison'" in dashboard_module._HTML  # noqa: SLF001
     assert "v1 remains active" in dashboard_module._HTML  # noqa: SLF001
+
+
+def test_dashboard_renders_live_v2_and_scan_freshness() -> None:
+    html = dashboard_module._HTML  # noqa: SLF001
+    assert 'id="live-v2"' in html
+    assert "LIVE V2 ARMED" in html
+    assert "heartbeat" in html
+    assert "scan #" in html
 
 
 def test_dashboard_renders_weathernext_statistics_as_summary_only() -> None:

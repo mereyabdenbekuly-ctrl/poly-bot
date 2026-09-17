@@ -16,6 +16,7 @@ from polybot.models import (
     GeoblockStatus,
     MarketDefinition,
     MarketSnapshot,
+    PaperOrderStatus,
     RuleInterpretation,
     WeatherForecast,
 )
@@ -257,6 +258,9 @@ def test_active_monitoring_does_not_consume_new_candidate_quota(monkeypatch) -> 
             return 321
 
         def active_paper_event_ids(self):
+            return {"active-event", "awaiting-event"}
+
+        def open_paper_event_ids(self):
             return {"active-event"}
 
         def finish_scan(self, *args, **kwargs):  # noqa: ANN002, ANN003
@@ -290,11 +294,40 @@ def test_active_monitoring_does_not_consume_new_candidate_quota(monkeypatch) -> 
     )
 
     assert ("candidate_quota", 8) in calls
-    assert ("excluded", {"active-event"}) in calls
+    assert ("excluded", {"active-event", "awaiting-event"}) in calls
     assert ("active-event", False) in calls
     assert ("candidate-event", True) in calls
     assert report.events_scanned == 2
     assert report.paper_orders_opened == 0
+
+
+def test_recent_awaiting_result_skips_expensive_resolution_calls() -> None:
+    now = datetime.now(UTC)
+    order = SimpleNamespace(
+        id=1,
+        status=PaperOrderStatus.AWAITING_RESULT,
+        resolution_checked_at=now - timedelta(minutes=5),
+    )
+
+    class FakeStorage:
+        def active_paper_orders(self):
+            return [order]
+
+    class FakeGateway:
+        def get_snapshot_for_token(self, **kwargs):  # noqa: ANN003
+            raise AssertionError("recent awaiting-result rows must be throttled")
+
+        def get_resolution(self, **kwargs):  # noqa: ANN003
+            raise AssertionError("recent awaiting-result rows must be throttled")
+
+    scanner = Scanner.__new__(Scanner)
+    scanner.settings = Settings(paper_resolution_recheck_seconds=1800)
+    scanner.storage = cast(Any, FakeStorage())
+
+    settled, errors = scanner._settle_resolved_paper_orders(cast(Any, FakeGateway()))
+
+    assert settled == 0
+    assert errors == []
 
 
 def test_evaluation_registry_keeps_source_failure_in_eligible_cohort() -> None:

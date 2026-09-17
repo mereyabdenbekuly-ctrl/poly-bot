@@ -36,6 +36,7 @@ from polybot.models import (
     EventDefinition,
     MarketDecision,
     MarketSnapshot,
+    PaperOrderStatus,
     RuleAudit,
     RuleInterpretation,
     ScanReport,
@@ -178,7 +179,13 @@ class Scanner:
                 # never through the opening path, and do not consume the quota
                 # reserved for new candidate events.
                 active_event_ids = self.storage.active_paper_event_ids()
-                for event_id in sorted(active_event_ids):
+                monitor_lookup = getattr(self.storage, "open_paper_event_ids", None)
+                monitor_event_ids = (
+                    cast(Callable[[], set[str]], monitor_lookup)()
+                    if callable(monitor_lookup)
+                    else active_event_ids
+                )
+                for event_id in sorted(monitor_event_ids):
                     try:
                         event = gateway.get_weather_event(event_id)
                     except Exception as error:
@@ -695,6 +702,13 @@ class Scanner:
                 if order.status.value == "RESOLVED":
                     self.storage.settle_resolved_paper_order(order.id)
                     settled += 1
+                    continue
+                if (
+                    order.status is PaperOrderStatus.AWAITING_RESULT
+                    and order.resolution_checked_at is not None
+                    and datetime.now(UTC) - order.resolution_checked_at.astimezone(UTC)
+                    < timedelta(seconds=self.settings.paper_resolution_recheck_seconds)
+                ):
                     continue
                 if order.condition_id is None or not order.identity_verified:
                     raise ValueError(

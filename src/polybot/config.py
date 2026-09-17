@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     min_expected_profit_usd: Decimal = Decimal("0.25")
     execution_buffer_usd: Decimal = Decimal("0.02")
     max_book_age_seconds: int = Field(default=180, ge=10, le=3600)
+    paper_resolution_recheck_seconds: int = Field(default=1800, ge=300, le=86400)
 
     weather_error_sigma_c: float = Field(default=1.5, gt=0.1, le=10)
     min_ensemble_members: int = Field(default=20, ge=5, le=200)

@@ -758,32 +758,37 @@ class Storage:
             reverse=True,
         )
         latest_scan = portfolio.get("last_scan")
-        latest_cycle = None
-        if active is not None:
-            reports = self.runtime_reports(active.id)
-            for report in reversed(reports):
-                if report.kind == "CYCLE" and isinstance(report.payload.get("scan"), dict):
-                    latest_cycle = report.payload["scan"]
-                    break
+        with self.connect() as connection:
+            latest_completed_scan_row = connection.execute(
+                "SELECT * FROM scan_runs WHERE status != 'running' "
+                "ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            recent_decision_rows = connection.execute(
+                "SELECT payload_json FROM decisions ORDER BY id DESC LIMIT 40"
+            ).fetchall()
         compact_decisions: list[dict[str, object]] = []
-        if isinstance(latest_cycle, dict):
-            for decision in latest_cycle.get("decisions", [])[:40]:
-                if not isinstance(decision, dict):
-                    continue
-                compact_decisions.append(
-                    {
-                        "action": decision.get("action"),
-                        "event_id": decision.get("event_id"),
-                        "market_id": decision.get("market_id"),
-                        "probability": decision.get("probability"),
-                        "executable_price": decision.get("executable_price"),
-                        "probability_edge": decision.get("probability_edge"),
-                        "expected_profit_usd": decision.get("expected_profit_usd"),
-                        "reason_codes": decision.get("reason_codes", []),
-                        "warning_codes": decision.get("warning_codes", []),
-                        "strategy_version": decision.get("strategy_version", "v1"),
-                    }
-                )
+        for row in recent_decision_rows:
+            try:
+                decision = json.loads(str(row["payload_json"]))
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(decision, dict):
+                continue
+            compact_decisions.append(
+                {
+                    "action": decision.get("action"),
+                    "event_id": decision.get("event_id"),
+                    "market_id": decision.get("market_id"),
+                    "probability": decision.get("probability"),
+                    "executable_price": decision.get("executable_price"),
+                    "probability_edge": decision.get("probability_edge"),
+                    "expected_profit_usd": decision.get("expected_profit_usd"),
+                    "reason_codes": decision.get("reason_codes", []),
+                    "warning_codes": decision.get("warning_codes", []),
+                    "strategy_version": decision.get("strategy_version", "v1"),
+                    "created_at": decision.get("created_at"),
+                }
+            )
         forecast_comparison: dict[str, object]
         try:
             if forecast_store is None:
@@ -901,11 +906,17 @@ class Storage:
                 "recent_decisions": [],
                 "error": str(error),
             }
+        live_v2 = self.live_v2_dashboard_summary()
         return {
             "generated_at": utc_now().isoformat(),
             "portfolio": portfolio,
             "positions": positions,
             "latest_scan": latest_scan,
+            "last_completed_scan": (
+                None
+                if latest_completed_scan_row is None
+                else dict(latest_completed_scan_row)
+            ),
             "decisions": compact_decisions,
             "active_window": None if active is None else active.model_dump(mode="json"),
             "reports": dashboard_reports,
@@ -915,6 +926,62 @@ class Storage:
             "weathernext_statistics": weathernext_statistics,
             "weathernext_full_refresh": weathernext_full_refresh,
             "weathernext_paper": weathernext_paper,
+            "live_v2": live_v2,
+        }
+
+    def live_v2_dashboard_summary(self) -> dict[str, object]:
+        """Return a read-only summary of the isolated live-v2 journal."""
+
+        with self.connect() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='live_v2_attempts'"
+            ).fetchone()
+            if exists is None:
+                return {
+                    "configured": False,
+                    "state": "NOT_CONFIGURED",
+                    "attempts": 0,
+                    "states": {},
+                    "latest": None,
+                }
+            state_rows = connection.execute(
+                "SELECT state,COUNT(*) AS count FROM live_v2_attempts GROUP BY state"
+            ).fetchall()
+            latest = connection.execute(
+                "SELECT local_day,decision_id,intent_sha256,state,remote_order_id,"
+                "created_at_utc,updated_at_utc,submitted_at_utc,closed_at_utc,"
+                "realized_pnl_usd FROM live_v2_attempts ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            runtime_exists = connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='live_v2_runtime'"
+            ).fetchone()
+            runtime = (
+                None
+                if runtime_exists is None
+                else connection.execute(
+                    "SELECT state,detail_json,updated_at_utc FROM live_v2_runtime "
+                    "WHERE singleton=1"
+                ).fetchone()
+            )
+        states = {str(row["state"]): int(row["count"]) for row in state_rows}
+        return {
+            "configured": True,
+            "state": "WAITING_FOR_SIGNAL" if latest is None else str(latest["state"]),
+            "attempts": sum(states.values()),
+            "states": states,
+            "latest": None if latest is None else dict(latest),
+            "runtime": None if runtime is None else dict(runtime),
+            "limits": {
+                "side": "BUY",
+                "order_type": "FOK",
+                "max_buy_notional_usd": "1.90",
+                "max_all_in_spend_usd": "2.00",
+                "max_wallet_balance_usd": "10.00",
+                "max_orders_per_day": 1,
+                "daily_timezone": "Asia/Almaty",
+            },
         }
 
     def start_scan(self, *, query: str, mode: str, window_id: int | None = None) -> int:
@@ -1962,6 +2029,11 @@ class Storage:
                     None if row["end_date"] is None else datetime.fromisoformat(row["end_date"])
                 ),
                 identity_verified=bool(row["identity_verified"]),
+                resolution_checked_at=(
+                    None
+                    if row["resolution_checked_at"] is None
+                    else datetime.fromisoformat(str(row["resolution_checked_at"]))
+                ),
             )
             for row in rows
         ]
@@ -1973,6 +2045,20 @@ class Storage:
             rows = connection.execute(
                 "SELECT DISTINCT event_id FROM paper_orders "
                 "WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED')"
+            ).fetchall()
+        return {str(row["event_id"]) for row in rows}
+
+    def open_paper_event_ids(self) -> set[str]:
+        """Return only positions that still need the full forecast monitor lane.
+
+        ``AWAITING_RESULT`` rows remain active exposure and continue to block a
+        duplicate entry, but their lightweight resolution check is enough; a
+        complete weather/rules/forecast rescan cannot change their outcome.
+        """
+
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT DISTINCT event_id FROM paper_orders WHERE status = 'OPEN'"
             ).fetchall()
         return {str(row["event_id"]) for row in rows}
 

@@ -229,6 +229,8 @@ class LiveV2Journal:
     def __init__(self, database: Path) -> None:
         self.path = database.expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._last_heartbeat_monotonic = 0.0
+        self._last_heartbeat_state: str | None = None
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
@@ -273,6 +275,13 @@ class LiveV2Journal:
                     detail_json TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS live_v2_runtime(
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    state TEXT NOT NULL,
+                    detail_json TEXT NOT NULL,
+                    updated_at_utc TEXT NOT NULL
+                );
+
                 """
             )
             columns = {
@@ -292,6 +301,29 @@ class LiveV2Journal:
                 "CREATE INDEX IF NOT EXISTS live_v2_attempts_closed_day_idx "
                 "ON live_v2_attempts(closed_local_day)"
             )
+
+    def heartbeat(self, state: str, *, detail: Mapping[str, Any] | None = None) -> None:
+        now_monotonic = time.monotonic()
+        if (
+            state == self._last_heartbeat_state
+            and now_monotonic - self._last_heartbeat_monotonic < 30
+        ):
+            return
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO live_v2_runtime(singleton,state,detail_json,updated_at_utc)
+                VALUES (1, ?, ?, ?)
+                ON CONFLICT(singleton) DO UPDATE SET
+                    state=excluded.state,
+                    detail_json=excluded.detail_json,
+                    updated_at_utc=excluded.updated_at_utc
+                """,
+                (state, _canonical_json(detail or {}), now),
+            )
+        self._last_heartbeat_state = state
+        self._last_heartbeat_monotonic = now_monotonic
 
     def reserve(
         self,
@@ -550,8 +582,13 @@ class LiveV2Journal:
             latest = connection.execute(
                 "SELECT * FROM live_v2_attempts ORDER BY id DESC LIMIT 1"
             ).fetchone()
+            runtime = connection.execute(
+                "SELECT state,detail_json,updated_at_utc FROM live_v2_runtime "
+                "WHERE singleton=1"
+            ).fetchone()
         return {
             "states": states,
+            "runtime": None if runtime is None else dict(runtime),
             "latest": None
             if latest is None
             else {
@@ -1005,6 +1042,7 @@ def run_live_v2(
     timeout_seconds: float,
 ) -> dict[str, Any]:
     journal = LiveV2Journal(database)
+    journal.heartbeat("STARTING")
     started = time.monotonic()
     while timeout_seconds <= 0 or time.monotonic() - started < timeout_seconds:
         authorization = load_live_v2_authorization(authorization_path)
@@ -1013,8 +1051,10 @@ def run_live_v2(
             raise LivePilotError("live-v2 requires an authorized Deposit Wallet session key")
         if credentials.wallet.casefold() != authorization.wallet.casefold():
             raise LivePilotError("live-v2 authorization wallet does not match credentials")
+        journal.heartbeat("RUNNING")
         active = journal.latest_active()
         if active is not None:
+            journal.heartbeat("RECONCILING", detail={"state": active.state.value})
             with open_live_client(credentials) as client:
                 if str(client.wallet_type) != "DEPOSIT_WALLET":
                     raise LivePilotError("live-v2 requires a Deposit Wallet")
@@ -1030,6 +1070,7 @@ def run_live_v2(
                 continue
         local_day = _local_day(datetime.now(UTC), authorization.daily_timezone)
         if journal.attempt_for_day(local_day) is not None or journal.closed_on_day(local_day):
+            journal.heartbeat("DAILY_LIMIT", detail={"local_day": local_day})
             time.sleep(max(30.0, poll_seconds))
             continue
         candidates = eligible_live_v2_candidates(
@@ -1039,8 +1080,10 @@ def run_live_v2(
             max_book_age_seconds=settings.max_book_age_seconds,
         )
         if not candidates:
+            journal.heartbeat("WAITING_FOR_SIGNAL")
             time.sleep(max(1.0, poll_seconds))
             continue
+        journal.heartbeat("CHECKING_CANDIDATE", detail={"count": len(candidates)})
         with open_live_client(credentials) as client:
             if str(client.wallet_type) != "DEPOSIT_WALLET":
                 raise LivePilotError("live-v2 requires a Deposit Wallet")
@@ -1079,12 +1122,20 @@ def run_live_v2(
                 )
                 if geoblock.blocked:
                     raise LivePilotError("network is geoblocked; live-v2 is disabled")
+                journal.heartbeat(
+                    "EXECUTING",
+                    detail={"decision_id": candidate.decision_id},
+                )
                 record = LiveV2Executor(journal).execute(
                     client=cast(Any, client),
                     intent=intent,
                     decision_id=candidate.decision_id,
                     authorization=authorization,
                     geoblocked=geoblock.blocked,
+                )
+                journal.heartbeat(
+                    "ATTEMPT_RECORDED",
+                    detail={"state": record.state.value},
                 )
                 return {
                     "mode": "LIVE_V2",

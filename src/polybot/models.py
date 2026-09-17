@@ -212,6 +212,7 @@ class PaperOrderTarget(StrictModel):
     fee_exponent: Decimal
     end_date: datetime | None
     identity_verified: bool
+    resolution_checked_at: datetime | None = None
 
 
 class WeatherNextPaperOrderTarget(StrictModel):

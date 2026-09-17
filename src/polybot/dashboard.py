@@ -109,6 +109,7 @@ h1{font-size:25px;letter-spacing:-.03em;margin:0}.subtitle{color:var(--muted);ma
   </header>
   <section class="grid" id="metrics"></section>
   <section class="card panel window" id="window"></section>
+  <section class="card panel" id="live-v2"></section>
   <section class="card panel"><div class="panel-head"><div><h2>Forecast comparison</h2><div class="panel-note">latest archived events · forecasts appear even without a trade</div></div><span id="forecast-count" class="pill blue">COLLECTING</span></div><div id="forecasts" class="forecast-grid"></div></section>
   <section class="card panel"><div class="panel-head"><div><h2>WeatherNext 3 statistics</h2><div class="panel-note">official statistics surface · one station · read-only summary</div></div><span id="weathernext-summary-mode" class="pill gray">SUMMARY_ONLY</span></div><div id="weathernext-summary"></div></section>
   <section class="card panel"><div class="panel-head"><div><h2>WeatherNext paper strategy</h2><div class="panel-note">isolated ledger · never mixed with v1 positions or P&amp;L</div></div><span id="weathernext-paper-state" class="pill gray">PAPER ONLY</span></div><div id="weathernext-paper"></div></section>
@@ -141,8 +142,9 @@ function renderMetrics(d){
   const allowed=cycleGeo.blocked===false || (cycleGeo.blocked==null && scan.geoblocked===0);
   const networkLocation=[cycleGeo.country,cycleGeo.region].filter(Boolean).join(' / ');
   const status=allowed?'good':'warn';
-  $('mode').textContent=d.active_window?.paper===false?'OBSERVE ONLY':'PAPER ONLY';
-  $('mode').className='pill '+(d.active_window?.paper===false?'gray':'blue');
+  const live=d.live_v2||{}, runtime=live.runtime||{}, heartbeat=runtime.updated_at_utc?new Date(runtime.updated_at_utc):null, liveOnline=Boolean(live.configured&&heartbeat&&(Date.now()-heartbeat.getTime())<90000);
+  $('mode').textContent=liveOnline?'LIVE V2 ARMED':d.active_window?.paper===false?'OBSERVE ONLY':'PAPER ONLY';
+  $('mode').className='pill '+(liveOnline?'green':d.active_window?.paper===false?'gray':'blue');
   $('metrics').innerHTML = [
     ['Open exposure',compactMoney(p.open_exposure_usd),'risk reserved','neutral'],
     ['Realized P&L',compactMoney(p.realized_pnl_usd),'after order-level API allocation',Number(p.realized_pnl_usd||0)>=0?'good':'warn'],
@@ -153,10 +155,14 @@ function renderMetrics(d){
 function renderWindow(d){
   const w=d.active_window, reports=d.reports||[];
   if(!w){$('window').innerHTML='<div class="empty">No active runtime window yet.</div>';return}
-  const start=new Date(w.started_at), secs=Math.max(0,(Date.now()-start.getTime())/1000), pct=Math.min(100,secs/7200*100), last=d.latest_scan||{}, next=last.completed_at?new Date(new Date(last.completed_at).getTime()+Number(w.interval_seconds||300)*1000):null;
+  const start=new Date(w.started_at), secs=Math.max(0,(Date.now()-start.getTime())/1000), pct=Math.min(100,secs/7200*100), last=d.latest_scan||{}, finished=d.last_completed_scan||{}, scanAge=last.started_at?Math.max(0,(Date.now()-new Date(last.started_at).getTime())/1000):0, scanText=last.status==='running'?`scan #${last.id} running ${elapsed(scanAge)}`:last.completed_at?`scan #${last.id} completed ${dateTime(last.completed_at)}`:finished.completed_at?`last finished ${dateTime(finished.completed_at)}`:'scan pending';
   $('window').innerHTML=`<div class="panel-head"><h2>Autonomous window #${w.id}</h2><span class="pill green"><span class="dot"></span> RUNNING</span></div>
-  <div class="window-meta"><span>Started ${dateTime(w.started_at)}</span><span>Every ${w.interval_seconds/60} min</span><span>${w.paper?'Paper trading':'Observe only'}</span><span>Astra ${w.astra?'on':'off'}</span><span>Next scan ${next?dateTime(next):'pending'}</span></div>
+  <div class="window-meta"><span>Started ${dateTime(w.started_at)}</span><span>Target cadence ${w.interval_seconds/60} min</span><span>${w.paper?'Paper research':'Observe only'}</span><span>Astra ${w.astra?'on':'off'}</span><span>${scanText}</span></div>
   <div class="bar"><span style="width:${pct}%"></span></div><div class="hint" style="margin-top:8px">${elapsed(secs)} of 120m · ${reports.length} saved reports · times shown in Almaty</div>`;
+}
+function renderLiveV2(d){
+ const live=d.live_v2||{}, runtime=live.runtime||{}, latest=live.latest||{}, limits=live.limits||{}, heartbeat=runtime.updated_at_utc?new Date(runtime.updated_at_utc):null, age=heartbeat?Math.max(0,(Date.now()-heartbeat.getTime())/1000):null, online=Boolean(live.configured&&heartbeat&&age<90), state=online?(runtime.state||live.state):(live.configured?'HEARTBEAT STALE':'NOT CONFIGURED'), stateClass=online?(state==='MANUAL_REVIEW'?'red':state==='DAILY_LIMIT'?'amber':'green'):'red';
+ $('live-v2').innerHTML=`<div class="panel-head"><div><h2>Live-v2 execution</h2><div class="panel-note">isolated Deposit Wallet lane · exact journal before every POST</div></div><span class="pill ${stateClass}">${esc(state)}</span></div><div class="grid" style="margin-bottom:0"><div class="metric"><div class="eyebrow">Service</div><div class="value ${online?'good':'warn'}">${online?'ONLINE':'CHECK'}</div><div class="hint">${heartbeat?`heartbeat ${elapsed(age)} ago`:'no heartbeat yet'}</div></div><div class="metric"><div class="eyebrow">Attempts</div><div class="value neutral">${live.attempts||0}</div><div class="hint">latest ${esc(latest.state||'waiting for signal')}</div></div><div class="metric"><div class="eyebrow">Order limits</div><div class="value neutral">$${esc(limits.max_buy_notional_usd||'1.90')}</div><div class="hint">FOK BUY · $${esc(limits.max_all_in_spend_usd||'2.00')} all-in</div></div><div class="metric"><div class="eyebrow">Daily guard</div><div class="value neutral">1</div><div class="hint">attempt/day · one position · $${esc(limits.max_wallet_balance_usd||'10.00')} wallet cap</div></div></div>`;
 }
 function renderPositions(d){
   const rows=d.positions||[];
@@ -338,11 +344,11 @@ function renderTimeline(d){
 }
 function renderDecisions(d){
  const decisions=d.decisions||[];
- if(!decisions.length){$('decisions').innerHTML='<div class="empty">No decisions in the latest cycle.</div>';return}
+ if(!decisions.length){$('decisions').innerHTML='<div class="empty">No recent decisions.</div>';return}
  const interesting=decisions.filter(x=>x.action!=='SKIP'||(x.expected_profit_usd!=null&&Number(x.expected_profit_usd)>0)).slice(0,12);
- $('decisions').innerHTML=(interesting.length?interesting:decisions.slice(0,12)).map(x=>`<div class="decision"><div class="decision-top"><span class="decision-id">${esc(x.market_id)}</span><span class="pill ${x.action==='PAPER_BUY'?'green':x.action==='OBSERVE'?'blue':'gray'}">${esc(x.action)}</span></div><div class="decision-metrics"><span>p ${x.probability==null?'—':(Number(x.probability)*100).toFixed(1)+'%'}</span><span>EV ${money(x.expected_profit_usd)}</span><span>entry ${money(x.executable_price)}</span></div><div class="decision-reason">${esc((x.reason_codes||[]).concat(x.warning_codes||[]).join(' · ')||'qualified')}</div></div>`).join('');
+ $('decisions').innerHTML=(interesting.length?interesting:decisions.slice(0,12)).map(x=>`<div class="decision"><div class="decision-top"><span class="decision-id">${esc(x.market_id)}</span><span class="pill ${x.action==='PAPER_BUY'?'green':x.action==='OBSERVE'?'blue':'gray'}">${esc(x.action)}</span></div><div class="decision-metrics"><span>p ${x.probability==null?'—':(Number(x.probability)*100).toFixed(1)+'%'}</span><span>EV ${money(x.expected_profit_usd)}</span><span>entry ${money(x.executable_price)}</span></div><div class="sub">${dateTime(x.created_at)}</div><div class="decision-reason">${esc((x.reason_codes||[]).concat(x.warning_codes||[]).join(' · ')||'qualified')}</div></div>`).join('');
 }
-async function refresh(){try{const response=await fetch('/api/dashboard',{cache:'no-store'});const data=await response.json();$('updated').textContent='Updated '+dateTime(data.generated_at);renderMetrics(data);renderWindow(data);renderForecasts(data);renderWeatherNextSummary(data);renderWeatherNextPaper(data);renderQuality(data);renderDiagnostics(data);renderPositions(data);renderSources(data);renderTimeline(data);renderDecisions(data)}catch(error){$('updated').textContent='Connection error';console.error(error)}}
+async function refresh(){try{const response=await fetch('/api/dashboard',{cache:'no-store'});const data=await response.json();$('updated').textContent='Updated '+dateTime(data.generated_at);renderMetrics(data);renderWindow(data);renderLiveV2(data);renderForecasts(data);renderWeatherNextSummary(data);renderWeatherNextPaper(data);renderQuality(data);renderDiagnostics(data);renderPositions(data);renderSources(data);renderTimeline(data);renderDecisions(data)}catch(error){$('updated').textContent='Connection error';console.error(error)}}
 async function refreshComparison(){try{const response=await fetch('/api/comparison',{cache:'no-store'});renderComparisonGate(await response.json())}catch(error){$('comparison-gate-state').textContent='UNAVAILABLE';$('comparison-gate').innerHTML='<div class="error">Comparison endpoint unavailable.</div>';console.error(error)}}
 refresh();refreshComparison();setInterval(refresh,30000);setInterval(refreshComparison,60000);
 </script>
