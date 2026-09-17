@@ -28,7 +28,9 @@ error_console = Console(stderr=True)
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="polybot",
-        description="Safe-by-default Polymarket weather research bot (no live executor).",
+        description=(
+            "Paper-first Polymarket weather bot with an approval-gated one-shot live pilot."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -111,6 +113,32 @@ def build_parser() -> argparse.ArgumentParser:
     live_execute.add_argument("--intent", default="/var/lib/polybot/live/intent.json")
     live_execute.add_argument("--approval", required=True)
     live_execute.add_argument("--json", action="store_true", dest="as_json")
+    live_auto_once = live_sub.add_parser(
+        "auto-once",
+        help="Wait for and submit at most one authorized fresh v1 FOK BUY",
+    )
+    _add_live_paths(live_auto_once)
+    live_auto_once.add_argument(
+        "--authorization",
+        default="/var/lib/polybot/live/auto-once-authorization.json",
+    )
+    live_auto_once.add_argument(
+        "--intent-output",
+        default="/var/lib/polybot/live/intent.json",
+    )
+    live_auto_once.add_argument(
+        "--exact-approval",
+        default="/var/lib/polybot/live/auto-once-exact-approval.json",
+    )
+    live_auto_once.add_argument("--poll-seconds", type=float, default=5.0)
+    live_auto_once.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=0.0,
+        help="Stop after this many seconds; 0 waits until one order attempt",
+    )
+    live_auto_once.add_argument("--after-decision-id", type=int, default=None)
+    live_auto_once.add_argument("--json", action="store_true", dest="as_json")
     live_reconcile = live_sub.add_parser(
         "reconcile", help="Read account state after an ambiguous or accepted submission"
     )
@@ -735,6 +763,20 @@ def _run_live_pilot(settings: Settings, args: argparse.Namespace) -> None:
             "remote_order_id": record.remote_order_id,
             "submitted_at_utc": record.submitted_at_utc,
         }
+    elif args.live_command == "auto-once":
+        from polybot.live_pilot_auto import run_auto_once
+
+        result = run_auto_once(
+            settings=live_settings,
+            database=database,
+            credentials_path=Path(args.credentials),
+            authorization_path=Path(args.authorization),
+            intent_output_path=Path(args.intent_output),
+            exact_approval_path=Path(args.exact_approval),
+            poll_seconds=args.poll_seconds,
+            timeout_seconds=args.timeout_seconds,
+            after_decision_id=args.after_decision_id,
+        )
     elif args.live_command == "reconcile":
         intent = load_live_intent(Path(args.intent))
         credentials = load_live_credentials(Path(args.credentials))

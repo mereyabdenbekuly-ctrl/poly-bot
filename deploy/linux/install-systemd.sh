@@ -59,6 +59,7 @@ for unit in \
   polybot-backup.timer \
   polybot-operational-report.service \
   polybot-operational-report.timer \
+  polybot-live-auto-once.service \
   polybot-astra-primary-tunnel.service \
   polybot-astra-fallback-tunnel.service \
   polybot-ecmwf-archive.service \

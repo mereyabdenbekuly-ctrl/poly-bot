@@ -89,3 +89,39 @@ sudo -u polybot -H /opt/polybot/.venv/bin/polybot live-pilot prepare \
 The `execute` command exists only for a later separately approved exact intent.
 It requires a private `0600` approval sidecar bound to the intent SHA-256. Do not
 run it until the owner explicitly approves that exact prepared intent.
+
+## Opt-in autonomous one-shot
+
+`live-pilot auto-once` is a standing-authorization wrapper around the same
+executor. It waits only for a **new** fresh eligible v1 candidate, prepares an
+exact intent, rechecks geoblock/account/book/fee state, and submits at most one
+FOK BUY. It does not remove any pilot limit: the wallet cap remains `$10`, the
+BUY notional cap remains `$1.90`, all-in spend remains `$2.00`, and the
+persistent one-shot gate is consumed before POST. A rejection, timeout, or
+ambiguous response also consumes the one-shot slot and is never retried.
+
+The command requires a private `0600` standing sidecar with this exact schema:
+
+```json
+{
+  "kind": "polybot-live-auto-once-v1",
+  "wallet": "0xDEPOSIT_WALLET",
+  "strategy": "open-meteo-truncated-normal-v1",
+  "side": "BUY",
+  "order_type": "FOK",
+  "max_orders": 1,
+  "max_wallet_balance_usd": "10.00",
+  "max_buy_notional_usd": "1.90",
+  "max_total_spend_usd": "2.00",
+  "min_probability_edge": "0.08",
+  "min_expected_profit_usd": "0.25",
+  "jurisdiction_confirmed": true,
+  "expires_at_utc": "2026-09-18T12:00:00+00:00"
+}
+```
+
+The sidecar is bound to the configured Deposit Wallet session key and is moved
+to a `.used-*` path as soon as the one-shot gate is consumed. The optional
+`polybot-live-auto-once.service` waits in the background but is never enabled by
+the installation script; an operator must create the sidecar and start it
+explicitly.

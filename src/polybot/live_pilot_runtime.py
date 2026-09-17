@@ -249,6 +249,8 @@ def account_check(
             blockers.append("existing_open_orders")
         if open_positions:
             blockers.append("existing_open_positions")
+        if trades:
+            blockers.append("existing_trade_history")
         if closed_only:
             blockers.append("account_closed_only")
         if not allowances or max(allowances.values()) < 1:

@@ -1,0 +1,42 @@
+[Unit]
+Description=Polybot authorized one-shot autonomous live pilot
+Wants=network-online.target
+After=network-online.target polybot-observer.service
+ConditionPathExists=/var/lib/polybot/polybot.sqlite3
+ConditionPathExists=/var/lib/polybot/live/credentials.json
+ConditionPathExists=/var/lib/polybot/live/auto-once-authorization.json
+
+[Service]
+Type=simple
+User=polybot
+Group=polybot
+WorkingDirectory=/opt/polybot
+EnvironmentFile=/etc/polybot/polybot.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/polybot/.venv/bin/polybot live-pilot auto-once \
+  --database /var/lib/polybot/polybot.sqlite3 \
+  --credentials /var/lib/polybot/live/credentials.json \
+  --authorization /var/lib/polybot/live/auto-once-authorization.json \
+  --intent-output /var/lib/polybot/live/intent.json \
+  --exact-approval /var/lib/polybot/live/auto-once-exact-approval.json \
+  --poll-seconds 5 \
+  --timeout-seconds 0 \
+  --json
+Restart=no
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/polybot
+
+[Install]
+WantedBy=multi-user.target

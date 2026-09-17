@@ -35,6 +35,18 @@ def test_live_provision_defaults_to_supported_direct_signer_without_database_arg
     assert not hasattr(args, "database")
 
 
+def test_live_auto_once_is_explicitly_bounded_and_opt_in() -> None:
+    args = build_parser().parse_args(["live-pilot", "auto-once", "--json"])
+
+    assert args.command == "live-pilot"
+    assert args.live_command == "auto-once"
+    assert args.timeout_seconds == 0.0
+    assert args.poll_seconds == 5.0
+    assert args.after_decision_id is None
+    assert args.authorization.endswith("auto-once-authorization.json")
+    assert args.as_json is True
+
+
 def test_weathernext_first_trial_and_existing_read_flags_are_explicit() -> None:
     planned = build_parser().parse_args(["weathernext", "first-full-trial-plan", "--json"])
     assert planned.weathernext_command == "first-full-trial-plan"
