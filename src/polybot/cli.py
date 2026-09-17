@@ -644,13 +644,7 @@ def _run_live_pilot(settings: Settings, args: argparse.Namespace) -> None:
         write_prepared_intent,
     )
 
-    database_option = getattr(args, "database", None)
-    database = Path(database_option).expanduser() if database_option else settings.database_path
-    journal = LivePilotJournal(database)
-    result: dict[str, Any]
-    if args.live_command == "status":
-        result = live_pilot_status(journal)
-    elif args.live_command == "provision":
+    if args.live_command == "provision":
         import getpass
         import sys
 
@@ -671,6 +665,15 @@ def _run_live_pilot(settings: Settings, args: argparse.Namespace) -> None:
             relayer_api_key=relayer_key,
             relayer_api_address=args.relayer_address,
         )
+        _print_live_result(result, as_json=args.as_json)
+        return
+
+    database_option = getattr(args, "database", None)
+    database = Path(database_option).expanduser() if database_option else settings.database_path
+    journal = LivePilotJournal(database)
+    result: dict[str, Any]
+    if args.live_command == "status":
+        result = live_pilot_status(journal)
     elif args.live_command == "account-check":
         check = account_check(
             settings=settings,
@@ -744,7 +747,11 @@ def _run_live_pilot(settings: Settings, args: argparse.Namespace) -> None:
         }
     else:
         raise RuntimeError(f"unknown live-pilot command: {args.live_command}")
-    if args.as_json:
+    _print_live_result(result, as_json=args.as_json)
+
+
+def _print_live_result(result: dict[str, Any], *, as_json: bool) -> None:
+    if as_json:
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     else:
         for key, value in result.items():
