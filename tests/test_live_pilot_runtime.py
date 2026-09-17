@@ -22,6 +22,9 @@ NOW = datetime(2026, 9, 16, 20, 0, tzinfo=UTC)
 
 
 class FakePublicClient:
+    book_hash = "book-1"
+    asks = (SimpleNamespace(price=Decimal("0.50"), size=Decimal("10")),)
+
     def get_market(self, *, id: str):  # noqa: ANN201
         return SimpleNamespace(
             id=id,
@@ -39,7 +42,9 @@ class FakePublicClient:
         return SimpleNamespace(
             asset_id=token_id,
             condition_id="condition-1",
-            hash="book-1",
+            hash=self.book_hash,
+            min_order_size=Decimal("1"),
+            asks=self.asks,
         )
 
 
@@ -203,6 +208,33 @@ def test_preview_accepts_candidate_suppressed_only_by_virtual_paper_duplicate(
 
     assert intent.strategy == "open-meteo-truncated-normal-v1"
     assert intent.amount_usd == Decimal("1.90")
+
+
+def test_preview_refreshes_book_hash_only_when_current_fok_price_is_not_worse(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "polybot.sqlite3"
+    _decision_db(database)
+    settings = Settings(database_path=database, max_book_age_seconds=180)
+    client = FakePublicClient()
+    client.book_hash = "book-current"
+
+    refreshed = preview_intent_from_decision(
+        settings=settings,
+        decision_id=1,
+        client=client,
+        now=NOW + timedelta(seconds=30),
+    )
+
+    assert refreshed.book_hash == "book-current"
+    client.asks = (SimpleNamespace(price=Decimal("0.51"), size=Decimal("10")),)
+    with pytest.raises(LivePilotError, match="moved above"):
+        preview_intent_from_decision(
+            settings=settings,
+            decision_id=1,
+            client=client,
+            now=NOW + timedelta(seconds=30),
+        )
 
 
 def test_preview_rejects_observe_with_any_non_virtual_reason(tmp_path: Path) -> None:

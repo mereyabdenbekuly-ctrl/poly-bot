@@ -392,17 +392,27 @@ def preview_intent_from_decision(
         raise LivePilotError("paper decision is missing fee provenance") from error
     if stored_fee_rate != fee_rate or stored_fee_exponent != fee_exponent:
         raise LivePilotError("platform fee metadata changed; wait for a new v1 candidate")
+    amount = Decimal(str(payload.get("notional_usd", "0")))
+    if amount <= 0 or amount > PILOT_MAX_BUY_NOTIONAL_USD:
+        raise LivePilotError("paper notional is outside the live-pilot cap")
+    max_price = Decimal(str(payload.get("executable_price", "0")))
     book = client.get_order_book(token_id=token_id)
     if str(getattr(book, "asset_id", "")) != token_id:
         raise LivePilotError("order book token identity changed")
     if str(getattr(book, "condition_id", "")) != condition_id:
         raise LivePilotError("order book condition identity changed")
-    if str(getattr(book, "hash", "")) != book_hash:
-        raise LivePilotError("order book changed; wait for a new v1 PAPER_BUY")
-    amount = Decimal(str(payload.get("notional_usd", "0")))
-    if amount <= 0 or amount > PILOT_MAX_BUY_NOTIONAL_USD:
-        raise LivePilotError("paper notional is outside the live-pilot cap")
-    max_price = Decimal(str(payload.get("executable_price", "0")))
+    current_book_hash = str(getattr(book, "hash", ""))
+    if not current_book_hash:
+        raise LivePilotError("current order book has no immutable hash")
+    if current_book_hash != book_hash:
+        current_limit = _fok_buy_limit_from_book(book, amount_usd=amount)
+        if current_limit > max_price:
+            raise LivePilotError(
+                "order book moved above the v1 candidate price; wait for a new candidate"
+            )
+    minimum_size = Decimal(str(getattr(book, "min_order_size", "0") or "0"))
+    if minimum_size > 0 and amount / max_price < minimum_size:
+        raise LivePilotError("live candidate is below the market minimum order size")
     worst_spend = (amount * (Decimal(1) + fee_rate)).quantize(
         Decimal("0.000001"), rounding=ROUND_UP
     )
@@ -416,7 +426,7 @@ def preview_intent_from_decision(
         amount_usd=amount,
         max_spend_usd=max_spend,
         max_price=max_price,
-        book_hash=book_hash,
+        book_hash=current_book_hash,
         decision_created_at_utc=created,
         expires_at_utc=expires,
     )
@@ -515,6 +525,29 @@ def _intent_dict(intent: LiveBuyIntent) -> dict[str, Any]:
         )
         for key, value in payload.items()
     }
+
+
+def _fok_buy_limit_from_book(book: Any, *, amount_usd: Decimal) -> Decimal:
+    asks = tuple(getattr(book, "asks", ()) or ())
+    levels: list[tuple[Decimal, Decimal]] = []
+    for level in asks:
+        try:
+            price = Decimal(str(level.price))
+            size = Decimal(str(level.size))
+        except (AttributeError, ValueError) as error:
+            raise LivePilotError("current order book contains an invalid ask") from error
+        if price <= 0 or size <= 0:
+            continue
+        levels.append((price, size))
+    remaining = amount_usd
+    limiting_price: Decimal | None = None
+    for price, size in sorted(levels):
+        available_cash = price * size
+        limiting_price = price
+        if remaining <= available_cash:
+            return limiting_price
+        remaining -= available_cash
+    raise LivePilotError("current order book lacks FOK liquidity for the pilot amount")
 
 
 def _private_file(path: Path, *, label: str) -> Path:
