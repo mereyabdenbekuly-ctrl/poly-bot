@@ -118,7 +118,7 @@ class AstraRuleAuditor:
                 client = OpenAI(
                     api_key=secret.get_secret_value(),
                     base_url=base_url.rstrip("/"),
-                    timeout=self.settings.http_timeout_seconds,
+                    timeout=self.settings.astra_timeout_seconds,
                     max_retries=0,
                 )
                 return client.responses.parse(

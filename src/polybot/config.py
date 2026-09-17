@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     astra_model: str = "gpt-6-astra"
     astra_reasoning_effort: Literal["low", "medium", "high", "xhigh", "max"] = "low"
     astra_max_output_tokens: int = Field(default=1800, ge=256, le=8000)
+    # xHigh structured extraction routinely needs longer than ordinary weather
+    # API requests. Keep its timeout independent so a slow model never weakens
+    # the tight network bounds used by books, geoblock, and observations.
+    astra_timeout_seconds: float = Field(default=120.0, ge=20, le=300)
     astra_budget_usd: Decimal = Decimal("5.00")
     astra_reserve_per_call_usd: Decimal = Decimal("0.25")
     astra_input_usd_per_million: Decimal = Decimal("10.00")
