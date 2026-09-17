@@ -220,14 +220,14 @@ def account_check(
     credentials_path: Path,
     journal: LivePilotJournal,
 ) -> AccountCheck:
+    credentials = load_live_credentials(credentials_path)
     geoblock = fetch_geoblock_status(
         url=settings.geoblock_url,
-        timeout=settings.http_timeout_seconds,
+        timeout=min(settings.http_timeout_seconds, 20.0),
     )
     blockers: list[str] = []
     if geoblock.blocked:
         blockers.append("network_geoblocked")
-    credentials = load_live_credentials(credentials_path)
     with open_live_client(credentials) as client:
         balance = client.get_balance_allowance(asset_type="COLLATERAL")
         balance_units = int(balance.balance)
