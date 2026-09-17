@@ -18,11 +18,11 @@ from polybot.live_pilot import (
     COLLATERAL_BASE_UNITS,
     PILOT_MAX_BUY_NOTIONAL_USD,
     PILOT_MAX_BUY_USD,
-    PILOT_MAX_FEE_RATE,
     PILOT_MAX_WALLET_USD,
     LiveBuyIntent,
     LivePilotError,
     LivePilotJournal,
+    resolve_platform_fee_info,
 )
 
 CREDENTIAL_KIND = "polybot-polymarket-account-v1"
@@ -380,13 +380,18 @@ def preview_intent_from_decision(
     state = getattr(market, "state", None)
     if state is not None and not bool(getattr(state, "accepting_orders", False)):
         raise LivePilotError("market no longer accepts orders")
+    fee_rate, fee_exponent = resolve_platform_fee_info(
+        client,
+        market=market,
+        condition_id=condition_id,
+    )
     try:
-        fee_rate = Decimal(str(market.fee_rate))
-        fee_exponent = Decimal(str(market.fee_exponent))
-    except (AttributeError, ValueError) as error:
-        raise LivePilotError("market fee metadata is unavailable") from error
-    if fee_rate < 0 or fee_rate > PILOT_MAX_FEE_RATE or fee_exponent < 0:
-        raise LivePilotError("market fee metadata exceeds the pilot safety model")
+        stored_fee_rate = Decimal(str(payload["fee_rate"]))
+        stored_fee_exponent = Decimal(str(payload["fee_exponent"]))
+    except (KeyError, ValueError) as error:
+        raise LivePilotError("paper decision is missing fee provenance") from error
+    if stored_fee_rate != fee_rate or stored_fee_exponent != fee_exponent:
+        raise LivePilotError("platform fee metadata changed; wait for a new v1 candidate")
     book = client.get_order_book(token_id=token_id)
     if str(getattr(book, "asset_id", "")) != token_id:
         raise LivePilotError("order book token identity changed")

@@ -599,7 +599,7 @@ class LivePilotExecutor:
             raise LivePilotError("pilot wallet already has trade history")
 
         market = client.get_market(id=intent.market_id)
-        fee_rate, fee_exponent = _verify_market_identity(market, intent)
+        fee_rate, fee_exponent = _verify_market_identity(client, market, intent)
         book = client.get_order_book(token_id=intent.token_id)
         _verify_book_identity(book, intent)
 
@@ -755,7 +755,9 @@ def _consume_approval(path: Path, intent_sha256: str) -> None:
     resolved.replace(used)
 
 
-def _verify_market_identity(market: Any, intent: LiveBuyIntent) -> tuple[Decimal, Decimal]:
+def _verify_market_identity(
+    client: Any, market: Any, intent: LiveBuyIntent
+) -> tuple[Decimal, Decimal]:
     if str(getattr(market, "id", "")) != intent.market_id:
         raise LivePilotError("market id changed")
     condition = getattr(market, "condition_id", None)
@@ -768,11 +770,45 @@ def _verify_market_identity(market: Any, intent: LiveBuyIntent) -> tuple[Decimal
     tokens = {str(getattr(getattr(outcomes, side, None), "token_id", "")) for side in ("yes", "no")}
     if intent.token_id not in tokens:
         raise LivePilotError("token no longer belongs to the selected market")
-    try:
-        fee_rate = Decimal(str(market.fee_rate))
-        fee_exponent = Decimal(str(market.fee_exponent))
-    except (AttributeError, ValueError) as error:
-        raise LivePilotError("market fee metadata is unavailable") from error
+    fee_rate, fee_exponent = resolve_platform_fee_info(
+        client,
+        market=market,
+        condition_id=intent.condition_id,
+    )
+    return fee_rate, fee_exponent
+
+
+def resolve_platform_fee_info(
+    client: Any,
+    *,
+    market: Any,
+    condition_id: str,
+) -> tuple[Decimal, Decimal]:
+    """Read current platform fees from Gamma metadata or the official CLOB endpoint."""
+
+    raw_rate = getattr(market, "fee_rate", None)
+    raw_exponent = getattr(market, "fee_exponent", None)
+    if raw_rate is not None and raw_exponent is not None:
+        try:
+            fee_rate = Decimal(str(raw_rate))
+            fee_exponent = Decimal(str(raw_exponent))
+        except ValueError as error:
+            raise LivePilotError("market fee metadata is invalid") from error
+    else:
+        try:
+            from polymarket._internal.actions.orders.market_data import (
+                fetch_platform_fee_info_sync,
+            )
+
+            context = client._ctx  # pyright: ignore[reportPrivateUsage]
+            info = fetch_platform_fee_info_sync(
+                context,
+                condition_id=cast(Any, condition_id),
+            )
+            fee_rate = Decimal(str(info.rate))
+            fee_exponent = Decimal(str(info.exponent))
+        except Exception as error:
+            raise LivePilotError("market fee metadata is unavailable") from error
     if fee_rate < 0 or fee_exponent < 0:
         raise LivePilotError("market fee metadata is invalid")
     if fee_rate > PILOT_MAX_FEE_RATE:
@@ -993,4 +1029,5 @@ __all__ = [
     "PILOT_MAX_BUY_NOTIONAL_USD",
     "PILOT_MAX_WALLET_USD",
     "load_live_approval",
+    "resolve_platform_fee_info",
 ]

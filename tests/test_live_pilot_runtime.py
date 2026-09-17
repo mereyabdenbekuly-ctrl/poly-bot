@@ -76,6 +76,8 @@ def _decision_db(
             "executable_price": "0.50",
             "probability_edge": "0.10",
             "expected_profit_usd": "0.30",
+            "fee_rate": "0.05",
+            "fee_exponent": "1",
             "created_at": created.isoformat(),
             "end_date": (created + timedelta(days=1)).isoformat(),
         }
