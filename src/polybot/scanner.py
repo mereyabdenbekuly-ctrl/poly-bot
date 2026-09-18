@@ -168,8 +168,8 @@ class Scanner:
                     gateway
                 )
                 errors.extend(settlement_errors)
-                wn_settled, wn_settlement_errors = (
-                    self._settle_resolved_weathernext_paper_orders(gateway)
+                wn_settled, wn_settlement_errors = self._settle_resolved_weathernext_paper_orders(
+                    gateway
                 )
                 self._weathernext_paper_settled += wn_settled
                 errors.extend(wn_settlement_errors)
@@ -446,21 +446,19 @@ class Scanner:
             )
 
         if shadow_failed:
-            status = "partial" if (
-                outcome_completed
-                or outcome_pending
-                or extra_registered
-                or shadow_completed
-            ) else "failed"
-            shadow_summary = "; ".join(shadow_errors[:4])
-            terminal_error = "; ".join(
-                item for item in (terminal_error, shadow_summary) if item
-            ) or "one or more ECMWF/v2 shadow jobs failed"
-        elif terminal_error:
             status = (
                 "partial"
-                if outcome_completed or outcome_pending or extra_registered
+                if (outcome_completed or outcome_pending or extra_registered or shadow_completed)
                 else "failed"
+            )
+            shadow_summary = "; ".join(shadow_errors[:4])
+            terminal_error = (
+                "; ".join(item for item in (terminal_error, shadow_summary) if item)
+                or "one or more ECMWF/v2 shadow jobs failed"
+            )
+        elif terminal_error:
+            status = (
+                "partial" if outcome_completed or outcome_pending or extra_registered else "failed"
             )
 
         self.storage.finish_shadow_research(
@@ -934,9 +932,7 @@ class Scanner:
                             "action": DecisionAction.SKIP,
                             "reason_codes": list(
                                 dict.fromkeys(
-                                    decision.reason_codes + [
-                                        "LOWER_RANKED_WEATHERNEXT_CANDIDATE"
-                                    ]
+                                    decision.reason_codes + ["LOWER_RANKED_WEATHERNEXT_CANDIDATE"]
                                 )
                             ),
                         }
@@ -1193,12 +1189,15 @@ class Scanner:
         prediction_ids: dict[str, int] = {}
         persist_failures: set[str] = set()
         deferred_shadow_versions: set[str] = set()
-        deferred_shadow_payload: tuple[
-            RuleAudit,
-            dict[str, Bracket],
-            ObservationHistory,
-            WeatherForecast,
-        ] | None = None
+        deferred_shadow_payload: (
+            tuple[
+                RuleAudit,
+                dict[str, Bracket],
+                ObservationHistory,
+                WeatherForecast,
+            ]
+            | None
+        ) = None
         market_snapshots: dict[str, MarketSnapshot] = {}
         analysis_rules = deterministic.interpretation
         if analysis_rules.tradeable and brackets and not observation_blockers and not rule_blockers:
@@ -1234,9 +1233,8 @@ class Scanner:
                     # Keep the synchronous branch only for callers that do not
                     # provide the bounded worker (for example a one-shot CLI
                     # invocation), preserving that compatibility contract.
-                    if (
-                        shadow_jobs is not None
-                        and getattr(self, "_background_research_enabled", False)
+                    if shadow_jobs is not None and getattr(
+                        self, "_background_research_enabled", False
                     ):
                         deferred_shadow_payload = (
                             audit,
@@ -1326,9 +1324,7 @@ class Scanner:
                         ],
                         paper_snapshot_for,
                     )
-                    comparison, weathernext_snapshot_reason = resolve_paper_snapshot(
-                        analysis_rules
-                    )
+                    comparison, weathernext_snapshot_reason = resolve_paper_snapshot(analysis_rules)
                 else:
                     # Compatibility for read-only adapters/tests predating the
                     # timely-paper gate.  The production provider implements
@@ -1867,12 +1863,14 @@ def _combine_rule_audits(deterministic: RuleAudit, astra: RuleAudit) -> RuleAudi
 
 
 def _failed_astra_audit(deterministic: RuleAudit, error: str) -> RuleAudit:
+    # Astra is an advisory audit layer. An unavailable or over-budget Astra call
+    # must not veto a clean deterministic interpretation; the event stays
+    # tradeable on the deterministic parser alone and the note is informational.
     interpretation: RuleInterpretation = deterministic.interpretation.model_copy(
         update={
-            "tradeable": False,
-            "ambiguity_reasons": deterministic.interpretation.ambiguity_reasons
-            + [f"Astra audit unavailable: {error}"],
-            "confidence": 0.0,
+            "tradeable": deterministic.interpretation.tradeable,
+            "ambiguity_reasons": list(deterministic.interpretation.ambiguity_reasons),
+            "confidence": min(deterministic.interpretation.confidence, Decimal("0.5")),
         }
     )
     return deterministic.model_copy(
