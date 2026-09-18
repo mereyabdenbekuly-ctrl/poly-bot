@@ -1198,7 +1198,6 @@ def run_live_v2(
         journal.heartbeat("RUNNING")
         active = journal.latest_active()
         if active is not None:
-            journal.heartbeat("RECONCILING", detail={"state": active.state.value})
             with open_live_client(credentials) as client:
                 if str(client.wallet_type) not in {"DEPOSIT_WALLET", "EOA"}:
                     raise LivePilotError("live-v2 requires a Deposit Wallet or EOA wallet")
