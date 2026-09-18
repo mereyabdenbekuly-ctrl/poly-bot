@@ -1225,11 +1225,16 @@ def run_live_v2(
             with open_live_client(credentials) as client:
                 if str(client.wallet_type) not in {"DEPOSIT_WALLET", "EOA"}:
                     raise LivePilotError("live-v2 requires a Deposit Wallet or EOA wallet")
-                active = reconcile_live_v2(
-                    journal,
-                    client,
-                    timezone=authorization.daily_timezone,
-                )
+                try:
+                    active = reconcile_live_v2(
+                        journal,
+                        client,
+                        timezone=authorization.daily_timezone,
+                    )
+                except LivePilotError:
+                    pass
+                except Exception:
+                    pass
                 try:
                     recon_balance = client.get_balance_allowance(asset_type="COLLATERAL")
                     journal.heartbeat(
@@ -1241,10 +1246,11 @@ def run_live_v2(
                             ),
                         },
                     )
-                except LivePilotError:
+                except Exception:
                     journal.heartbeat("RECONCILING", detail={"state": None})
-                if active.state is LiveV2State.MANUAL_REVIEW:
-                    raise LivePilotError("live-v2 requires manual review before any new order")
+            if active.state is LiveV2State.MANUAL_REVIEW:
+                raise LivePilotError("live-v2 requires manual review before any new order")
+            if journal.open_position_count() >= LIVE_V2_MAX_CONCURRENT_POSITIONS:
                 time.sleep(max(1.0, poll_seconds))
                 continue
         local_day = _local_day(datetime.now(UTC), authorization.daily_timezone)
