@@ -26,6 +26,8 @@ from polybot.live_pilot import (
 )
 
 LIVE_V2_PRICE_DRIFT_USD = Decimal("0.02")
+LIVE_V2_PRICE_BUFFER_USD = Decimal("0.01")
+LIVE_V2_PRICE_BUFFER_USD = Decimal("0.01")
 CREDENTIAL_KIND = "polybot-polymarket-account-v1"
 INTENT_KIND = "polybot-live-buy-intent-v1"
 AuthMode = Literal["session_key", "direct_signer"]
@@ -415,13 +417,15 @@ def preview_intent_from_decision(
         amount = floor
     if amount > PILOT_MAX_BUY_NOTIONAL_USD:
         raise LivePilotError("market minimum order size exceeds the live-pilot cap")
+    limit_cap = max_price + LIVE_V2_PRICE_DRIFT_USD
     if current_book_hash != book_hash:
         current_limit = _fok_buy_limit_from_book(book, amount_usd=amount)
-        if current_limit > max_price + LIVE_V2_PRICE_DRIFT_USD:
+        if current_limit > limit_cap:
             raise LivePilotError(
                 "order book moved above the v1 candidate price; wait for a new candidate"
             )
         max_price = current_limit
+    max_price = min(max_price + LIVE_V2_PRICE_BUFFER_USD, limit_cap)
     worst_spend = (amount * (Decimal(1) + fee_rate)).quantize(
         Decimal("0.000001"), rounding=ROUND_UP
     )
