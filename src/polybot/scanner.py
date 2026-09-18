@@ -1847,8 +1847,11 @@ def _combine_rule_audits(deterministic: RuleAudit, astra: RuleAudit) -> RuleAudi
     for field in ("event_type", "observation_date", "unit"):
         if getattr(left, field) != getattr(right, field):
             mismatches.append(f"Astra disagrees with deterministic parser on {field}")
-    if left.location and right.location and left.location.casefold() != right.location.casefold():
-        mismatches.append("Astra disagrees with deterministic parser on location")
+    if left.location and right.location:
+        det_loc = left.location.casefold()
+        ast_loc = right.location.casefold()
+        if det_loc != ast_loc and det_loc not in ast_loc and ast_loc not in det_loc:
+            mismatches.append("Astra disagrees with deterministic parser on location")
     ambiguity = list(dict.fromkeys(left.ambiguity_reasons + right.ambiguity_reasons + mismatches))
     interpretation = right.model_copy(
         update={
