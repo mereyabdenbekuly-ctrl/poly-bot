@@ -585,6 +585,15 @@ class LiveV2Journal:
             detail={},
         )
 
+    def mark_exchange_rejected(self, digest: str, error: BaseException) -> None:
+        self._move(
+            digest,
+            expected={LiveV2State.SUBMITTING},
+            target=LiveV2State.REJECTED,
+            updates={"last_error": _safe_error(error)},
+            detail={"error": _safe_error(error)},
+        )
+
     def mark_ambiguous(self, digest: str, error: BaseException) -> None:
         self._move(
             digest,
@@ -601,9 +610,13 @@ class LiveV2Journal:
             remote = str(getattr(response, "order_id", "")) or None
             status = str(getattr(response, "status", ""))
             trade_ids = tuple(str(value) for value in getattr(response, "trade_ids", ()))
-            if remote is None or status != "matched" or not trade_ids:
+            if remote is not None and status == "matched" and trade_ids:
+                state = LiveV2State.ACCEPTED
+            elif status in {"live", ""} and remote is None and not trade_ids:
+                remote = None
+                state = LiveV2State.REJECTED
+            else:
                 raise LivePilotError("accepted FOK response lacks a matched order id and fill ids")
-            state = LiveV2State.ACCEPTED
         elif ok is False:
             code = str(getattr(response, "code", ""))
             message = str(getattr(response, "message", ""))
@@ -925,6 +938,9 @@ class LiveV2Executor:
         try:
             response = client.post_order(signed)
         except BaseException as error:
+            if _is_not_filled_rejection(error):
+                self.journal.mark_exchange_rejected(intent.digest, error)
+                raise LivePilotError("live-v2 order was not filled by the exchange") from error
             self.journal.mark_ambiguous(intent.digest, error)
             raise LivePilotError(
                 "live-v2 submission is ambiguous; automatic retries are forbidden"
@@ -1135,6 +1151,13 @@ def reconcile_live_v2(
             detail={"reason": "accepted response did not produce a visible trade or position"},
         )
     return journal.get(record.intent_sha256)
+
+
+def _is_not_filled_rejection(error: BaseException) -> bool:
+    text = str(error).lower()
+    return (
+        "couldn't be fully filled" in text or "not fully filled" in text or "fok_not_filled" in text
+    )
 
 
 def _verify_book_price_limit(book: Any, intent: LiveBuyIntent) -> None:
