@@ -1251,6 +1251,13 @@ def run_live_v2(
                 raise LivePilotError("live-v2 requires a Deposit Wallet or EOA wallet")
             balance = client.get_balance_allowance(asset_type="COLLATERAL")
             balance_units = int(balance.balance)
+            journal.heartbeat(
+                "CHECKING_CANDIDATE",
+                detail={
+                    "count": len(candidates),
+                    "balance_usd": str(Decimal(balance_units) / COLLATERAL_BASE_UNITS),
+                },
+            )
             if balance_units <= 0:
                 raise LivePilotError("live-v2 wallet collateral balance is zero")
             if balance_units > int(PILOT_MAX_WALLET_USD * COLLATERAL_BASE_UNITS):
