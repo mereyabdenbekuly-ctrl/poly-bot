@@ -407,10 +407,12 @@ def preview_intent_from_decision(
     if not current_book_hash:
         raise LivePilotError("current order book has no immutable hash")
     minimum_size = Decimal(str(getattr(book, "min_order_size", "0") or "0"))
-    if minimum_size > PILOT_MAX_BUY_NOTIONAL_USD:
+    if minimum_size > 0 and max_price > 0:
+        shares = amount / max_price
+        if shares < minimum_size:
+            amount = (minimum_size * max_price).quantize(Decimal("0.000001"), rounding=ROUND_UP)
+    if amount > PILOT_MAX_BUY_NOTIONAL_USD:
         raise LivePilotError("market minimum order size exceeds the live-pilot cap")
-    if minimum_size > 0 and amount < minimum_size:
-        amount = minimum_size
     if current_book_hash != book_hash:
         current_limit = _fok_buy_limit_from_book(book, amount_usd=amount)
         if current_limit > max_price:
