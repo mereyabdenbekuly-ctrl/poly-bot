@@ -49,6 +49,7 @@ LIVE_V2_MIN_PROBABILITY_EDGE = Decimal("0.05")
 LIVE_V2_MIN_EXPECTED_PROFIT_USD = Decimal("0.15")
 LIVE_V2_MIDNIGHT_GUARD_SECONDS = 120
 LIVE_V2_RECONCILE_GRACE = timedelta(minutes=15)
+LIVE_V2_BALANCE_POLL_SECONDS = float(300)
 
 
 class LiveV2State(StrEnum):
@@ -1147,6 +1148,7 @@ def run_live_v2(
     journal = LiveV2Journal(database)
     journal.heartbeat("STARTING")
     started = time.monotonic()
+    last_balance_poll = 0.0
     while timeout_seconds <= 0 or time.monotonic() - started < timeout_seconds:
         authorization = load_live_v2_authorization(authorization_path)
         credentials = load_live_credentials(credentials_path)
@@ -1185,7 +1187,23 @@ def run_live_v2(
             max_book_age_seconds=settings.max_book_age_seconds,
         )
         if not candidates:
-            journal.heartbeat("WAITING_FOR_SIGNAL")
+            if time.monotonic() - last_balance_poll >= LIVE_V2_BALANCE_POLL_SECONDS:
+                try:
+                    with open_live_client(credentials) as client:
+                        poll_balance = client.get_balance_allowance(asset_type="COLLATERAL")
+                        journal.heartbeat(
+                            "WAITING_FOR_SIGNAL",
+                            detail={
+                                "balance_usd": str(
+                                    Decimal(int(poll_balance.balance)) / COLLATERAL_BASE_UNITS
+                                )
+                            },
+                        )
+                        last_balance_poll = time.monotonic()
+                except LivePilotError:
+                    journal.heartbeat("WAITING_FOR_SIGNAL")
+            else:
+                journal.heartbeat("WAITING_FOR_SIGNAL")
             time.sleep(max(1.0, poll_seconds))
             continue
         journal.heartbeat("CHECKING_CANDIDATE", detail={"count": len(candidates)})

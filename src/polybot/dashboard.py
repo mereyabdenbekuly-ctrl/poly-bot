@@ -137,20 +137,20 @@ const elapsed = s => { s=Number(s||0); return s<60 ? `${s}s` : `${Math.floor(s/6
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function latestCycle(d){ return [...(d.reports||[])].reverse().find(r=>r.kind==='CYCLE' && r.payload && r.payload.scan); }
 function renderMetrics(d){
-  const p=d.portfolio||{}, scan=d.latest_scan||{};
-  const cycle=latestCycle(d)?.payload?.scan||{}, cycleGeo=cycle.geoblock||{};
-  const allowed=cycleGeo.blocked===false || (cycleGeo.blocked==null && scan.geoblocked===0);
-  const networkLocation=[cycleGeo.country,cycleGeo.region].filter(Boolean).join(' / ');
-  const status=allowed?'good':'warn';
-  const live=d.live_v2||{}, runtime=live.runtime||{}, heartbeat=runtime.updated_at_utc?new Date(runtime.updated_at_utc):null, liveOnline=Boolean(live.configured&&heartbeat&&(Date.now()-heartbeat.getTime())<90000);
-  $('mode').textContent=liveOnline?'LIVE V2 ARMED':d.active_window?.paper===false?'OBSERVE ONLY':'PAPER ONLY';
-  $('mode').className='pill '+(liveOnline?'green':d.active_window?.paper===false?'gray':'blue');
-  $('metrics').innerHTML = [
-    ['Open exposure',compactMoney(p.open_exposure_usd),'risk reserved','neutral'],
-    ['Realized P&L',compactMoney(p.realized_pnl_usd),'after order-level API allocation',Number(p.realized_pnl_usd||0)>=0?'good':'warn'],
-    ['API spend',compactMoney(p.api_spend_usd),'persistent project budget','neutral'],
-    ['Network',allowed?(networkLocation||'allowed'):'blocked',allowed?'public API reachable':'new entries disabled',status]
-  ].map(x=>`<div class="card metric"><div class="eyebrow">${x[0]}</div><div class="value ${x[3]}">${x[1]}</div><div class="hint">${x[2]}</div></div>`).join('');
+ const scan=d.latest_scan||{}, live=d.live_v2||{}, t=live.totals||{}, runtime=live.runtime||{}, detail=(runtime&&runtime.detail)||{};
+ const cycle=latestCycle(d)?.payload?.scan||{}, cycleGeo=cycle.geoblock||{};
+ const allowed=cycleGeo.blocked===false || (cycleGeo.blocked==null && scan.geoblocked===0);
+ const networkLocation=[cycleGeo.country,cycleGeo.region].filter(Boolean).join(" / ");
+ const pnl=Number(t.realized_pnl_usd||0);
+ const liveOnline=Boolean(live.configured&&runtime.updated_at_utc&&(Date.now()-new Date(runtime.updated_at_utc).getTime())<90000);
+ $('mode').textContent=liveOnline?'LIVE V2 ARMED':d.active_window?.paper===false?'OBSERVE ONLY':'PAPER ONLY';
+ $('mode').className='pill '+(liveOnline?'green':d.active_window?.paper===false?'gray':'blue');
+ $('metrics').innerHTML = [
+ ['Live realized P&L',compactMoney(t.realized_pnl_usd||0),(t.wins||0)+'W / '+(t.losses||0)+'L settled · real wallet',pnl>=0?'good':'warn'],
+ ['Live orders',String(t.submitted||0),(live.attempts||0)+' attempts · '+esc(runtime.state||live.state||'')+' · '+esc(String(live.limits?.max_orders_per_day||12))+'/day cap','neutral'],
+ ['Open positions',String(t.open_positions||0),compactMoney(t.open_cost_usd||0)+' at risk · one at a time','neutral'],
+ ['Wallet balance',detail.balance_usd!=null?compactMoney(detail.balance_usd):'—','exchange collateral · '+(allowed?(networkLocation||'allowed'):'geoblocked'),detail.balance_usd!=null?'good':'neutral']
+ ].map(x=>`<div class="card metric"><div class="eyebrow">${x[0]}</div><div class="value ${x[3]}">${x[1]}</div><div class="hint">${x[2]}</div></div>`).join('');
 }
 function renderWindow(d){
   const w=d.active_window, reports=d.reports||[];
@@ -161,8 +161,24 @@ function renderWindow(d){
   <div class="bar"><span style="width:${pct}%"></span></div><div class="hint" style="margin-top:8px">${elapsed(secs)} of 120m · ${reports.length} saved reports · times shown in Almaty</div>`;
 }
 function renderLiveV2(d){
- const live=d.live_v2||{}, runtime=live.runtime||{}, latest=live.latest||{}, limits=live.limits||{}, heartbeat=runtime.updated_at_utc?new Date(runtime.updated_at_utc):null, age=heartbeat?Math.max(0,(Date.now()-heartbeat.getTime())/1000):null, online=Boolean(live.configured&&heartbeat&&age<90), state=online?(runtime.state||live.state):(live.configured?'HEARTBEAT STALE':'NOT CONFIGURED'), stateClass=online?(state==='MANUAL_REVIEW'?'red':state==='DAILY_LIMIT'?'amber':'green'):'red';
- $('live-v2').innerHTML=`<div class="panel-head"><div><h2>Live-v2 execution</h2><div class="panel-note">isolated Deposit Wallet lane · exact journal before every POST</div></div><span class="pill ${stateClass}">${esc(state)}</span></div><div class="grid" style="margin-bottom:0"><div class="metric"><div class="eyebrow">Service</div><div class="value ${online?'good':'warn'}">${online?'ONLINE':'CHECK'}</div><div class="hint">${heartbeat?`heartbeat ${elapsed(age)} ago`:'no heartbeat yet'}</div></div><div class="metric"><div class="eyebrow">Attempts</div><div class="value neutral">${live.attempts||0}</div><div class="hint">latest ${esc(latest.state||'waiting for signal')}</div></div><div class="metric"><div class="eyebrow">Order limits</div><div class="value neutral">$${esc(limits.max_buy_notional_usd||'1.90')}</div><div class="hint">FOK BUY · $${esc(limits.max_all_in_spend_usd||'2.00')} all-in</div></div><div class="metric"><div class="eyebrow">Daily guard</div><div class="value neutral">1</div><div class="hint">attempt/day · one position · $${esc(limits.max_wallet_balance_usd||'10.00')} wallet cap</div></div></div>`;
+ const live=d.live_v2||{}, runtime=live.runtime||{}, latest=live.latest||{}, limits=live.limits||{}, t=live.totals||{}, detail=(runtime&&runtime.detail)||{}, orders=live.orders||[];
+ const heartbeat=runtime.updated_at_utc?new Date(runtime.updated_at_utc):null, age=heartbeat?Math.max(0,(Date.now()-heartbeat.getTime())/1000):null, online=Boolean(live.configured&&heartbeat&&age<90), state=online?(runtime.state||live.state):(live.configured?'HEARTBEAT STALE':'NOT CONFIGURED'), stateClass=online?(state==='MANUAL_REVIEW'?'red':state==='DAILY_LIMIT'?'amber':'green'):'red';
+ const pnl=Number(t.realized_pnl_usd||0);
+ const statePill=o=>{
+ if(o.state==='ACCEPTED'||o.state==='POSITION_OPEN')return 'green';
+ if(o.state==='CLOSED')return 'blue';
+ if(o.state==='MANUAL_REVIEW'||o.state==='AMBIGUOUS')return 'red';
+ return 'gray';
+ };
+ const rows=orders.map(o=>{const p=o.realized_pnl_usd==null?null:Number(o.realized_pnl_usd);return `<tr><td>${dateTime(o.submitted_at_utc||o.created_at_utc)}<div class="sub">#${esc(String(o.id))} · decision ${esc(String(o.decision_id))}</div></td><td><div class="market">event ${esc(o.event_id||'—')} <span class="pill gray">${esc(o.market_id||'')}</span></div><div class="sub">${esc(o.side||'BUY')} ${esc(o.order_type||'FOK')}</div></td><td class="num">${money(o.amount_usd)}<div class="sub">price ≤ ${money(o.max_price)}</div></td><td><span class="pill ${statePill(o)}">${esc(o.state)}</span></td><td class="num ${p==null?'':p>=0?'positive':'negative'}">${p==null?'—':money(p)}</td></tr>`}).join('');
+ const table=orders.length?`<div style="overflow-x:auto"><table class="positions"><thead><tr><th>Placed</th><th>Market</th><th class="num">Amount</th><th>State</th><th class="num">P&L</th></tr></thead><tbody>${rows}</tbody></table></div>`:'<div class="empty">No live order attempts recorded yet. Real FOK BUY orders will appear here.</div>';
+ $('live-v2').innerHTML=`<div class="panel-head"><div><h2>Live trading · real orders</h2><div class="panel-note">isolated wallet lane · exact journal before every POST · times in Almaty</div></div><span class="pill ${stateClass}">${esc(state)}</span></div>
+ <div class="grid" style="margin-bottom:14px">
+ <div class="metric"><div class="eyebrow">Service</div><div class="value ${online?'good':'warn'}">${online?'ONLINE':'CHECK'}</div><div class="hint">${heartbeat?`heartbeat ${elapsed(age)} ago`:'no heartbeat yet'}</div></div>
+ <div class="metric"><div class="eyebrow">Realized P&L</div><div class="value ${pnl>=0?'good':'warn'}">${compactMoney(t.realized_pnl_usd||0)}</div><div class="hint">${t.wins||0} wins · ${t.losses||0} losses</div></div>
+ <div class="metric"><div class="eyebrow">Submitted</div><div class="value neutral">${t.submitted||0}</div><div class="hint">of ${esc(String(limits.max_orders_per_day||12))}/day · ${live.attempts||0} attempts total</div></div>
+ <div class="metric"><div class="eyebrow">Wallet balance</div><div class="value neutral">${detail.balance_usd!=null?compactMoney(detail.balance_usd):'—'}</div><div class="hint">cap $${esc(limits.max_wallet_balance_usd||'10.00')} · FOK ≤ $${esc(limits.max_buy_notional_usd||'1.90')}</div></div>
+ </div>${table}`;
 }
 function renderPositions(d){
   const rows=d.positions||[];

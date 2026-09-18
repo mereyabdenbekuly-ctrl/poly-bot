@@ -760,8 +760,7 @@ class Storage:
         latest_scan = portfolio.get("last_scan")
         with self.connect() as connection:
             latest_completed_scan_row = connection.execute(
-                "SELECT * FROM scan_runs WHERE status != 'running' "
-                "ORDER BY id DESC LIMIT 1"
+                "SELECT * FROM scan_runs WHERE status != 'running' ORDER BY id DESC LIMIT 1"
             ).fetchone()
             recent_decision_rows = connection.execute(
                 "SELECT payload_json FROM decisions ORDER BY id DESC LIMIT 40"
@@ -913,9 +912,7 @@ class Storage:
             "positions": positions,
             "latest_scan": latest_scan,
             "last_completed_scan": (
-                None
-                if latest_completed_scan_row is None
-                else dict(latest_completed_scan_row)
+                None if latest_completed_scan_row is None else dict(latest_completed_scan_row)
             ),
             "decisions": compact_decisions,
             "active_window": None if active is None else active.model_dump(mode="json"),
@@ -934,8 +931,7 @@ class Storage:
 
         with self.connect() as connection:
             exists = connection.execute(
-                "SELECT 1 FROM sqlite_master "
-                "WHERE type='table' AND name='live_v2_attempts'"
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='live_v2_attempts'"
             ).fetchone()
             if exists is None:
                 return {
@@ -944,6 +940,8 @@ class Storage:
                     "attempts": 0,
                     "states": {},
                     "latest": None,
+                    "orders": [],
+                    "totals": {},
                 }
             state_rows = connection.execute(
                 "SELECT state,COUNT(*) AS count FROM live_v2_attempts GROUP BY state"
@@ -953,33 +951,93 @@ class Storage:
                 "created_at_utc,updated_at_utc,submitted_at_utc,closed_at_utc,"
                 "realized_pnl_usd FROM live_v2_attempts ORDER BY id DESC LIMIT 1"
             ).fetchone()
+            order_rows = connection.execute(
+                "SELECT id,decision_id,state,intent_json,remote_order_id,"
+                "created_at_utc,submitted_at_utc,closed_at_utc,realized_pnl_usd "
+                "FROM live_v2_attempts ORDER BY id DESC LIMIT 25"
+            ).fetchall()
+            totals_row = connection.execute(
+                "SELECT "
+                "SUM(CASE WHEN submitted_at_utc IS NOT NULL "
+                "THEN 1 ELSE 0 END) AS submitted,"
+                "SUM(CASE WHEN state='POSITION_OPEN' "
+                "THEN 1 ELSE 0 END) AS open_positions,"
+                "SUM(CASE WHEN state='POSITION_OPEN' "
+                "THEN CAST(json_extract(intent_json,'$.amount_usd') AS REAL) "
+                "ELSE 0 END) AS open_cost,"
+                "TOTAL(realized_pnl_usd) AS realized_pnl,"
+                "SUM(CASE WHEN realized_pnl_usd IS NOT NULL "
+                "AND CAST(realized_pnl_usd AS REAL)>0 THEN 1 ELSE 0 END) AS wins,"
+                "SUM(CASE WHEN realized_pnl_usd IS NOT NULL "
+                "AND CAST(realized_pnl_usd AS REAL)<0 THEN 1 ELSE 0 END) AS losses "
+                "FROM live_v2_attempts"
+            ).fetchone()
             runtime_exists = connection.execute(
-                "SELECT 1 FROM sqlite_master "
-                "WHERE type='table' AND name='live_v2_runtime'"
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='live_v2_runtime'"
             ).fetchone()
             runtime = (
                 None
                 if runtime_exists is None
                 else connection.execute(
-                    "SELECT state,detail_json,updated_at_utc FROM live_v2_runtime "
-                    "WHERE singleton=1"
+                    "SELECT state,detail_json,updated_at_utc FROM live_v2_runtime WHERE singleton=1"
                 ).fetchone()
             )
         states = {str(row["state"]): int(row["count"]) for row in state_rows}
+        orders: list[dict[str, object]] = []
+        for row in order_rows:
+            try:
+                intent = json.loads(row["intent_json"])
+            except (TypeError, ValueError):
+                intent = {}
+            orders.append(
+                {
+                    "id": int(row["id"]),
+                    "decision_id": row["decision_id"],
+                    "state": str(row["state"]),
+                    "event_id": intent.get("event_id"),
+                    "market_id": intent.get("market_id"),
+                    "amount_usd": intent.get("amount_usd"),
+                    "max_price": intent.get("max_price"),
+                    "order_type": intent.get("order_type"),
+                    "side": intent.get("side"),
+                    "remote_order_id": row["remote_order_id"],
+                    "created_at_utc": row["created_at_utc"],
+                    "submitted_at_utc": row["submitted_at_utc"],
+                    "closed_at_utc": row["closed_at_utc"],
+                    "realized_pnl_usd": row["realized_pnl_usd"],
+                }
+            )
+        totals = {
+            "submitted": int(totals_row["submitted"] or 0),
+            "open_positions": int(totals_row["open_positions"] or 0),
+            "open_cost_usd": round(float(totals_row["open_cost"] or 0.0), 4),
+            "realized_pnl_usd": round(float(totals_row["realized_pnl"] or 0.0), 4),
+            "wins": int(totals_row["wins"] or 0),
+            "losses": int(totals_row["losses"] or 0),
+        }
+        runtime_payload: dict[str, object] | None = None
+        if runtime is not None:
+            runtime_payload = dict(runtime)
+            try:
+                runtime_payload["detail"] = json.loads(runtime["detail_json"] or "{}")
+            except (TypeError, ValueError):
+                runtime_payload["detail"] = {}
         return {
             "configured": True,
             "state": "WAITING_FOR_SIGNAL" if latest is None else str(latest["state"]),
             "attempts": sum(states.values()),
             "states": states,
             "latest": None if latest is None else dict(latest),
-            "runtime": None if runtime is None else dict(runtime),
+            "runtime": runtime_payload,
+            "orders": orders,
+            "totals": totals,
             "limits": {
                 "side": "BUY",
                 "order_type": "FOK",
                 "max_buy_notional_usd": "1.90",
                 "max_all_in_spend_usd": "2.00",
                 "max_wallet_balance_usd": "10.00",
-                "max_orders_per_day": 1,
+                "max_orders_per_day": 12,
                 "daily_timezone": "Asia/Almaty",
             },
         }
@@ -1593,9 +1651,7 @@ class Storage:
                 "SELECT event_id, max_loss_usd FROM weathernext_paper_orders "
                 "WHERE status IN ('OPEN', 'AWAITING_RESULT', 'RESOLVED')"
             ).fetchall()
-            total_exposure = sum(
-                (Decimal(row["max_loss_usd"]) for row in active_rows), Decimal(0)
-            )
+            total_exposure = sum((Decimal(row["max_loss_usd"]) for row in active_rows), Decimal(0))
             event_exposure = sum(
                 (
                     Decimal(row["max_loss_usd"])
@@ -1743,9 +1799,7 @@ class Storage:
             )
         return pnl
 
-    def mark_awaiting_weathernext_paper_result(
-        self, order_id: int, check: ResolutionCheck
-    ) -> bool:
+    def mark_awaiting_weathernext_paper_result(self, order_id: int, check: ResolutionCheck) -> bool:
         if check.confirmed:
             raise ValueError("confirmed results must resolve before awaiting")
         ended = (
@@ -1852,12 +1906,9 @@ class Storage:
             (Decimal(row["realized_pnl_usd"]) for row in settled_rows if row["realized_pnl_usd"]),
             Decimal(0),
         )
-        open_exposure = sum(
-            (Decimal(row["max_loss_usd"]) for row in open_rows), Decimal(0)
-        )
+        open_exposure = sum((Decimal(row["max_loss_usd"]) for row in open_rows), Decimal(0))
         marks = {
-            int(row["paper_order_id"]): json.loads(row["payload_json"])
-            for row in latest_marks
+            int(row["paper_order_id"]): json.loads(row["payload_json"]) for row in latest_marks
         }
         orders = []
         for row in open_rows:
@@ -1877,9 +1928,7 @@ class Storage:
             "settled_orders": len(settled_rows),
             "realized_pnl_usd": realized,
             "orders_by_status": {str(row["status"]): int(row["count"]) for row in status_rows},
-            "decisions_by_action": {
-                str(row["action"]): int(row["count"]) for row in decision_rows
-            },
+            "decisions_by_action": {str(row["action"]): int(row["count"]) for row in decision_rows},
             "recent_orders": orders,
             "recent_decisions": decisions,
         }
