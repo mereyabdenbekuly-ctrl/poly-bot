@@ -1852,7 +1852,7 @@ def _combine_rule_audits(deterministic: RuleAudit, astra: RuleAudit) -> RuleAudi
     ambiguity = list(dict.fromkeys(left.ambiguity_reasons + right.ambiguity_reasons + mismatches))
     interpretation = right.model_copy(
         update={
-            "tradeable": left.tradeable and right.tradeable and not mismatches,
+            "tradeable": left.tradeable and not mismatches,
             "ambiguity_reasons": ambiguity,
             "confidence": min(left.confidence, right.confidence),
         }
