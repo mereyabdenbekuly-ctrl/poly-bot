@@ -106,6 +106,7 @@ class FakeClient:
         self.trades: list[Any] = []
         self.closed_positions: list[Any] = []
         self.book_hash = "book-1"
+        self.asks = (SimpleNamespace(price=Decimal("0.40"), size=Decimal("100")),)
         self.market_closed = False
         self.closed_only = False
         self.post_calls = 0
@@ -157,6 +158,7 @@ class FakeClient:
             asset_id="token-1",
             condition_id="condition-1",
             hash=self.book_hash,
+            asks=self.asks,
         )
 
     def create_market_order(self, **kwargs: Any) -> FakeSignedOrder:
@@ -491,7 +493,7 @@ def test_live_v2_does_not_mutate_legacy_live_pilot_gate(tmp_path: Path) -> None:
 def test_pre_sign_rejection_journals_without_signing_or_posting(tmp_path: Path) -> None:
     value = _intent()
     client = FakeClient()
-    client.book_hash = "changed-book"
+    client.asks = (SimpleNamespace(price=Decimal("0.90"), size=Decimal("100")),)
     journal = LiveV2Journal(tmp_path / "polybot.sqlite3")
 
     record = LiveV2Executor(journal).execute(
@@ -814,7 +816,7 @@ def test_legacy_migration_preserves_history_and_does_not_release_old_rejections(
 def test_unsigned_retry_preserves_both_attempts_and_consumes_no_cash(tmp_path: Path) -> None:
     journal = LiveV2Journal(tmp_path / "polybot.sqlite3")
     client = FakeClient()
-    client.book_hash = "changed"
+    client.asks = (SimpleNamespace(price=Decimal("0.90"), size=Decimal("100")),)
     authorization = _loaded_authorization(tmp_path)
     for index in (1, 2):
         result = LiveV2Executor(journal).execute(

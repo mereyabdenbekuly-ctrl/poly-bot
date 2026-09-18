@@ -30,11 +30,11 @@ from polybot.live_pilot import (
     _safe_error,
     _signed_payload,
     _trade_matches,
-    _verify_book_identity,
     _verify_market_identity,
     _verify_signed_order,
 )
 from polybot.live_pilot_runtime import (
+    _fok_buy_limit_from_book,
     load_live_credentials,
     open_live_client,
     preview_intent_from_decision,
@@ -866,7 +866,7 @@ class LiveV2Executor:
             market = client.get_market(id=intent.market_id)
             fee_rate, fee_exponent = _verify_market_identity(client, market, intent)
             book = client.get_order_book(token_id=intent.token_id)
-            _verify_book_identity(book, intent)
+            _verify_book_price_limit(book, intent)
             signing_time = datetime.now(UTC)
             if signing_time >= authorization.expires_at_utc:
                 raise LivePilotError("live-v2 authorization expired before signing")
@@ -1134,6 +1134,21 @@ def reconcile_live_v2(
             detail={"reason": "accepted response did not produce a visible trade or position"},
         )
     return journal.get(record.intent_sha256)
+
+
+def _verify_book_price_limit(book: Any, intent: LiveBuyIntent) -> None:
+    asset_id = str(getattr(book, "asset_id", getattr(book, "token_id", "")))
+    condition_id = str(getattr(book, "condition_id", ""))
+    if asset_id != intent.token_id or condition_id != intent.condition_id:
+        raise LivePilotError("order book identity mismatch")
+    try:
+        current_limit = _fok_buy_limit_from_book(book, amount_usd=intent.amount_usd)
+    except LivePilotError as error:
+        raise LivePilotError(
+            "order book changed; a new decision and approval are required"
+        ) from error
+    if current_limit > intent.max_price:
+        raise LivePilotError("order book changed; a new decision and approval are required")
 
 
 def run_live_v2(
