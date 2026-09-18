@@ -1195,8 +1195,9 @@ def run_live_v2(
             raise LivePilotError("live-v2 requires an authorized wallet signer")
         if credentials.wallet.casefold() != authorization.wallet.casefold():
             raise LivePilotError("live-v2 authorization wallet does not match credentials")
-        journal.heartbeat("RUNNING")
         active = journal.latest_active()
+        if active is None:
+            journal.heartbeat("RUNNING")
         if active is not None:
             with open_live_client(credentials) as client:
                 if str(client.wallet_type) not in {"DEPOSIT_WALLET", "EOA"}:
