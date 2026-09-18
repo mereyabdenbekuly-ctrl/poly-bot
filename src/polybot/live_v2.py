@@ -46,6 +46,7 @@ LIVE_V2_STRATEGY = "open-meteo-truncated-normal-v1"
 LIVE_V2_TIMEZONE = "Asia/Almaty"
 LIVE_V2_DAILY_STOP_USD = Decimal("6.00")
 LIVE_V2_MAX_ORDERS_PER_DAY = 50
+LIVE_V2_MAX_CONCURRENT_POSITIONS = 3
 LIVE_V2_MIN_PROBABILITY_EDGE = Decimal("0.05")
 LIVE_V2_MIN_EXPECTED_PROFIT_USD = Decimal("0.15")
 LIVE_V2_MIDNIGHT_GUARD_SECONDS = 120
@@ -437,7 +438,20 @@ class LiveV2Journal:
             active = connection.execute(
                 "SELECT state FROM live_v2_attempts ORDER BY id DESC"
             ).fetchall()
-            if any(LiveV2State(str(row["state"])) in ACTIVE_STATES for row in active):
+            states = [LiveV2State(str(row["state"])) for row in active]
+            blocking = {
+                LiveV2State.PREPARED,
+                LiveV2State.SIGNING,
+                LiveV2State.SIGNED,
+                LiveV2State.SUBMITTING,
+                LiveV2State.AMBIGUOUS,
+                LiveV2State.MANUAL_REVIEW,
+            }
+            open_positions = sum(1 for state in states if state is LiveV2State.POSITION_OPEN)
+            if (
+                any(state in blocking for state in states)
+                or open_positions >= LIVE_V2_MAX_CONCURRENT_POSITIONS
+            ):
                 raise LivePilotError("an earlier live-v2 attempt still requires resolution")
             charged_today = int(
                 connection.execute(
@@ -519,7 +533,15 @@ class LiveV2Journal:
             ).fetchone()
         return row is not None
 
+    def open_position_count(self) -> int:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM live_v2_attempts WHERE state = 'POSITION_OPEN'"
+            ).fetchone()
+        return int(row[0])
+
     def latest_active(self) -> LiveV2Record | None:
+
         placeholders = ",".join("?" for _ in ACTIVE_STATES)
         with self._connect() as connection:
             row = connection.execute(
@@ -860,8 +882,9 @@ class LiveV2Executor:
             if any(True for _ in client.list_open_orders().iter_items()):
                 raise LivePilotError("live-v2 wallet already has an open order")
             positions = client.list_positions(user=str(client.wallet)).iter_items()
-            if any(_position_is_open(value) for value in positions):
-                raise LivePilotError("live-v2 wallet already has an open position")
+            open_positions = sum(1 for value in positions if _position_is_open(value))
+            if open_positions >= LIVE_V2_MAX_CONCURRENT_POSITIONS:
+                raise LivePilotError("live-v2 concurrent position cap reached")
             if bool(client.get_closed_only_mode()):
                 raise LivePilotError("live-v2 account is in closed-only mode")
             day_start = _local_day_start_utc(current, authorization.daily_timezone)
@@ -1280,7 +1303,8 @@ def run_live_v2(
                 time.sleep(max(1.0, poll_seconds))
                 continue
             positions = client.list_positions(user=str(client.wallet)).iter_items()
-            if any(_position_is_open(item) for item in positions):
+            open_positions = sum(1 for item in positions if _position_is_open(item))
+            if open_positions >= LIVE_V2_MAX_CONCURRENT_POSITIONS:
                 time.sleep(max(1.0, poll_seconds))
                 continue
             for candidate in candidates:
