@@ -1207,7 +1207,19 @@ def run_live_v2(
                     client,
                     timezone=authorization.daily_timezone,
                 )
-            if active is not None and active.state in ACTIVE_STATES:
+                try:
+                    recon_balance = client.get_balance_allowance(asset_type="COLLATERAL")
+                    journal.heartbeat(
+                        "RECONCILING",
+                        detail={
+                            "state": active.state.value if active is not None else None,
+                            "balance_usd": str(
+                                Decimal(int(recon_balance.balance)) / COLLATERAL_BASE_UNITS
+                            ),
+                        },
+                    )
+                except LivePilotError:
+                    journal.heartbeat("RECONCILING", detail={"state": None})
                 if active.state is LiveV2State.MANUAL_REVIEW:
                     raise LivePilotError("live-v2 requires manual review before any new order")
                 time.sleep(max(1.0, poll_seconds))
