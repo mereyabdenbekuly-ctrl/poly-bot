@@ -137,16 +137,26 @@ Its risk envelope is fixed:
 
 - only `FOK BUY` orders from fresh, authorized `v1` candidates;
 - BUY notional at most `$1.90` and signed all-in spend at most `$2.00`;
-- one reserved order attempt per `Asia/Almaty` local day. Reservation happens
-  before signing/POST, so one attempt with a `$2.00` maximum spend
-  conservatively bounds new daily risk to `$2.00`. A position closure consumes
-  that local day's slot too, and any other wallet trade observed that day blocks
-  a new attempt;
+- up to twelve signing/submission attempts per `Asia/Almaty` local day. Reservation happens
+  before signing/POST. A provably unsigned preflight rejection is recorded but
+  releases its temporary daily reservation; the same decision is not reused.
+  Crossing the durable `SIGNING` boundary keeps the daily reservation even if
+  signature validation fails, the process crashes, or POST is ambiguous.
+ Each signing attempt keeps the `$2.00` all-in cap. The day stops after twelve
+ charged attempts or `$6.00` of realized losses, whichever comes first.
+ Exchange trades observed on the wallet count toward the same attempt cap;
 - one position at a time: any open order or open position makes the loop wait;
 - dedicated-wallet collateral must be greater than zero and at most `$10.00`;
 - an ambiguous submission is never retried automatically. Reconciliation that
   cannot prove a position or close marks `MANUAL_REVIEW`, and no new order is
   allowed while any active/manual-review attempt remains unresolved.
+
+The daily attempt restriction is a conservative implementation guard, not a
+measurement of realized daily loss. It remains separate from account P&L and
+does not guarantee that the strategy is profitable. On a schema upgrade, old
+attempts and transitions are preserved byte-for-byte in their original columns;
+old `PRE_SIGN_REJECTED` rows remain charged because the older code could produce
+a signature before writing that state. The upgrade does not reset their history.
 
 The loop requires an authorized Deposit Wallet `session_key` plus a private
 mode-`0600` `/var/lib/polybot/live/live-v2-authorization.json`. The sidecar has
@@ -161,8 +171,8 @@ two non-negative signal thresholds explicitly:
   "side": "BUY",
   "order_type": "FOK",
   "one_position_at_a_time": true,
-  "max_orders_per_day": 1,
-  "daily_stop_loss_usd": "2.00",
+  "max_orders_per_day": 12,
+  "daily_stop_loss_usd": "6.00",
   "daily_timezone": "Asia/Almaty",
   "max_wallet_balance_usd": "10.00",
   "max_buy_notional_usd": "1.90",

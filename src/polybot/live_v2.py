@@ -43,8 +43,8 @@ from polybot.live_pilot_runtime import (
 LIVE_V2_AUTHORIZATION_KIND = "polybot-live-v2-authorization-v1"
 LIVE_V2_STRATEGY = "open-meteo-truncated-normal-v1"
 LIVE_V2_TIMEZONE = "Asia/Almaty"
-LIVE_V2_DAILY_STOP_USD = Decimal("2.00")
-LIVE_V2_MAX_ORDERS_PER_DAY = 1
+LIVE_V2_DAILY_STOP_USD = Decimal("6.00")
+LIVE_V2_MAX_ORDERS_PER_DAY = 12
 LIVE_V2_MIN_PROBABILITY_EDGE = Decimal("0.08")
 LIVE_V2_MIN_EXPECTED_PROFIT_USD = Decimal("0.25")
 LIVE_V2_MIDNIGHT_GUARD_SECONDS = 120
@@ -54,6 +54,7 @@ LIVE_V2_RECONCILE_GRACE = timedelta(minutes=15)
 class LiveV2State(StrEnum):
     PREPARED = "PREPARED"
     PRE_SIGN_REJECTED = "PRE_SIGN_REJECTED"
+    SIGNING = "SIGNING"
     SIGNED = "SIGNED"
     SUBMITTING = "SUBMITTING"
     AMBIGUOUS = "AMBIGUOUS"
@@ -67,6 +68,7 @@ class LiveV2State(StrEnum):
 ACTIVE_STATES = frozenset(
     {
         LiveV2State.PREPARED,
+        LiveV2State.SIGNING,
         LiveV2State.SIGNED,
         LiveV2State.SUBMITTING,
         LiveV2State.AMBIGUOUS,
@@ -126,6 +128,7 @@ class LiveV2Record:
     closed_at_utc: datetime | None
     closed_local_day: str | None
     realized_pnl_usd: Decimal | None
+    consumes_daily_limit: bool
 
     @property
     def intent(self) -> LiveBuyIntent:
@@ -198,9 +201,9 @@ def load_live_v2_authorization(
     if not authorization.one_position_at_a_time:
         raise LivePilotError("live-v2 requires one_position_at_a_time=true")
     if authorization.max_orders_per_day != LIVE_V2_MAX_ORDERS_PER_DAY:
-        raise LivePilotError("live-v2 permits exactly one order attempt per local day")
+        raise LivePilotError("live-v2 permits at most twelve order attempts per local day")
     if authorization.daily_stop_loss_usd != LIVE_V2_DAILY_STOP_USD:
-        raise LivePilotError("live-v2 daily stop must remain $2.00")
+        raise LivePilotError("live-v2 daily stop must remain $6.00")
     if authorization.daily_timezone != LIVE_V2_TIMEZONE:
         raise LivePilotError("live-v2 daily timezone must remain Asia/Almaty")
     if authorization.max_wallet_balance_usd != PILOT_MAX_WALLET_USD:
@@ -246,7 +249,7 @@ class LiveV2Journal:
                 """
                 CREATE TABLE IF NOT EXISTS live_v2_attempts(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    local_day TEXT NOT NULL UNIQUE,
+                    local_day TEXT NOT NULL,
                     decision_id INTEGER NOT NULL UNIQUE,
                     intent_sha256 TEXT NOT NULL UNIQUE,
                     idempotency_key TEXT NOT NULL UNIQUE,
@@ -263,7 +266,9 @@ class LiveV2Journal:
                     reconciled_at_utc TEXT,
                     closed_at_utc TEXT,
                     closed_local_day TEXT,
-                    realized_pnl_usd TEXT
+                    realized_pnl_usd TEXT,
+                    consumes_daily_limit INTEGER NOT NULL DEFAULT 1
+                        CHECK(consumes_daily_limit IN (0, 1))
                 );
 
                 CREATE TABLE IF NOT EXISTS live_v2_transitions(
@@ -301,6 +306,87 @@ class LiveV2Journal:
                 "CREATE INDEX IF NOT EXISTS live_v2_attempts_closed_day_idx "
                 "ON live_v2_attempts(closed_local_day)"
             )
+
+        self._migrate_daily_limit()
+
+    def _migrate_daily_limit(self) -> None:
+        """Keep old rows charged; release only provably unsigned new failures.
+
+        Old PRE_SIGN_REJECTED rows may have signed before writing that state.
+        Their history and daily charge must not be inferred away on upgrade.
+        """
+
+        connection = self._connect()
+        try:
+            # Rebuild the old day-UNIQUE parent without renaming it first;
+            # dependent transition rows keep referring to live_v2_attempts.
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("BEGIN IMMEDIATE")
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(live_v2_attempts)")
+            }
+            if "consumes_daily_limit" not in columns:
+                connection.execute(
+                    """
+                    CREATE TABLE live_v2_attempts_migrating(
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        local_day TEXT NOT NULL,
+                        decision_id INTEGER NOT NULL UNIQUE,
+                        intent_sha256 TEXT NOT NULL UNIQUE,
+                        idempotency_key TEXT NOT NULL UNIQUE,
+                        state TEXT NOT NULL,
+                        intent_json TEXT NOT NULL,
+                        signed_fingerprint TEXT UNIQUE,
+                        signed_order_json TEXT,
+                        remote_order_id TEXT UNIQUE,
+                        response_json TEXT,
+                        last_error TEXT,
+                        created_at_utc TEXT NOT NULL,
+                        updated_at_utc TEXT NOT NULL,
+                        submitted_at_utc TEXT,
+                        reconciled_at_utc TEXT,
+                        closed_at_utc TEXT,
+                        closed_local_day TEXT,
+                        realized_pnl_usd TEXT,
+                        consumes_daily_limit INTEGER NOT NULL DEFAULT 1
+                            CHECK(consumes_daily_limit IN (0, 1))
+                    )
+                    """
+                )
+                names = (
+                    "id,local_day,decision_id,intent_sha256,idempotency_key,state,"
+                    "intent_json,signed_fingerprint,signed_order_json,remote_order_id,"
+                    "response_json,last_error,created_at_utc,updated_at_utc,"
+                    "submitted_at_utc,reconciled_at_utc,closed_at_utc,closed_local_day,"
+                    "realized_pnl_usd"
+                )
+                connection.execute(
+                    f"INSERT INTO live_v2_attempts_migrating({names}) "  # noqa: S608
+                    f"SELECT {names} FROM live_v2_attempts"
+                )
+                connection.execute("DROP TABLE live_v2_attempts")
+                connection.execute(
+                    "ALTER TABLE live_v2_attempts_migrating RENAME TO live_v2_attempts"
+                )
+            connection.execute("DROP INDEX IF EXISTS live_v2_charged_day_idx")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS live_v2_charged_day_idx "
+                "ON live_v2_attempts(local_day) WHERE consumes_daily_limit = 1"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS live_v2_attempts_closed_day_idx "
+                "ON live_v2_attempts(closed_local_day)"
+            )
+            if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise LivePilotError("daily-limit migration failed its foreign-key check")
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.close()
 
     def heartbeat(self, state: str, *, detail: Mapping[str, Any] | None = None) -> None:
         now_monotonic = time.monotonic()
@@ -351,18 +437,22 @@ class LiveV2Journal:
             ).fetchall()
             if any(LiveV2State(str(row["state"])) in ACTIVE_STATES for row in active):
                 raise LivePilotError("an earlier live-v2 attempt still requires resolution")
-            if connection.execute(
-                "SELECT 1 FROM live_v2_attempts WHERE local_day = ?",
-                (local_day,),
-            ).fetchone() is not None:
+            charged_today = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM live_v2_attempts "
+                    "WHERE local_day = ? AND consumes_daily_limit = 1",
+                    (local_day,),
+                ).fetchone()[0]
+            )
+            if charged_today >= LIVE_V2_MAX_ORDERS_PER_DAY:
                 raise LivePilotError("live-v2 daily order-attempt limit is already consumed")
-            if connection.execute(
-                "SELECT 1 FROM live_v2_attempts WHERE closed_local_day = ? LIMIT 1",
+            realized_today = connection.execute(
+                "SELECT TOTAL(realized_pnl_usd) FROM live_v2_attempts "
+                "WHERE closed_local_day = ? AND realized_pnl_usd IS NOT NULL",
                 (local_day,),
-            ).fetchone() is not None:
-                raise LivePilotError(
-                    "live-v2 daily stop is active after a position closed today"
-                )
+            ).fetchone()[0]
+            if Decimal(str(realized_today)) <= -LIVE_V2_DAILY_STOP_USD:
+                raise LivePilotError("live-v2 daily stop is active after realized losses today")
             cursor = connection.execute(
                 """
                 INSERT INTO live_v2_attempts(
@@ -402,20 +492,23 @@ class LiveV2Journal:
         finally:
             connection.close()
 
-    def attempt_for_day(self, local_day: str) -> LiveV2Record | None:
+    def charged_count_for_day(self, local_day: str) -> int:
         with self._connect() as connection:
-            row = connection.execute(
-                "SELECT * FROM live_v2_attempts WHERE local_day = ?", (local_day,)
-            ).fetchone()
-        return None if row is None else _record(row)
-
-    def closed_on_day(self, local_day: str) -> bool:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT 1 FROM live_v2_attempts WHERE closed_local_day = ? LIMIT 1",
+            count = connection.execute(
+                "SELECT COUNT(*) FROM live_v2_attempts "
+                "WHERE local_day = ? AND consumes_daily_limit = 1",
                 (local_day,),
-            ).fetchone()
-        return row is not None
+            ).fetchone()[0]
+        return int(count)
+
+    def daily_loss_stop_hit(self, local_day: str) -> bool:
+        with self._connect() as connection:
+            realized = connection.execute(
+                "SELECT TOTAL(realized_pnl_usd) FROM live_v2_attempts "
+                "WHERE closed_local_day = ? AND realized_pnl_usd IS NOT NULL",
+                (local_day,),
+            ).fetchone()[0]
+        return Decimal(str(realized)) <= -LIVE_V2_DAILY_STOP_USD
 
     def decision_attempted(self, decision_id: int) -> bool:
         with self._connect() as connection:
@@ -449,8 +542,17 @@ class LiveV2Journal:
             digest,
             expected={LiveV2State.PREPARED},
             target=LiveV2State.PRE_SIGN_REJECTED,
-            updates={"last_error": _safe_error(error)},
+            updates={"last_error": _safe_error(error), "consumes_daily_limit": 0},
             detail={"error": _safe_error(error)},
+        )
+
+    def mark_signing(self, digest: str) -> None:
+        self._move(
+            digest,
+            expected={LiveV2State.PREPARED},
+            target=LiveV2State.SIGNING,
+            updates={},
+            detail={},
         )
 
     def save_signed(self, digest: str, signed: Mapping[str, Any]) -> None:
@@ -463,7 +565,7 @@ class LiveV2Journal:
         stored["signature_sha256"] = hashlib.sha256(signature.encode()).hexdigest()
         self._move(
             digest,
-            expected={LiveV2State.PREPARED},
+            expected={LiveV2State.SIGNING},
             target=LiveV2State.SIGNED,
             updates={
                 "signed_fingerprint": fingerprint,
@@ -498,9 +600,7 @@ class LiveV2Journal:
             status = str(getattr(response, "status", ""))
             trade_ids = tuple(str(value) for value in getattr(response, "trade_ids", ()))
             if remote is None or status != "matched" or not trade_ids:
-                raise LivePilotError(
-                    "accepted FOK response lacks a matched order id and fill ids"
-                )
+                raise LivePilotError("accepted FOK response lacks a matched order id and fill ids")
             state = LiveV2State.ACCEPTED
         elif ok is False:
             code = str(getattr(response, "code", ""))
@@ -554,9 +654,7 @@ class LiveV2Journal:
                 "reconciled_at_utc": now.isoformat(),
                 "closed_at_utc": now.isoformat(),
                 "closed_local_day": _local_day(now, timezone),
-                "realized_pnl_usd": None
-                if realized_pnl_usd is None
-                else str(realized_pnl_usd),
+                "realized_pnl_usd": None if realized_pnl_usd is None else str(realized_pnl_usd),
             },
             detail=detail,
         )
@@ -583,8 +681,7 @@ class LiveV2Journal:
                 "SELECT * FROM live_v2_attempts ORDER BY id DESC LIMIT 1"
             ).fetchone()
             runtime = connection.execute(
-                "SELECT state,detail_json,updated_at_utc FROM live_v2_runtime "
-                "WHERE singleton=1"
+                "SELECT state,detail_json,updated_at_utc FROM live_v2_runtime WHERE singleton=1"
             ).fetchone()
         return {
             "states": states,
@@ -600,6 +697,7 @@ class LiveV2Journal:
                 "closed_at_utc": latest["closed_at_utc"],
                 "closed_local_day": latest["closed_local_day"],
                 "realized_pnl_usd": latest["realized_pnl_usd"],
+                "consumes_daily_limit": bool(latest["consumes_daily_limit"]),
                 "updated_at_utc": str(latest["updated_at_utc"]),
             },
         }
@@ -643,6 +741,7 @@ class LiveV2Journal:
                 "closed_at_utc",
                 "closed_local_day",
                 "realized_pnl_usd",
+                "consumes_daily_limit",
             }
             if not set(values).issubset(allowed):
                 raise LivePilotError("unsafe live-v2 journal update")
@@ -677,8 +776,8 @@ class LiveV2Journal:
         now: str,
     ) -> None:
         connection.execute(
-            "INSERT INTO live_v2_transitions(" 
-            "attempt_id,from_state,to_state,created_at_utc,detail_json" 
+            "INSERT INTO live_v2_transitions("
+            "attempt_id,from_state,to_state,created_at_utc,detail_json"
             ") VALUES (?, ?, ?, ?, ?)",
             (
                 attempt_id,
@@ -751,23 +850,17 @@ class LiveV2Executor:
             if bool(client.get_closed_only_mode()):
                 raise LivePilotError("live-v2 account is in closed-only mode")
             day_start = _local_day_start_utc(current, authorization.daily_timezone)
-            if any(
-                True
-                for _ in client.list_account_trades(
-                    after=day_start.isoformat()
-                ).iter_items()
-            ):
+            trades_today = sum(
+                1 for _ in client.list_account_trades(after=day_start.isoformat()).iter_items()
+            )
+            if trades_today >= authorization.max_orders_per_day:
                 raise LivePilotError(
-                    "live-v2 daily stop blocks a new order after wallet trading activity today"
+                    "live-v2 daily order limit blocks a new order "
+                    "after wallet trading activity today"
                 )
-            if any(
-                _position_closed_since(item, day_start)
-                for item in client.list_closed_positions(
-                    user=str(client.wallet)
-                ).iter_items()
-            ):
+            if self.journal.daily_loss_stop_hit(record.local_day):
                 raise LivePilotError(
-                    "live-v2 daily stop blocks a new order after a wallet position closed today"
+                    "live-v2 daily stop blocks a new order after realized losses today"
                 )
             market = client.get_market(id=intent.market_id)
             fee_rate, fee_exponent = _verify_market_identity(client, market, intent)
@@ -776,8 +869,18 @@ class LiveV2Executor:
             signing_time = datetime.now(UTC)
             if signing_time >= authorization.expires_at_utc:
                 raise LivePilotError("live-v2 authorization expired before signing")
+            if signing_time >= intent.expires_at_utc:
+                raise LivePilotError("live-v2 intent expired before signing")
             if _local_day(signing_time, authorization.daily_timezone) != record.local_day:
                 raise LivePilotError("live-v2 local day changed before signing")
+        except LivePilotError as error:
+            self.journal.mark_pre_sign_rejected(intent.digest, error)
+            return self.journal.get(intent.digest)
+
+        # This durable CAS also prevents two workers that observed PREPARED
+        # from both reaching the signing SDK. A crash after it is fail-closed.
+        self.journal.mark_signing(intent.digest)
+        try:
             signed = client.create_market_order(
                 token_id=intent.token_id,
                 side="BUY",
@@ -794,14 +897,21 @@ class LiveV2Executor:
                 fee_rate=fee_rate,
                 fee_exponent=fee_exponent,
             )
-        except LivePilotError as error:
-            self.journal.mark_pre_sign_rejected(intent.digest, error)
-            return self.journal.get(intent.digest)
-        signed_payload = _signed_payload(signed)
-        self.journal.save_signed(intent.digest, signed_payload)
+            signed_payload = _signed_payload(signed)
+            self.journal.save_signed(intent.digest, signed_payload)
+        except BaseException as error:
+            self.journal.mark_manual_review(
+                intent.digest,
+                detail={
+                    "reason": "signing or signed-order validation failed",
+                    "error": _safe_error(error),
+                },
+            )
+            raise LivePilotError("live-v2 signing boundary requires manual review") from error
         post_time = datetime.now(UTC)
         if (
             post_time >= authorization.expires_at_utc
+            or post_time >= intent.expires_at_utc
             or _local_day(post_time, authorization.daily_timezone) != record.local_day
         ):
             self.journal.mark_manual_review(
@@ -865,10 +975,13 @@ def eligible_live_v2_candidates(
             )
             if not paper_buy and not monitor_only:
                 continue
-            if connection.execute(
-                "SELECT 1 FROM decisions WHERE market_id = ? AND id > ? LIMIT 1",
-                (str(row["market_id"]), decision_id),
-            ).fetchone() is not None:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM decisions WHERE market_id = ? AND id > ? LIMIT 1",
+                    (str(row["market_id"]), decision_id),
+                ).fetchone()
+                is not None
+            ):
                 continue
             try:
                 created = _parse_time(payload.get("created_at", row["created_at"]))
@@ -912,7 +1025,7 @@ def reconcile_live_v2(
     record = journal.latest_active()
     if record is None:
         return None
-    if record.state in {LiveV2State.PREPARED, LiveV2State.SIGNED}:
+    if record.state in {LiveV2State.PREPARED, LiveV2State.SIGNING, LiveV2State.SIGNED}:
         journal.mark_manual_review(
             record.intent_sha256,
             detail={"reason": "process stopped before submission boundary"},
@@ -924,17 +1037,13 @@ def reconcile_live_v2(
     open_orders = tuple(client.list_open_orders().iter_items())
     positions = tuple(client.list_positions(user=str(client.wallet)).iter_items())
     open_positions = tuple(item for item in positions if _position_is_open(item))
-    matching_positions = tuple(
-        item for item in open_positions if _position_matches(item, intent)
-    )
+    matching_positions = tuple(item for item in open_positions if _position_matches(item, intent))
     expected_trade_ids = _response_trade_ids(record)
     all_candidate_trades = [
         item
         for item in client.list_account_trades(
             token_id=intent.token_id,
-            after=None
-            if record.submitted_at_utc is None
-            else record.submitted_at_utc.isoformat(),
+            after=None if record.submitted_at_utc is None else record.submitted_at_utc.isoformat(),
         ).iter_items()
         if _trade_matches(item, intent, remote_order_id=record.remote_order_id)
     ]
@@ -978,17 +1087,13 @@ def reconcile_live_v2(
         market_closed = bool(getattr(market_state, "closed", False))
         closed_positions = tuple(
             item
-            for item in client.list_closed_positions(
-                user=str(client.wallet)
-            ).iter_items()
+            for item in client.list_closed_positions(user=str(client.wallet)).iter_items()
             if _closed_position_matches(item, intent, record.submitted_at_utc)
         )
         if market_closed and closed_positions:
             pnl_values = [
                 Decimal(str(value))
-                for value in (
-                    getattr(item, "realized_pnl", None) for item in closed_positions
-                )
+                for value in (getattr(item, "realized_pnl", None) for item in closed_positions)
                 if value is not None
             ]
             realized_pnl = sum(pnl_values, Decimal(0)) if pnl_values else None
@@ -998,9 +1103,7 @@ def reconcile_live_v2(
                 realized_pnl_usd=realized_pnl,
                 detail={
                     "matching_closed_positions": len(closed_positions),
-                    "realized_pnl_usd": None
-                    if realized_pnl is None
-                    else str(realized_pnl),
+                    "realized_pnl_usd": None if realized_pnl is None else str(realized_pnl),
                 },
             )
         elif market_closed and datetime.now(UTC) - record.updated_at_utc > timedelta(days=1):
@@ -1069,7 +1172,9 @@ def run_live_v2(
                 time.sleep(max(1.0, poll_seconds))
                 continue
         local_day = _local_day(datetime.now(UTC), authorization.daily_timezone)
-        if journal.attempt_for_day(local_day) is not None or journal.closed_on_day(local_day):
+        if journal.charged_count_for_day(
+            local_day
+        ) >= authorization.max_orders_per_day or journal.daily_loss_stop_hit(local_day):
             journal.heartbeat("DAILY_LIMIT", detail={"local_day": local_day})
             time.sleep(max(30.0, poll_seconds))
             continue
@@ -1113,9 +1218,7 @@ def run_live_v2(
                     continue
                 authorization = load_live_v2_authorization(authorization_path)
                 if credentials.wallet.casefold() != authorization.wallet.casefold():
-                    raise LivePilotError(
-                        "live-v2 authorization wallet does not match credentials"
-                    )
+                    raise LivePilotError("live-v2 authorization wallet does not match credentials")
                 geoblock = fetch_geoblock_status(
                     url=settings.geoblock_url,
                     timeout=min(settings.http_timeout_seconds, 20.0),
@@ -1160,6 +1263,7 @@ def live_v2_status(database: Path) -> dict[str, Any]:
         "max_all_in_spend_usd": str(PILOT_MAX_BUY_USD),
         "daily_stop_loss_usd": str(LIVE_V2_DAILY_STOP_USD),
         "max_orders_per_day": LIVE_V2_MAX_ORDERS_PER_DAY,
+        "daily_limit_scope": "signing_or_uncertain_attempts; unsigned_preflight_excluded",
         "daily_timezone": LIVE_V2_TIMEZONE,
         "min_probability_edge": str(LIVE_V2_MIN_PROBABILITY_EDGE),
         "min_expected_profit_usd": str(LIVE_V2_MIN_EXPECTED_PROFIT_USD),
@@ -1221,13 +1325,12 @@ def _record(row: sqlite3.Row) -> LiveV2Record:
         reconciled_at_utc=None
         if row["reconciled_at_utc"] is None
         else _parse_time(row["reconciled_at_utc"]),
-        closed_at_utc=None
-        if row["closed_at_utc"] is None
-        else _parse_time(row["closed_at_utc"]),
+        closed_at_utc=None if row["closed_at_utc"] is None else _parse_time(row["closed_at_utc"]),
         closed_local_day=row["closed_local_day"],
         realized_pnl_usd=None
         if row["realized_pnl_usd"] is None
         else Decimal(str(row["realized_pnl_usd"])),
+        consumes_daily_limit=bool(row["consumes_daily_limit"]),
     )
 
 

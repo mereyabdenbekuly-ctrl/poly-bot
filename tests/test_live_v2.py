@@ -4,7 +4,7 @@ import hashlib
 import json
 import sqlite3
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -205,8 +205,8 @@ def _authorization(path: Path, **updates: object) -> Path:
         "side": "BUY",
         "order_type": "FOK",
         "one_position_at_a_time": True,
-        "max_orders_per_day": 1,
-        "daily_stop_loss_usd": "2.00",
+        "max_orders_per_day": 12,
+        "daily_stop_loss_usd": "6.00",
         "daily_timezone": LIVE_V2_TIMEZONE,
         "max_wallet_balance_usd": "10.00",
         "max_buy_notional_usd": "1.90",
@@ -279,7 +279,7 @@ def test_authorization_is_private_fixed_and_time_bounded(tmp_path: Path) -> None
 
     assert loaded.wallet == WALLET
     assert loaded.daily_timezone == LIVE_V2_TIMEZONE
-    assert loaded.max_orders_per_day == 1
+    assert loaded.max_orders_per_day == 12
 
     path.chmod(0o644)
     with pytest.raises(LivePilotError, match="mode 0600"):
@@ -304,8 +304,8 @@ def test_authorization_is_private_fixed_and_time_bounded(tmp_path: Path) -> None
         ({"side": "SELL"}, "only FOK BUY"),
         ({"order_type": "GTC"}, "only FOK BUY"),
         ({"one_position_at_a_time": False}, "one_position_at_a_time"),
-        ({"max_orders_per_day": 2}, "exactly one"),
-        ({"daily_stop_loss_usd": "2.01"}, "daily stop"),
+        ({"max_orders_per_day": 13}, "at most twelve"),
+        ({"daily_stop_loss_usd": "6.01"}, "daily stop"),
         ({"daily_timezone": "UTC"}, "Asia/Almaty"),
         ({"max_wallet_balance_usd": "10.01"}, r"\$10 wallet cap"),
         ({"max_buy_notional_usd": "1.91"}, r"\$1\.90 BUY cap"),
@@ -427,7 +427,7 @@ def test_candidate_filtering_requires_fresh_unsuperseded_unattempted_v1(
     assert [candidate.decision_id for candidate in candidates] == [2, 3]
 
 
-def test_one_attempt_per_almaty_day_allows_next_day_after_terminal(
+def test_unsigned_rejection_does_not_consume_the_almaty_day(
     tmp_path: Path,
 ) -> None:
     journal = LiveV2Journal(tmp_path / "polybot.sqlite3")
@@ -445,13 +445,18 @@ def test_one_attempt_per_almaty_day_allows_next_day_after_terminal(
     journal.mark_pre_sign_rejected(first.digest, LivePilotError("terminal"))
 
     assert first_record.local_day == "2026-09-17"
-    with pytest.raises(LivePilotError, match="daily order-attempt limit"):
-        journal.reserve(
-            intent=_intent(event_id="same-day"),
-            decision_id=2,
-            timezone=LIVE_V2_TIMEZONE,
-            now=same_almaty_day,
-        )
+    assert journal.charged_count_for_day(first_record.local_day) == 0
+    assert not journal.get(first.digest).consumes_daily_limit
+    second = _intent(event_id="same-day")
+    same_day_record = journal.reserve(
+        intent=second,
+        decision_id=2,
+        timezone=LIVE_V2_TIMEZONE,
+        now=same_almaty_day,
+    )
+    assert same_day_record.local_day == first_record.local_day
+    assert same_day_record.consumes_daily_limit
+    journal.mark_pre_sign_rejected(second.digest, LivePilotError("terminal"))
 
     next_record = journal.reserve(
         intent=_intent(event_id="next-day"),
@@ -501,6 +506,7 @@ def test_pre_sign_rejection_journals_without_signing_or_posting(tmp_path: Path) 
     assert record.state is LiveV2State.PRE_SIGN_REJECTED
     assert record.signed_fingerprint is None
     assert record.signed_order_json is None
+    assert not record.consumes_daily_limit
     assert "order book changed" in str(record.last_error)
     assert client.create_calls == 0
     assert client.post_calls == 0
@@ -570,7 +576,8 @@ def test_accepted_response_and_redacted_signature_are_journaled(tmp_path: Path) 
         ).fetchall()
     assert transitions == [
         (None, "PREPARED"),
-        ("PREPARED", "SIGNED"),
+        ("PREPARED", "SIGNING"),
+        ("SIGNING", "SIGNED"),
         ("SIGNED", "SUBMITTING"),
         ("SUBMITTING", "ACCEPTED"),
     ]
@@ -686,3 +693,141 @@ def test_reconciliation_treats_buy_fill_as_open_and_requires_confirmed_close(
     assert closed.state is LiveV2State.CLOSED
     assert closed.realized_pnl_usd == Decimal("0.42")
     assert closed.closed_local_day is not None
+
+
+def test_signed_validation_failure_never_releases_day(tmp_path: Path) -> None:
+    value = _intent()
+    client = FakeClient()
+    client.signed = replace(client.signed, maker_amount=2_100_000)
+    journal = LiveV2Journal(tmp_path / "polybot.sqlite3")
+
+    with pytest.raises(LivePilotError, match="signing boundary requires manual review"):
+        LiveV2Executor(journal).execute(
+            client=client,
+            intent=value,
+            decision_id=1,
+            authorization=_loaded_authorization(tmp_path),
+            geoblocked=False,
+            now=NOW,
+        )
+
+    record = journal.get(value.digest)
+    assert record.state is LiveV2State.MANUAL_REVIEW
+    assert record.consumes_daily_limit
+    assert client.create_calls == 1
+    assert client.post_calls == 0
+    with pytest.raises(LivePilotError, match="invalid live-v2 transition"):
+        journal.mark_pre_sign_rejected(value.digest, LivePilotError("not unsigned"))
+
+
+def test_signing_boundary_is_single_owner_and_crash_safe(tmp_path: Path) -> None:
+    journal = LiveV2Journal(tmp_path / "polybot.sqlite3")
+    value = _intent()
+    journal.reserve(intent=value, decision_id=1, timezone=LIVE_V2_TIMEZONE, now=NOW)
+    journal.mark_signing(value.digest)
+
+    with pytest.raises(LivePilotError, match="invalid live-v2 transition"):
+        journal.mark_signing(value.digest)
+    with pytest.raises(LivePilotError, match="invalid live-v2 transition"):
+        journal.mark_pre_sign_rejected(value.digest, LivePilotError("not unsigned"))
+
+    record = reconcile_live_v2(journal, FakeClient())
+    assert record is not None
+    assert record.state is LiveV2State.MANUAL_REVIEW
+    assert record.consumes_daily_limit
+
+
+def test_posted_rejection_still_consumes_day_and_allows_next_day(tmp_path: Path) -> None:
+    journal = LiveV2Journal(tmp_path / "polybot.sqlite3")
+    value = _intent()
+    record = journal.reserve(intent=value, decision_id=1, timezone=LIVE_V2_TIMEZONE, now=NOW)
+    journal.mark_signing(value.digest)
+    journal.save_signed(value.digest, asdict(FakeSignedOrder()))
+    journal.mark_submitting(value.digest)
+    journal.mark_response(
+        value.digest,
+        FakeResponse(ok=False, order_id=None, code="fok_not_filled", message="not filled"),
+    )
+
+    assert journal.get(value.digest).consumes_daily_limit
+    assert journal.charged_count_for_day(record.local_day) == 1
+    same_day = journal.reserve(
+        intent=_intent(event_id="same-day"),
+        decision_id=2,
+        timezone=LIVE_V2_TIMEZONE,
+        now=NOW,
+    )
+    assert same_day.local_day == record.local_day
+    assert journal.charged_count_for_day(record.local_day) == 2
+    journal.mark_pre_sign_rejected(same_day.intent_sha256, LivePilotError("terminal"))
+    next_record = journal.reserve(
+        intent=_intent(event_id="next-day"),
+        decision_id=3,
+        timezone=LIVE_V2_TIMEZONE,
+        now=NOW + timedelta(days=1),
+    )
+    assert next_record.local_day != record.local_day
+
+
+def test_legacy_migration_preserves_history_and_does_not_release_old_rejections(
+    tmp_path: Path,
+) -> None:
+    source = LiveV2Journal(tmp_path / "source.sqlite3")
+    value = _intent()
+    source.reserve(intent=value, decision_id=1, timezone=LIVE_V2_TIMEZONE, now=NOW)
+    source.mark_pre_sign_rejected(value.digest, LivePilotError("old book changed"))
+    database = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(source.path) as old, sqlite3.connect(database) as legacy:
+        schema = old.execute(
+            "SELECT sql FROM sqlite_master WHERE name='live_v2_attempts'"
+        ).fetchone()[0]
+        # Recreate the real pre-fix implicit UNIQUE constraint, with no charge
+        # column or durable signing-boundary evidence.
+        schema = schema[: schema.index(",\n                    consumes_daily_limit")] + ")"
+        schema = schema.replace("local_day TEXT NOT NULL,", "local_day TEXT NOT NULL UNIQUE,")
+        legacy.execute(schema)
+        columns = [row[1] for row in legacy.execute("PRAGMA table_info(live_v2_attempts)")]
+        rows = old.execute(f"SELECT {','.join(columns)} FROM live_v2_attempts").fetchall()
+        placeholders = ",".join("?" for _ in columns)
+        legacy.executemany(f"INSERT INTO live_v2_attempts VALUES ({placeholders})", rows)
+        transition_schema = old.execute(
+            "SELECT sql FROM sqlite_master WHERE name='live_v2_transitions'"
+        ).fetchone()[0]
+        legacy.execute(transition_schema)
+        transitions = old.execute("SELECT * FROM live_v2_transitions ORDER BY id").fetchall()
+        legacy.executemany("INSERT INTO live_v2_transitions VALUES (?,?,?,?,?,?)", transitions)
+
+    upgraded = LiveV2Journal(database)
+    upgraded_again = LiveV2Journal(database)
+    record = upgraded_again.get(value.digest)
+    assert record.state is LiveV2State.PRE_SIGN_REJECTED
+    assert record.consumes_daily_limit  # The old state alone was not proof of no signature.
+    assert upgraded.charged_count_for_day(record.local_day) >= 1
+    with sqlite3.connect(database) as check:
+        assert (
+            check.execute("SELECT * FROM live_v2_transitions ORDER BY id").fetchall() == transitions
+        )
+        assert check.execute(f"SELECT {','.join(columns)} FROM live_v2_attempts").fetchall() == rows
+        assert check.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
+def test_unsigned_retry_preserves_both_attempts_and_consumes_no_cash(tmp_path: Path) -> None:
+    journal = LiveV2Journal(tmp_path / "polybot.sqlite3")
+    client = FakeClient()
+    client.book_hash = "changed"
+    authorization = _loaded_authorization(tmp_path)
+    for index in (1, 2):
+        result = LiveV2Executor(journal).execute(
+            client=client,
+            intent=_intent(event_id=f"event-{index}"),
+            decision_id=index,
+            authorization=authorization,
+            geoblocked=False,
+            now=NOW,
+        )
+        assert result.state is LiveV2State.PRE_SIGN_REJECTED
+        assert result.submitted_at_utc is None
+        assert not result.consumes_daily_limit
+
+    assert client.create_calls == client.post_calls == 0
+    assert journal.summary()["states"] == {"PRE_SIGN_REJECTED": 2}
