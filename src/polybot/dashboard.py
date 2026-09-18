@@ -193,7 +193,7 @@ function renderLiveV2(d){
  };
  const rowOf=o=>{const p=o.realized_pnl_usd==null?null:Number(o.realized_pnl_usd);return `<tr><td>${dateTime(o.submitted_at_utc||o.created_at_utc)}<div class="sub">#${esc(String(o.id))} · decision ${esc(String(o.decision_id))}</div></td><td><div class="market">event ${esc(o.event_id||'—')} <span class="pill gray">${esc(o.market_id||'')}</span></div><div class="sub">${esc(o.side||'BUY')} ${esc(o.order_type||'FOK')}</div></td><td class="num">${money(o.amount_usd)}<div class="sub">price ≤ ${money(o.max_price)}</div></td><td><span class="pill ${statePill(o)}">${esc(o.state)}</span></td><td class="num ${p==null?'':p>=0?'positive':'negative'}">${p==null?'—':money(p)}</td></tr>`};
  const tableHtml=rows=>rows.length?'<div style="overflow-x:auto"><table class="positions"><thead><tr><th>Placed</th><th>Market</th><th class="num">Amount</th><th>State</th><th class="num">P&L</th></tr></thead><tbody>'+rows.map(rowOf).join('')+'</tbody></table></div>':'';
- paginate('orders',orders,tableHtml,$('live-orders'),'No live order attempts recorded yet. Real FOK BUY orders will appear here.');
+
  $('live-v2').innerHTML=`<div class="panel-head"><div><h2>Live trading · real orders</h2><div class="panel-note">isolated wallet lane · exact journal before every POST · times in Almaty</div></div><span class="pill ${stateClass}">${esc(state)}</span></div>
  <div class="grid" style="margin-bottom:14px">
  <div class="metric"><div class="eyebrow">Service</div><div class="value ${online?'good':'warn'}">${online?'ONLINE':'CHECK'}</div><div class="hint">${heartbeat?`heartbeat ${elapsed(age)} ago`:'no heartbeat yet'}</div></div>
@@ -201,6 +201,7 @@ function renderLiveV2(d){
  <div class="metric"><div class="eyebrow">Submitted</div><div class="value neutral">${t.submitted||0}</div><div class="hint">of ${esc(String(limits.max_orders_per_day||50))}/day · ${live.attempts||0} attempts total</div></div>
  <div class="metric"><div class="eyebrow">Wallet balance</div><div class="value neutral">${detail.balance_usd!=null?compactMoney(detail.balance_usd):'—'}</div><div class="hint">cap $${esc(limits.max_wallet_balance_usd||'10.00')} · FOK ≤ $${esc(limits.max_buy_notional_usd||'1.90')}</div></div>
  </div><div id="live-orders"></div>`;
+ paginate('orders',orders,tableHtml,$('live-orders'),'No live order attempts recorded yet. Real FOK BUY orders will appear here.');
 }
 function renderPositions(d){
  const rows=d.positions||[];
