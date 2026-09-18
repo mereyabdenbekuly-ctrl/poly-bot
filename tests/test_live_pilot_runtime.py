@@ -227,7 +227,7 @@ def test_preview_refreshes_book_hash_only_when_current_fok_price_is_not_worse(
     )
 
     assert refreshed.book_hash == "book-current"
-    client.asks = (SimpleNamespace(price=Decimal("0.51"), size=Decimal("10")),)
+    client.asks = (SimpleNamespace(price=Decimal("0.53"), size=Decimal("10")),)
     with pytest.raises(LivePilotError, match="moved above"):
         preview_intent_from_decision(
             settings=settings,

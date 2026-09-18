@@ -34,6 +34,7 @@ from polybot.live_pilot import (
     _verify_signed_order,
 )
 from polybot.live_pilot_runtime import (
+    LIVE_V2_PRICE_DRIFT_USD,
     _fok_buy_limit_from_book,
     load_live_credentials,
     open_live_client,
@@ -1147,7 +1148,7 @@ def _verify_book_price_limit(book: Any, intent: LiveBuyIntent) -> None:
         raise LivePilotError(
             "order book changed; a new decision and approval are required"
         ) from error
-    if current_limit > intent.max_price:
+    if current_limit > intent.max_price + LIVE_V2_PRICE_DRIFT_USD:
         raise LivePilotError("order book changed; a new decision and approval are required")
 
 
