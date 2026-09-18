@@ -45,8 +45,8 @@ LIVE_V2_STRATEGY = "open-meteo-truncated-normal-v1"
 LIVE_V2_TIMEZONE = "Asia/Almaty"
 LIVE_V2_DAILY_STOP_USD = Decimal("6.00")
 LIVE_V2_MAX_ORDERS_PER_DAY = 12
-LIVE_V2_MIN_PROBABILITY_EDGE = Decimal("0.08")
-LIVE_V2_MIN_EXPECTED_PROFIT_USD = Decimal("0.25")
+LIVE_V2_MIN_PROBABILITY_EDGE = Decimal("0.05")
+LIVE_V2_MIN_EXPECTED_PROFIT_USD = Decimal("0.15")
 LIVE_V2_MIDNIGHT_GUARD_SECONDS = 120
 LIVE_V2_RECONCILE_GRACE = timedelta(minutes=15)
 
@@ -215,7 +215,7 @@ def load_live_v2_authorization(
     if authorization.min_probability_edge != LIVE_V2_MIN_PROBABILITY_EDGE:
         raise LivePilotError("live-v2 probability edge gate must remain 0.08")
     if authorization.min_expected_profit_usd != LIVE_V2_MIN_EXPECTED_PROFIT_USD:
-        raise LivePilotError("live-v2 expected-profit gate must remain $0.25")
+        raise LivePilotError("live-v2 expected-profit gate must remain $0.15")
     if not authorization.jurisdiction_confirmed:
         raise LivePilotError("user/account jurisdiction eligibility is not confirmed")
     if authorization.authorized_at_utc >= authorization.expires_at_utc:
@@ -1150,8 +1150,8 @@ def run_live_v2(
     while timeout_seconds <= 0 or time.monotonic() - started < timeout_seconds:
         authorization = load_live_v2_authorization(authorization_path)
         credentials = load_live_credentials(credentials_path)
-        if credentials.auth_mode != "session_key":
-            raise LivePilotError("live-v2 requires an authorized Deposit Wallet session key")
+        if credentials.auth_mode not in {"session_key", "direct_signer"}:
+            raise LivePilotError("live-v2 requires an authorized wallet signer")
         if credentials.wallet.casefold() != authorization.wallet.casefold():
             raise LivePilotError("live-v2 authorization wallet does not match credentials")
         journal.heartbeat("RUNNING")
@@ -1159,8 +1159,8 @@ def run_live_v2(
         if active is not None:
             journal.heartbeat("RECONCILING", detail={"state": active.state.value})
             with open_live_client(credentials) as client:
-                if str(client.wallet_type) != "DEPOSIT_WALLET":
-                    raise LivePilotError("live-v2 requires a Deposit Wallet")
+                if str(client.wallet_type) not in {"DEPOSIT_WALLET", "EOA"}:
+                    raise LivePilotError("live-v2 requires a Deposit Wallet or EOA wallet")
                 active = reconcile_live_v2(
                     journal,
                     client,
@@ -1190,8 +1190,8 @@ def run_live_v2(
             continue
         journal.heartbeat("CHECKING_CANDIDATE", detail={"count": len(candidates)})
         with open_live_client(credentials) as client:
-            if str(client.wallet_type) != "DEPOSIT_WALLET":
-                raise LivePilotError("live-v2 requires a Deposit Wallet")
+            if str(client.wallet_type) not in {"DEPOSIT_WALLET", "EOA"}:
+                raise LivePilotError("live-v2 requires a Deposit Wallet or EOA wallet")
             balance = client.get_balance_allowance(asset_type="COLLATERAL")
             balance_units = int(balance.balance)
             if balance_units <= 0:
