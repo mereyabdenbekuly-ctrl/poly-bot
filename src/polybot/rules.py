@@ -22,6 +22,11 @@ _LABEL_RE = re.compile(
     r"(?:\s+(?P<tail>or below|or lower|or higher|or above))?\s*$",
     re.I,
 )
+_RANGE_RE = re.compile(
+    r"^\s*(?P<value>-?\d+(?:\.\d+)?)\s*-\s*(?P<high>-?\d+(?:\.\d+)?)"
+    r"\s*°?\s*(?P<unit>[CF])?\s*$",
+    re.I,
+)
 
 
 def rules_hash(event: EventDefinition) -> str:
@@ -122,38 +127,45 @@ def deterministic_rule_audit(event: EventDefinition) -> RuleAudit:
 
 
 def build_brackets(event: EventDefinition) -> dict[str, Bracket]:
-    parsed: list[tuple[str, str, Decimal, str | None]] = []
+    parsed: list[tuple[str, str, Decimal, str | None, Decimal | None]] = []
     for market in event.markets:
         match = _LABEL_RE.match(market.group_item_title)
         if match is None:
+            match = _RANGE_RE.match(market.group_item_title)
+        if match is None:
             raise ValueError(f"unsupported bracket label: {market.group_item_title!r}")
+        groups = match.groupdict()
         parsed.append(
             (
                 market.id,
                 market.group_item_title,
-                Decimal(match.group("value")),
-                None if match.group("tail") is None else match.group("tail").lower(),
+                Decimal(groups["value"]),
+                None if groups.get("tail") is None else str(groups["tail"]).lower(),
+                None if groups.get("high") is None else Decimal(groups["high"]),
             )
         )
 
-    unique_values = sorted({item[2] for item in parsed})
+    endpoints = sorted(
+        {item[2] for item in parsed} | {item[4] for item in parsed if item[4] is not None}
+    )
     steps = [
-        right - left
-        for left, right in zip(unique_values, unique_values[1:], strict=False)
-        if right > left
+        right - left for left, right in zip(endpoints, endpoints[1:], strict=False) if right > left
     ]
     width = min(steps) if steps else Decimal(1)
     if width <= 0:
         raise ValueError("bracket labels do not have a positive interval")
 
     brackets: dict[str, Bracket] = {}
-    for market_id, label, value, tail in parsed:
+    for market_id, label, value, tail, high in parsed:
         if tail in {"or below", "or lower"}:
             lower = None
             upper = float(value + width)
         elif tail in {"or higher", "or above"}:
             lower = float(value)
             upper = None
+        elif high is not None:
+            lower = float(value)
+            upper = float(high + width)
         else:
             lower = float(value)
             upper = float(value + width)

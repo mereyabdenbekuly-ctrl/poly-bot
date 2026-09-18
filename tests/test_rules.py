@@ -57,6 +57,34 @@ def test_temperature_labels_become_contiguous_brackets() -> None:
     assert brackets["3"].upper is None
 
 
+def test_fahrenheit_range_labels_become_brackets() -> None:
+    event = sample_event()
+    event.markets = [
+        MarketDefinition(
+            id=f"r-{k}",
+            slug=None,
+            question=label,
+            group_item_title=label,
+            asset_id=f"asset-r-{k}",
+            condition_id=None,
+            end_date=None,
+            accepting_orders=True,
+            fee_rate=Decimal("0.05"),
+            fee_exponent=Decimal(1),
+            fee_taker_only=True,
+        )
+        for k, label in [("a", "98-99°F"), ("b", "100-101°F"), ("c", "102°F or higher")]
+    ]
+    brackets = build_brackets(event)
+
+    assert brackets["r-a"].lower == 98.0
+    assert brackets["r-a"].upper == 100.0
+    assert brackets["r-b"].lower == 100.0
+    assert brackets["r-b"].upper == 102.0
+    assert brackets["r-c"].lower == 102.0
+    assert brackets["r-c"].upper is None
+
+
 def test_whole_degree_precision_is_supported() -> None:
     candidate = sample_event().model_copy(
         update={
