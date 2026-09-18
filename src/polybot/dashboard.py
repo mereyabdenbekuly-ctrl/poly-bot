@@ -145,16 +145,17 @@ function paginate(key, items, renderPage, target, emptyText){
  const page = pageState[key];
  const pages = Math.ceil(items.length/ps);
  const slice = items.slice(page*ps,(page+1)*ps);
- const btn = (label,dir,dis)=>'<button class="pg-btn'+(dis?' pg-dis':'')+'" onclick="goPage(\''+key+'\','+dir+')" '+(dis?'disabled':'')+'>'+label+'</button>';
+ const btn = (label,dir,dis)=>'<button class="pg-btn'+(dis?' pg-dis':'')+'" data-pg-key="'+key+'" data-pg-dir="'+dir+'"'+(dis?' disabled':'')+'>'+label+'</button>';
  const nav = pages>1 ? '<div class="pg-bar">'+btn('‹ Prev',page-1,page===0)+'<span class="pg-info">Page '+(page+1)+' / '+pages+' · '+items.length+' total</span>'+btn('Next ›',page+1,page===pages-1)+'</div>' : '';
  target.innerHTML = renderPage(slice) + nav;
 }
-function goPage(key,dir){
- const cap={};
- pageState[key]=dir;
+document.addEventListener('click', ev=>{
+ const el = ev.target.closest ? ev.target.closest('.pg-btn') : null;
+ if(!el || el.disabled) return;
+ const key = el.getAttribute('data-pg-key');
+ pageState[key] = Number(el.getAttribute('data-pg-dir'));
  if(window.__pgRefresh) window.__pgRefresh();
-}
-
+});
 
 function latestCycle(d){ return [...(d.reports||[])].reverse().find(r=>r.kind==='CYCLE' && r.payload && r.payload.scan); }
 function renderMetrics(d){
