@@ -1282,9 +1282,7 @@ def run_live_v2(
                         )
                         last_balance_poll = time.monotonic()
                 except LivePilotError:
-                    journal.heartbeat("WAITING_FOR_SIGNAL")
-            else:
-                journal.heartbeat("WAITING_FOR_SIGNAL")
+                    pass
             time.sleep(max(1.0, poll_seconds))
             continue
         journal.heartbeat("CHECKING_CANDIDATE", detail={"count": len(candidates)})
