@@ -406,13 +406,34 @@ def serve_dashboard(storage: Storage, *, host: str, port: int) -> None:
     forecast_store = ForecastStore(storage.path, read_only=True)
     comparison_cache = ComparisonCache(storage.path)
 
+    payload_lock = threading.Lock()
+    payload_state: dict[str, Any] = {"payload": None}
+
+    def _payload_refresher() -> None:
+        while True:
+            try:
+                built = storage.dashboard_payload(forecast_store=forecast_store)
+                with payload_lock:
+                    payload_state["payload"] = built
+            except Exception:  # keep serving the last good payload on transient errors
+                pass
+            time.sleep(60.0)
+
+    threading.Thread(target=_payload_refresher, daemon=True).start()
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:  # noqa: N802
             path = urlparse(self.path).path
             if path == "/health":
                 self._send_json({"ok": True})
             elif path in {"/api/dashboard", "/api/status"}:
-                self._send_json(storage.dashboard_payload(forecast_store=forecast_store))
+                with payload_lock:
+                    cached = payload_state["payload"]
+                if cached is None:
+                    cached = storage.dashboard_payload(forecast_store=forecast_store)
+                    with payload_lock:
+                        payload_state["payload"] = cached
+                self._send_json(cached)
             elif path == "/api/comparison":
                 try:
                     self._send_json(comparison_cache.get())
@@ -436,7 +457,7 @@ def serve_dashboard(storage: Storage, *, host: str, port: int) -> None:
                     "Content-Security-Policy",
                     "default-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; object-src 'none'",
                 )
-                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Content-Options", "nosniff")
                 self.send_header("Referrer-Policy", "no-referrer")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -452,7 +473,7 @@ def serve_dashboard(storage: Storage, *, host: str, port: int) -> None:
             self.send_header(
                 "Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'"
             )
-            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Content-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
