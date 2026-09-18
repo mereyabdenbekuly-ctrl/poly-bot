@@ -44,7 +44,7 @@ LIVE_V2_AUTHORIZATION_KIND = "polybot-live-v2-authorization-v1"
 LIVE_V2_STRATEGY = "open-meteo-truncated-normal-v1"
 LIVE_V2_TIMEZONE = "Asia/Almaty"
 LIVE_V2_DAILY_STOP_USD = Decimal("6.00")
-LIVE_V2_MAX_ORDERS_PER_DAY = 12
+LIVE_V2_MAX_ORDERS_PER_DAY = 50
 LIVE_V2_MIN_PROBABILITY_EDGE = Decimal("0.05")
 LIVE_V2_MIN_EXPECTED_PROFIT_USD = Decimal("0.15")
 LIVE_V2_MIDNIGHT_GUARD_SECONDS = 120
@@ -202,7 +202,7 @@ def load_live_v2_authorization(
     if not authorization.one_position_at_a_time:
         raise LivePilotError("live-v2 requires one_position_at_a_time=true")
     if authorization.max_orders_per_day != LIVE_V2_MAX_ORDERS_PER_DAY:
-        raise LivePilotError("live-v2 permits at most twelve order attempts per local day")
+        raise LivePilotError("live-v2 permits at most fifty order attempts per local day")
     if authorization.daily_stop_loss_usd != LIVE_V2_DAILY_STOP_USD:
         raise LivePilotError("live-v2 daily stop must remain $6.00")
     if authorization.daily_timezone != LIVE_V2_TIMEZONE:

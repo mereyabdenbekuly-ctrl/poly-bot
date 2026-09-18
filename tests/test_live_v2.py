@@ -205,14 +205,14 @@ def _authorization(path: Path, **updates: object) -> Path:
         "side": "BUY",
         "order_type": "FOK",
         "one_position_at_a_time": True,
-        "max_orders_per_day": 12,
+        "max_orders_per_day": 50,
         "daily_stop_loss_usd": "6.00",
         "daily_timezone": LIVE_V2_TIMEZONE,
         "max_wallet_balance_usd": "10.00",
         "max_buy_notional_usd": "1.90",
         "max_total_spend_usd": "2.00",
-        "min_probability_edge": "0.08",
-        "min_expected_profit_usd": "0.25",
+        "min_probability_edge": "0.05",
+        "min_expected_profit_usd": "0.15",
         "jurisdiction_confirmed": True,
         "authorized_at_utc": (NOW - timedelta(minutes=1)).isoformat(),
         "expires_at_utc": (NOW + timedelta(hours=1)).isoformat(),
@@ -279,7 +279,7 @@ def test_authorization_is_private_fixed_and_time_bounded(tmp_path: Path) -> None
 
     assert loaded.wallet == WALLET
     assert loaded.daily_timezone == LIVE_V2_TIMEZONE
-    assert loaded.max_orders_per_day == 12
+    assert loaded.max_orders_per_day == 50
 
     path.chmod(0o644)
     with pytest.raises(LivePilotError, match="mode 0600"):
@@ -304,14 +304,14 @@ def test_authorization_is_private_fixed_and_time_bounded(tmp_path: Path) -> None
         ({"side": "SELL"}, "only FOK BUY"),
         ({"order_type": "GTC"}, "only FOK BUY"),
         ({"one_position_at_a_time": False}, "one_position_at_a_time"),
-        ({"max_orders_per_day": 13}, "at most twelve"),
+        ({"max_orders_per_day": 51}, "at most fifty"),
         ({"daily_stop_loss_usd": "6.01"}, "daily stop"),
         ({"daily_timezone": "UTC"}, "Asia/Almaty"),
         ({"max_wallet_balance_usd": "10.01"}, r"\$10 wallet cap"),
         ({"max_buy_notional_usd": "1.91"}, r"\$1\.90 BUY cap"),
         ({"max_total_spend_usd": "2.01"}, r"\$2 all-in cap"),
-        ({"min_probability_edge": "0.07"}, "probability edge gate"),
-        ({"min_expected_profit_usd": "0.24"}, "expected-profit gate"),
+        ({"min_probability_edge": "0.04"}, "probability edge gate"),
+        ({"min_expected_profit_usd": "0.14"}, "expected-profit gate"),
         ({"jurisdiction_confirmed": False}, "eligibility"),
     ],
 )
@@ -357,12 +357,12 @@ def test_candidate_filtering_requires_fresh_unsuperseded_unattempted_v1(
         expected_profit="0.50",
         created_at=NOW - timedelta(seconds=10),
     )
-    _insert_decision(database, decision_id=4, market_id="below-edge", edge="0.079")
+    _insert_decision(database, decision_id=4, market_id="below-edge", edge="0.049")
     _insert_decision(
         database,
         decision_id=5,
         market_id="below-profit",
-        expected_profit="0.249",
+        expected_profit="0.149",
     )
     _insert_decision(
         database,
