@@ -1016,12 +1016,36 @@ class Storage:
             "losses": int(totals_row["losses"] or 0),
         }
         runtime_payload: dict[str, object] | None = None
+        activity_rows = connection.execute(
+            "SELECT t.id, t.attempt_id, t.from_state, t.to_state, t.created_at_utc, "
+            "t.detail_json, a.decision_id FROM live_v2_transitions t "
+            "LEFT JOIN live_v2_attempts a ON a.id = t.attempt_id "
+            "ORDER BY t.id DESC LIMIT 12"
+        ).fetchall()
         if runtime is not None:
             runtime_payload = dict(runtime)
             try:
                 runtime_payload["detail"] = json.loads(runtime["detail_json"] or "{}")
             except (TypeError, ValueError):
                 runtime_payload["detail"] = {}
+        activity = []
+        for row in activity_rows:
+            try:
+                detail = json.loads(row["detail_json"] or "{}")
+            except (TypeError, ValueError):
+                detail = {}
+            activity.append(
+                {
+                    "id": int(row["id"]),
+                    "attempt_id": int(row["attempt_id"]),
+                    "decision_id": row["decision_id"],
+                    "from_state": row["from_state"],
+                    "to_state": row["to_state"],
+                    "created_at_utc": row["created_at_utc"],
+                    "detail": detail,
+                }
+            )
+
         return {
             "configured": True,
             "state": "WAITING_FOR_SIGNAL" if latest is None else str(latest["state"]),
@@ -1029,6 +1053,7 @@ class Storage:
             "states": states,
             "latest": None if latest is None else dict(latest),
             "runtime": runtime_payload,
+            "activity": activity,
             "orders": orders,
             "totals": totals,
             "limits": {

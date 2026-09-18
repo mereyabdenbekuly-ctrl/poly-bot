@@ -396,6 +396,7 @@ class LiveV2Journal:
         if (
             state == self._last_heartbeat_state
             and now_monotonic - self._last_heartbeat_monotonic < 30
+            and not detail
         ):
             return
         now = datetime.now(UTC).isoformat()
