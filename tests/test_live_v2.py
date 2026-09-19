@@ -520,7 +520,7 @@ def test_pre_sign_rejection_journals_without_signing_or_posting(tmp_path: Path) 
         (lambda client: client.open_orders.append(SimpleNamespace(id="open")), "open order"),
         (
             lambda client: [
-                client.positions.append(SimpleNamespace(size=Decimal("1"))) for _ in range(3)
+                client.positions.append(SimpleNamespace(size=Decimal("1"))) for _ in range(6)
             ],
             "position cap",
         ),
